@@ -39,7 +39,7 @@ export function AdminLayout() {
 			<aside className="w-56 cyber-card border-r border-cyan-500/20">
 				<div className="p-3 border-b border-cyan-500/20">
 					<Link to="/" className="text-lg font-bold gradient-text hover:opacity-80">
-						tank.yoga
+						ollo.art
 					</Link>
 					<p className="text-[10px] text-cyan-400/50 mt-0.5">admin panel</p>
 				</div>

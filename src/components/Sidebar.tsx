@@ -155,7 +155,7 @@ export function Sidebar({
 			{/* Header */}
 			<div className="p-3 flex items-center justify-between border-b border-[var(--border)]">
 				<div>
-					<h1 className="text-lg font-bold gradient-text">tank.yoga</h1>
+					<h1 className="text-lg font-bold gradient-text">ollo.art</h1>
 					<p className="text-[9px] text-[var(--text-secondary)]">neural image synthesis</p>
 				</div>
 				{onToggleCollapse && (

@@ -5,7 +5,7 @@ set -e
 # Run this once on a fresh Ubuntu 22.04+ droplet
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/YOUR_USER/yoga.tank.app/main/deploy/setup-server.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/YOUR_USER/ollo.art/main/deploy/setup-server.sh | bash
 #   OR
 #   ssh root@your-server
 #   bash setup-server.sh
@@ -74,7 +74,7 @@ ufw allow 443/tcp
 ufw --force enable
 
 # Clone repository
-APP_DIR="/opt/yoga-tank"
+APP_DIR="/opt/ollo-art"
 echo -e "${GREEN}Cloning repository to ${APP_DIR}...${NC}"
 
 if [ -d "$APP_DIR" ]; then

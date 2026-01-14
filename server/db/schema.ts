@@ -127,7 +127,7 @@ export function initializeSchema(db: Database): void {
 		db.prepare(`
 			INSERT INTO subscription_products (id, name, description, monthly_image_limit, monthly_cost_limit, bonus_credits, price)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`).run(freeProductId, "Free", "Try Yoga Tank with 5 free generations per month", 5, 1.50, 0, 0);
+		`).run(freeProductId, "Free", "Try ollo.art with 5 free generations per month", 5, 1.50, 0, 0);
 	}
 
 	// Generations table (base schema without new columns)

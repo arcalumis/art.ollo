@@ -19,7 +19,7 @@ export async function sendWelcomeEmail(
 		const { error } = await resend.emails.send({
 			from: FROM_EMAIL,
 			to: email,
-			subject: "Welcome to Yoga Tank - Your Account Details",
+			subject: "Welcome to ollo.art - Your Account Details",
 			html: `
 <!DOCTYPE html>
 <html>
@@ -29,7 +29,7 @@ export async function sendWelcomeEmail(
 </head>
 <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
   <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 10px 10px 0 0;">
-    <h1 style="color: white; margin: 0; font-size: 28px;">Welcome to Yoga Tank!</h1>
+    <h1 style="color: white; margin: 0; font-size: 28px;">Welcome to ollo.art!</h1>
   </div>
 
   <div style="background: #f9fafb; padding: 30px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 10px 10px;">
@@ -89,7 +89,7 @@ export async function sendMagicLinkEmail(
 		const { error } = await resend.emails.send({
 			from: FROM_EMAIL,
 			to: email,
-			subject: "Your Login Link for Yoga Tank",
+			subject: "Your Login Link for ollo.art",
 			html: `
 <!DOCTYPE html>
 <html>
@@ -99,7 +99,7 @@ export async function sendMagicLinkEmail(
 </head>
 <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
   <div style="background: linear-gradient(135deg, #06b6d4 0%, #8b5cf6 100%); padding: 30px; border-radius: 10px 10px 0 0;">
-    <h1 style="color: white; margin: 0; font-size: 28px;">Sign In to Yoga Tank</h1>
+    <h1 style="color: white; margin: 0; font-size: 28px;">Sign In to ollo.art</h1>
   </div>
 
   <div style="background: #f9fafb; padding: 30px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 10px 10px;">
@@ -156,7 +156,7 @@ export async function sendPasswordResetEmail(
 		const { error } = await resend.emails.send({
 			from: FROM_EMAIL,
 			to: email,
-			subject: "Reset Your Yoga Tank Password",
+			subject: "Reset Your ollo.art Password",
 			html: `
 <!DOCTYPE html>
 <html>

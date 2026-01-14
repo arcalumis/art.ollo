@@ -40,7 +40,7 @@ export function MagicLinkVerify() {
 		<div className="min-h-screen flex items-center justify-center p-4">
 			<div className="w-full max-w-sm">
 				<div className="cyber-card rounded-lg p-6 shadow-2xl text-center">
-					<h1 className="text-3xl font-bold mb-2 gradient-text">tank.yoga</h1>
+					<h1 className="text-3xl font-bold mb-2 gradient-text">ollo.art</h1>
 
 					{status === "verifying" && (
 						<div className="mt-8">

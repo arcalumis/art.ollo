@@ -1,4 +1,4 @@
-# Yoga Tank App - System Architecture
+# ollo.art - System Architecture
 
 ## Tech Stack
 - **Frontend:** React 19 + TypeScript + Tailwind CSS 4 + React Router

@@ -117,7 +117,7 @@ export default function AdminPnL() {
 				<div className="cyber-card p-6 max-w-2xl mx-auto">
 					{/* Statement Header */}
 					<div className="text-center mb-6 pb-4 border-b border-cyan-500/20">
-						<h2 className="text-lg font-bold text-white">tank.yoga</h2>
+						<h2 className="text-lg font-bold text-white">ollo.art</h2>
 						<p className="text-sm text-cyan-400">Profit & Loss Statement</p>
 						<p className="text-xs text-gray-500 mt-1">
 							{formatDate(pnl.period.start)} - {formatDate(pnl.period.end)}
