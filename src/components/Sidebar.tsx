@@ -10,8 +10,8 @@ interface SidebarProps {
 	onRenameThread?: (threadId: string, newTitle: string) => void;
 	onDeleteThread?: (thread: Thread) => void;
 	onViewGallery: () => void;
-	viewMode: "chat" | "gallery";
-	onViewModeChange: (mode: "chat" | "gallery") => void;
+	viewMode: "chat" | "gallery" | "billing";
+	onViewModeChange: (mode: "chat" | "gallery" | "billing") => void;
 	onOpenSettings: () => void;
 	onLogout: () => void;
 	username: string;
@@ -156,7 +156,7 @@ export function Sidebar({
 			<div className="p-3 flex items-center justify-between border-b border-[var(--border)]">
 				<div>
 					<h1 className="text-lg font-bold gradient-text">ollo.art</h1>
-					<p className="text-[9px] text-[var(--text-secondary)]">neural image synthesis</p>
+					<p className="text-[9px] text-[var(--text-secondary)]">build with divine inspiration</p>
 				</div>
 				{onToggleCollapse && (
 					<button
@@ -382,6 +382,20 @@ export function Sidebar({
 
 			{/* Footer / User Menu */}
 			<div className="p-3 border-t border-[var(--border)] space-y-2">
+				{/* Billing Button */}
+				<button
+					type="button"
+					onClick={() => onViewModeChange("billing")}
+					className={`w-full p-2 text-xs flex items-center gap-2 cyber-card rounded transition-all ${
+						viewMode === "billing" ? "neon-border bg-[var(--accent)]/10" : "hover:neon-border"
+					}`}
+				>
+					<svg className="w-4 h-4 text-[var(--accent)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+					</svg>
+					<span>Credits & Billing</span>
+				</button>
+
 				{/* Quick Links */}
 				<div className="flex items-center gap-1">
 					<button

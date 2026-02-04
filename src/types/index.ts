@@ -103,9 +103,40 @@ export interface SubscriptionProduct {
 	dailyImageLimit: number | null;
 	bonusCredits: number;
 	price: number;
+	priceSol: number | null;
+	availableForUsd: boolean;
+	availableForSol: boolean;
 	isActive: boolean;
+	allowedModels: string[] | null;
 	createdAt: string;
 	activeUsers?: number;
+}
+
+export interface SubscriptionBoost {
+	id: string;
+	userId: string;
+	boostProductId: string;
+	boostProductName?: string;
+	originalProductId: string | null;
+	originalProductName?: string;
+	grantedByUserId: string | null;
+	grantedByUsername?: string;
+	username?: string;
+	email?: string | null;
+	reason: string | null;
+	startsAt: string;
+	endsAt: string;
+	status: "active" | "expired" | "cancelled";
+	createdAt: string;
+}
+
+export interface CreditPackage {
+	id: string;
+	name: string;
+	credits: number;
+	priceSol: number;
+	isActive: boolean;
+	createdAt?: string;
 }
 
 export interface UserSubscription {
@@ -182,6 +213,7 @@ export interface UserSubscriptionInfo {
 		name: string;
 		description: string | null;
 		price: number;
+		allowedModels: string[] | null;
 	} | null;
 	limits: {
 		monthlyImageLimit: number | null;

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getDb } from "../db";
+import { processExpiredBoosts } from "./subscription-boost";
 
 interface TrashRow {
 	id: string;
@@ -53,6 +54,9 @@ export function cleanupTrashedItems(): void {
 	if (totalCleaned > 0) {
 		console.log(`Cleanup: Permanently deleted ${totalCleaned} trashed items`);
 	}
+
+	// Process expired subscription boosts
+	processExpiredBoosts();
 }
 
 export function startCleanupJob(intervalMs = 5 * 60 * 1000): NodeJS.Timeout {

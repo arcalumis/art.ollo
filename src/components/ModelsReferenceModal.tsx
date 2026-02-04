@@ -7,6 +7,8 @@ interface ModelsReferenceModalProps {
 	onClose: () => void;
 	onSelectModel?: (modelId: string) => void;
 	currentModel?: string;
+	allowedModels?: string[] | null;
+	onUpgrade?: () => void;
 }
 
 type CategoryFilter = ModelConfig["category"] | "all";
@@ -16,9 +18,17 @@ export function ModelsReferenceModal({
 	onClose,
 	onSelectModel,
 	currentModel,
+	allowedModels,
+	onUpgrade,
 }: ModelsReferenceModalProps) {
 	const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>("all");
 	const [expandedModel, setExpandedModel] = useState<string | null>(null);
+
+	// Check if a model is available on the user's plan
+	const isModelAvailable = (modelId: string) => {
+		if (allowedModels === null || allowedModels === undefined) return true; // All models allowed
+		return allowedModels.includes(modelId);
+	};
 
 	const filteredModels =
 		categoryFilter === "all"
@@ -65,7 +75,6 @@ export function ModelsReferenceModal({
 								<th className="text-center py-2 px-2 text-[var(--text-secondary)] font-medium">Category</th>
 								<th className="text-center py-2 px-2 text-[var(--text-secondary)] font-medium">Images</th>
 								<th className="text-center py-2 px-2 text-[var(--text-secondary)] font-medium">Multi-Out</th>
-								<th className="text-center py-2 px-2 text-[var(--text-secondary)] font-medium">Cost</th>
 								<th className="text-left py-2 px-2 text-[var(--text-secondary)] font-medium">Best For</th>
 							</tr>
 						</thead>
@@ -74,6 +83,7 @@ export function ModelsReferenceModal({
 								const catInfo = MODEL_CATEGORIES[model.category];
 								const isExpanded = expandedModel === model.id;
 								const isCurrent = currentModel === model.id;
+								const available = isModelAvailable(model.id);
 
 								return (
 									<>
@@ -81,7 +91,7 @@ export function ModelsReferenceModal({
 											key={model.id}
 											className={`border-b border-[var(--border)]/50 hover:bg-[var(--bg-tertiary)]/50 cursor-pointer transition-colors ${
 												isCurrent ? "bg-[var(--accent)]/10" : ""
-											}`}
+											} ${!available ? "opacity-60" : ""}`}
 											onClick={() => setExpandedModel(isExpanded ? null : model.id)}
 										>
 											<td className="py-2 px-2">
@@ -91,25 +101,41 @@ export function ModelsReferenceModal({
 															type="button"
 															onClick={(e) => {
 																e.stopPropagation();
-																onSelectModel(model.id);
-																onClose();
+																if (available) {
+																	onSelectModel(model.id);
+																	onClose();
+																}
 															}}
-															className="w-5 h-5 rounded border border-[var(--border)] hover:border-[var(--accent)] hover:bg-[var(--accent)]/10 flex items-center justify-center transition-colors"
-															title="Select this model"
+															className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${
+																available
+																	? "border-[var(--border)] hover:border-[var(--accent)] hover:bg-[var(--accent)]/10"
+																	: "border-gray-600 cursor-not-allowed"
+															}`}
+															title={available ? "Select this model" : "Upgrade to access this model"}
+															disabled={!available}
 														>
-															{isCurrent ? (
+															{!available ? (
+																<svg className="w-3 h-3 text-gray-500" fill="currentColor" viewBox="0 0 20 20">
+																	<path fillRule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clipRule="evenodd" />
+																</svg>
+															) : isCurrent ? (
 																<span className="text-[var(--accent)]">✓</span>
 															) : (
 																<span className="text-[var(--text-secondary)]">+</span>
 															)}
 														</button>
 													)}
-													<div>
-														<span className="font-medium text-[var(--text-primary)]">
+													<div className="flex items-center gap-1.5">
+														<span className={`font-medium ${available ? "text-[var(--text-primary)]" : "text-gray-500"}`}>
 															{model.shortName}
 														</span>
 														{model.capabilities.requiresImageInput && (
-															<span className="ml-1 text-[10px] text-[var(--accent)]">*</span>
+															<span className="text-[10px] text-[var(--accent)]">*</span>
+														)}
+														{!available && (
+															<span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">
+																Pro
+															</span>
 														)}
 													</div>
 												</div>
@@ -141,9 +167,6 @@ export function ModelsReferenceModal({
 													<span className="text-[var(--text-secondary)]/50">—</span>
 												)}
 											</td>
-											<td className="py-2 px-2 text-center font-mono text-[var(--accent)]">
-												{model.pricing.displayCost}
-											</td>
 											<td className="py-2 px-2">
 												<div className="flex flex-wrap gap-1">
 													{model.bestFor.slice(0, 2).map((use) => (
@@ -164,7 +187,7 @@ export function ModelsReferenceModal({
 										</tr>
 										{isExpanded && (
 											<tr key={`${model.id}-details`} className="bg-[var(--bg-tertiary)]/30">
-												<td colSpan={6} className="py-3 px-4">
+												<td colSpan={5} className="py-3 px-4">
 													<div className="space-y-2">
 														<p className="text-[var(--text-primary)] text-sm leading-relaxed">
 															{model.detailedDescription}
@@ -179,6 +202,31 @@ export function ModelsReferenceModal({
 																<span className="font-medium">Similar to:</span>{" "}
 																{model.similarTo.join(", ")}
 															</p>
+														)}
+														{!available && onUpgrade && (
+															<div className="pt-2 mt-2 border-t border-[var(--border)]">
+																<div className="flex items-center gap-3">
+																	<div className="flex-1">
+																		<p className="text-xs text-yellow-400 font-medium">
+																			This model requires a Pro or Premium subscription
+																		</p>
+																		<p className="text-[10px] text-[var(--text-secondary)]">
+																			Upgrade to access premium models and higher quality outputs
+																		</p>
+																	</div>
+																	<button
+																		type="button"
+																		onClick={(e) => {
+																			e.stopPropagation();
+																			onUpgrade();
+																			onClose();
+																		}}
+																		className="px-3 py-1.5 text-xs font-medium rounded bg-gradient-to-r from-yellow-500 to-orange-500 text-black hover:from-yellow-400 hover:to-orange-400 transition-colors"
+																	>
+																		Upgrade
+																	</button>
+																</div>
+															</div>
 														)}
 													</div>
 												</td>

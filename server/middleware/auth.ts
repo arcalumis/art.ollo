@@ -58,3 +58,21 @@ export async function adminMiddleware(request: FastifyRequest, reply: FastifyRep
 		return reply.status(403).send({ error: "Admin access required" });
 	}
 }
+
+/**
+ * Optional auth middleware - sets user if token present, but doesn't reject if missing
+ */
+export async function optionalAuthMiddleware(request: FastifyRequest): Promise<void> {
+	const authHeader = request.headers.authorization;
+
+	if (!authHeader?.startsWith("Bearer ")) {
+		return;
+	}
+
+	const token = authHeader.slice(7);
+	const payload = verifyToken(token);
+
+	if (payload) {
+		request.user = payload;
+	}
+}

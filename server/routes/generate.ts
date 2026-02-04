@@ -4,7 +4,7 @@ import type { GenerateRequest } from "../../src/types";
 import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
 import { enhancePrompt, generateImage, MODELS } from "../services/replicate";
-import { canUserGenerate, deductCredit, recordUsage } from "../services/usage";
+import { canUserGenerate, canUserUseModel, deductCredit, recordUsage } from "../services/usage";
 import { getUserApiKey } from "./user";
 
 interface ExtendedGenerateRequest extends GenerateRequest {
@@ -63,6 +63,14 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 			// Variation models require image inputs
 			if (isVariationModel && !hasImageInputs) {
 				return reply.status(400).send({ error: "Variation models require an input image" });
+			}
+
+			// Check if user's subscription tier allows this model
+			if (!canUserUseModel(userId, model)) {
+				return reply.status(403).send({
+					error: "This model is not available on your subscription tier. Please upgrade to access more models.",
+					modelRestricted: true,
+				});
 			}
 
 			// Check if user can generate based on subscription limits

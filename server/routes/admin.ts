@@ -4,6 +4,18 @@ import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
 import { sendWelcomeEmail } from "../services/email";
 import { calculateGenerationCost } from "../services/replicate";
+import {
+	cancelBoost,
+	getAllActiveBoosts,
+	getActiveBoost,
+	grantSubscriptionBoost,
+} from "../services/subscription-boost";
+import {
+	createCreditPackage,
+	deleteCreditPackage,
+	getAllCreditPackages,
+	updateCreditPackage,
+} from "../services/solana";
 import { addCredits, assignSubscription, getCurrentYearMonth, getUserUsageHistory } from "../services/usage";
 
 interface UserRow {
@@ -25,7 +37,11 @@ interface ProductRow {
 	daily_image_limit: number | null;
 	bonus_credits: number;
 	price: number;
+	price_sol: number | null;
+	available_for_usd: number;
+	available_for_sol: number;
 	is_active: number;
+	allowed_models: string | null;
 	created_at: string;
 }
 
@@ -517,7 +533,11 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 				dailyImageLimit: product.daily_image_limit,
 				bonusCredits: product.bonus_credits,
 				price: product.price,
+				priceSol: product.price_sol,
+				availableForUsd: product.available_for_usd === 1,
+				availableForSol: product.available_for_sol === 1,
 				isActive: product.is_active === 1,
+				allowedModels: product.allowed_models ? JSON.parse(product.allowed_models) : null,
 				createdAt: product.created_at,
 				activeUsers: userCount.count,
 			};
@@ -536,11 +556,26 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			dailyImageLimit?: number;
 			bonusCredits?: number;
 			price?: number;
+			priceSol?: number;
+			availableForUsd?: boolean;
+			availableForSol?: boolean;
+			allowedModels?: string[] | null;
 		};
 	}>("/api/admin/products", async (request, reply) => {
 		const db = getDb();
-		const { name, description, monthlyImageLimit, monthlyCostLimit, dailyImageLimit, bonusCredits, price } =
-			request.body;
+		const {
+			name,
+			description,
+			monthlyImageLimit,
+			monthlyCostLimit,
+			dailyImageLimit,
+			bonusCredits,
+			price,
+			priceSol,
+			availableForUsd,
+			availableForSol,
+			allowedModels,
+		} = request.body;
 
 		if (!name) {
 			return reply.status(400).send({ error: "Name is required" });
@@ -550,8 +585,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 
 		db.prepare(
 			`INSERT INTO subscription_products
-			(id, name, description, monthly_image_limit, monthly_cost_limit, daily_image_limit, bonus_credits, price)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, name, description, monthly_image_limit, monthly_cost_limit, daily_image_limit, bonus_credits, price, price_sol, available_for_usd, available_for_sol, allowed_models)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		).run(
 			id,
 			name,
@@ -561,6 +596,10 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			dailyImageLimit ?? null,
 			bonusCredits ?? 0,
 			price ?? 0,
+			priceSol ?? null,
+			availableForUsd !== false ? 1 : 0,
+			availableForSol === true ? 1 : 0,
+			allowedModels ? JSON.stringify(allowedModels) : null,
 		);
 
 		return {
@@ -572,6 +611,10 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			dailyImageLimit: dailyImageLimit ?? null,
 			bonusCredits: bonusCredits ?? 0,
 			price: price ?? 0,
+			priceSol: priceSol ?? null,
+			availableForUsd: availableForUsd !== false,
+			availableForSol: availableForSol === true,
+			allowedModels: allowedModels ?? null,
 			isActive: true,
 		};
 	});
@@ -587,7 +630,11 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			dailyImageLimit?: number | null;
 			bonusCredits?: number;
 			price?: number;
+			priceSol?: number | null;
+			availableForUsd?: boolean;
+			availableForSol?: boolean;
 			isActive?: boolean;
+			allowedModels?: string[] | null;
 		};
 	}>("/api/admin/products/:id", async (request, reply) => {
 		const db = getDb();
@@ -600,7 +647,11 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			dailyImageLimit,
 			bonusCredits,
 			price,
+			priceSol,
+			availableForUsd,
+			availableForSol,
 			isActive,
+			allowedModels,
 		} = request.body;
 
 		const product = db.prepare("SELECT id FROM subscription_products WHERE id = ?").get(id);
@@ -639,9 +690,25 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			updates.push("price = ?");
 			params.push(price);
 		}
+		if (priceSol !== undefined) {
+			updates.push("price_sol = ?");
+			params.push(priceSol);
+		}
+		if (availableForUsd !== undefined) {
+			updates.push("available_for_usd = ?");
+			params.push(availableForUsd ? 1 : 0);
+		}
+		if (availableForSol !== undefined) {
+			updates.push("available_for_sol = ?");
+			params.push(availableForSol ? 1 : 0);
+		}
 		if (isActive !== undefined) {
 			updates.push("is_active = ?");
 			params.push(isActive ? 1 : 0);
+		}
+		if (allowedModels !== undefined) {
+			updates.push("allowed_models = ?");
+			params.push(allowedModels ? JSON.stringify(allowedModels) : null);
 		}
 
 		if (updates.length > 0) {
@@ -804,5 +871,157 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 		}));
 
 		return { pricing };
+	});
+
+	// ============================================
+	// SUBSCRIPTION BOOST MANAGEMENT
+	// ============================================
+
+	// GET /api/admin/boosts - List all active boosts
+	fastify.get("/api/admin/boosts", async () => {
+		const db = getDb();
+		const boosts = getAllActiveBoosts();
+
+		// Enrich with user info
+		const boostsWithUsers = boosts.map((boost) => {
+			const user = db
+				.prepare("SELECT username, email FROM users WHERE id = ?")
+				.get(boost.userId) as { username: string; email: string | null } | undefined;
+
+			const grantedBy = boost.grantedByUserId
+				? (db.prepare("SELECT username FROM users WHERE id = ?").get(boost.grantedByUserId) as
+						| { username: string }
+						| undefined)
+				: null;
+
+			return {
+				...boost,
+				username: user?.username || "Unknown",
+				email: user?.email,
+				grantedByUsername: grantedBy?.username,
+			};
+		});
+
+		return { boosts: boostsWithUsers };
+	});
+
+	// GET /api/admin/users/:id/boost - Get user's active boost
+	fastify.get<{ Params: { id: string } }>("/api/admin/users/:id/boost", async (request, reply) => {
+		const { id } = request.params;
+
+		const db = getDb();
+		const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
+		if (!user) {
+			return reply.status(404).send({ error: "User not found" });
+		}
+
+		const boost = getActiveBoost(id);
+		return { boost };
+	});
+
+	// POST /api/admin/users/:id/boost - Grant boost to user
+	fastify.post<{
+		Params: { id: string };
+		Body: { productId: string; durationDays?: number; reason?: string };
+	}>("/api/admin/users/:id/boost", async (request, reply) => {
+		const { id } = request.params;
+		const { productId, durationDays = 30, reason } = request.body;
+
+		const db = getDb();
+		const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
+		if (!user) {
+			return reply.status(404).send({ error: "User not found" });
+		}
+
+		if (!productId) {
+			return reply.status(400).send({ error: "Product ID is required" });
+		}
+
+		const adminUserId = request.user?.userId || null;
+		const boost = grantSubscriptionBoost(id, productId, durationDays, adminUserId, reason || null);
+
+		if (!boost) {
+			return reply.status(400).send({ error: "Failed to grant boost. Product may not exist." });
+		}
+
+		return { success: true, boost };
+	});
+
+	// DELETE /api/admin/users/:id/boost - Cancel user's active boost
+	fastify.delete<{ Params: { id: string } }>("/api/admin/users/:id/boost", async (request, reply) => {
+		const { id } = request.params;
+
+		const db = getDb();
+		const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
+		if (!user) {
+			return reply.status(404).send({ error: "User not found" });
+		}
+
+		const boost = getActiveBoost(id);
+		if (!boost) {
+			return reply.status(404).send({ error: "No active boost found" });
+		}
+
+		const success = cancelBoost(boost.id);
+		return { success };
+	});
+
+	// ============================================
+	// SOL CREDIT PACKAGE MANAGEMENT
+	// ============================================
+
+	// GET /api/admin/credit-packages - List all credit packages
+	fastify.get("/api/admin/credit-packages", async () => {
+		const packages = getAllCreditPackages();
+		return { packages };
+	});
+
+	// POST /api/admin/credit-packages - Create credit package
+	fastify.post<{
+		Body: { name: string; credits: number; priceSol: number; isActive?: boolean };
+	}>("/api/admin/credit-packages", async (request, reply) => {
+		const { name, credits, priceSol, isActive } = request.body;
+
+		if (!name || !credits || !priceSol) {
+			return reply.status(400).send({ error: "Name, credits, and priceSol are required" });
+		}
+
+		const pkg = createCreditPackage({ name, credits, priceSol, isActive });
+
+		if (!pkg) {
+			return reply.status(500).send({ error: "Failed to create package" });
+		}
+
+		return pkg;
+	});
+
+	// PATCH /api/admin/credit-packages/:id - Update credit package
+	fastify.patch<{
+		Params: { id: string };
+		Body: { name?: string; credits?: number; priceSol?: number; isActive?: boolean };
+	}>("/api/admin/credit-packages/:id", async (request, reply) => {
+		const { id } = request.params;
+		const { name, credits, priceSol, isActive } = request.body;
+
+		const success = updateCreditPackage(id, { name, credits, priceSol, isActive });
+
+		if (!success) {
+			return reply.status(404).send({ error: "Package not found" });
+		}
+
+		return { success: true };
+	});
+
+	// DELETE /api/admin/credit-packages/:id - Deactivate credit package
+	fastify.delete<{ Params: { id: string } }>("/api/admin/credit-packages/:id", async (request, reply) => {
+		const { id } = request.params;
+
+		const success = deleteCreditPackage(id);
+
+		if (!success) {
+			return reply.status(404).send({ error: "Package not found" });
+		}
+
+		return { success: true };
 	});
 }

@@ -55,6 +55,7 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
 				name: product.name,
 				description: product.description,
 				price: product.price,
+				allowedModels: product.allowed_models ? JSON.parse(product.allowed_models) : null,
 			},
 			limits: {
 				monthlyImageLimit: product.monthly_image_limit,

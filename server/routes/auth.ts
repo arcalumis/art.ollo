@@ -1,11 +1,14 @@
 import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
+import bs58 from "bs58";
 import type { FastifyInstance } from "fastify";
+import nacl from "tweetnacl";
 import { getDb } from "../db";
 import { adminMiddleware, authMiddleware, signToken } from "../middleware/auth";
 import { sendMagicLinkEmail, sendPasswordResetEmail } from "../services/email";
 import { createEmailToken, markTokenUsed, validateToken } from "../services/tokens";
 import { assignDefaultSubscription } from "../services/usage";
+import { PublicKey } from "@solana/web3.js";
 
 const isProduction = process.env.NODE_ENV === "production";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (isProduction ? undefined : "admin");
@@ -89,6 +92,53 @@ interface UserRow {
 	email: string | null;
 	password_hash: string;
 	is_admin: number;
+	wallet_address: string | null;
+}
+
+interface WalletChallengeBody {
+	walletAddress: string;
+}
+
+interface WalletVerifyBody {
+	walletAddress: string;
+	challenge: string;
+	signature: string;
+	username?: string;
+}
+
+interface WalletChallengeRow {
+	id: string;
+	wallet_address: string;
+	challenge: string;
+	expires_at: string;
+	used_at: string | null;
+}
+
+const WALLET_CHALLENGE_EXPIRY_MINUTES = 5;
+
+// Verify Solana wallet signature
+function verifyWalletSignature(address: string, message: string, signature: string): boolean {
+	try {
+		const pubkey = new PublicKey(address);
+		const msgBytes = new TextEncoder().encode(message);
+		const sigBytes = bs58.decode(signature);
+		return nacl.sign.detached.verify(msgBytes, sigBytes, pubkey.toBytes());
+	} catch {
+		return false;
+	}
+}
+
+// Validate Solana wallet address format (base58, 32-44 chars)
+function isValidWalletAddress(address: string): boolean {
+	if (!address || address.length < 32 || address.length > 44) {
+		return false;
+	}
+	try {
+		new PublicKey(address);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 // Strict rate limit config for auth endpoints (5 attempts per minute)
@@ -436,5 +486,168 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
 		markTokenUsed(token);
 
 		return { success: true };
+	});
+
+	// ==================== Wallet Auth Endpoints ====================
+
+	// Request wallet challenge (rate limited: 5 per minute)
+	fastify.post<{ Body: WalletChallengeBody }>("/api/auth/wallet/challenge", authRateLimit, async (request, reply) => {
+		const { walletAddress } = request.body;
+
+		if (!walletAddress) {
+			return reply.status(400).send({ error: "Wallet address required" });
+		}
+
+		if (!isValidWalletAddress(walletAddress)) {
+			return reply.status(400).send({ error: "Invalid wallet address format" });
+		}
+
+		const db = getDb();
+
+		// Check if wallet is already registered
+		const existingUser = db.prepare("SELECT id, username FROM users WHERE wallet_address = ?").get(walletAddress) as
+			| Pick<UserRow, "id" | "username">
+			| undefined;
+
+		// Generate challenge nonce (32 bytes hex)
+		const nonce = crypto.randomBytes(32).toString("hex");
+		const timestamp = Date.now();
+		const challenge = `${nonce}:${timestamp}`;
+		const message = `Sign this message to authenticate with ollo.art\n\nNonce: ${nonce}\nTimestamp: ${timestamp}`;
+
+		// Store challenge with expiry
+		const challengeId = crypto.randomUUID();
+		const expiresAt = new Date(Date.now() + WALLET_CHALLENGE_EXPIRY_MINUTES * 60 * 1000).toISOString();
+
+		db.prepare(`
+			INSERT INTO wallet_challenges (id, wallet_address, challenge, expires_at)
+			VALUES (?, ?, ?, ?)
+		`).run(challengeId, walletAddress, challenge, expiresAt);
+
+		return {
+			challenge,
+			message,
+			isRegistered: !!existingUser,
+			username: existingUser?.username,
+		};
+	});
+
+	// Verify wallet signature and login/register (rate limited: 5 per minute)
+	fastify.post<{ Body: WalletVerifyBody }>("/api/auth/wallet/verify", authRateLimit, async (request, reply) => {
+		const { walletAddress, challenge, signature, username } = request.body;
+
+		if (!walletAddress || !challenge || !signature) {
+			return reply.status(400).send({ error: "Wallet address, challenge, and signature required" });
+		}
+
+		if (!isValidWalletAddress(walletAddress)) {
+			return reply.status(400).send({ error: "Invalid wallet address format" });
+		}
+
+		const db = getDb();
+
+		// Find and validate challenge
+		const challengeRow = db.prepare(`
+			SELECT * FROM wallet_challenges
+			WHERE challenge = ? AND wallet_address = ?
+		`).get(challenge, walletAddress) as WalletChallengeRow | undefined;
+
+		if (!challengeRow) {
+			return reply.status(401).send({ error: "Invalid or expired challenge" });
+		}
+
+		// Check if challenge expired
+		if (new Date(challengeRow.expires_at) < new Date()) {
+			return reply.status(401).send({ error: "Challenge has expired" });
+		}
+
+		// Check if challenge was already used
+		if (challengeRow.used_at) {
+			return reply.status(401).send({ error: "Challenge has already been used" });
+		}
+
+		// Reconstruct message for verification
+		const [nonce, timestamp] = challenge.split(":");
+		const message = `Sign this message to authenticate with ollo.art\n\nNonce: ${nonce}\nTimestamp: ${timestamp}`;
+
+		// Verify signature
+		if (!verifyWalletSignature(walletAddress, message, signature)) {
+			return reply.status(401).send({ error: "Invalid signature" });
+		}
+
+		// Mark challenge as used
+		db.prepare("UPDATE wallet_challenges SET used_at = datetime('now') WHERE id = ?").run(challengeRow.id);
+
+		// Check if wallet is registered
+		const existingUser = db.prepare("SELECT * FROM users WHERE wallet_address = ?").get(walletAddress) as
+			| UserRow
+			| undefined;
+
+		if (existingUser) {
+			// Existing user - log them in
+			db.prepare("UPDATE users SET last_login = datetime('now') WHERE id = ?").run(existingUser.id);
+
+			const token = signToken({
+				userId: existingUser.id,
+				username: existingUser.username,
+				isAdmin: existingUser.is_admin === 1,
+			});
+
+			return {
+				token,
+				user: {
+					id: existingUser.id,
+					username: existingUser.username,
+					isAdmin: existingUser.is_admin === 1,
+				},
+			};
+		}
+
+		// New wallet - check if username provided
+		if (!username) {
+			return { needsUsername: true };
+		}
+
+		// Validate username
+		if (username.length < 3 || username.length > 30) {
+			return reply.status(400).send({ error: "Username must be between 3 and 30 characters" });
+		}
+
+		if (!/^[a-zA-Z0-9_-]+$/.test(username)) {
+			return reply.status(400).send({ error: "Username can only contain letters, numbers, underscores, and hyphens" });
+		}
+
+		// Check if username is taken
+		const usernameExists = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
+		if (usernameExists) {
+			return reply.status(409).send({ error: "Username already taken" });
+		}
+
+		// Create new user with random unusable password hash
+		const userId = crypto.randomUUID();
+		const randomPasswordHash = hashPassword(crypto.randomBytes(32).toString("hex"));
+
+		db.prepare(`
+			INSERT INTO users (id, username, password_hash, wallet_address, is_admin, is_active, last_login)
+			VALUES (?, ?, ?, ?, 0, 1, datetime('now'))
+		`).run(userId, username, randomPasswordHash, walletAddress);
+
+		// Assign default subscription
+		assignDefaultSubscription(userId);
+
+		const token = signToken({
+			userId,
+			username,
+			isAdmin: false,
+		});
+
+		return {
+			token,
+			user: {
+				id: userId,
+				username,
+				isAdmin: false,
+			},
+		};
 	});
 }

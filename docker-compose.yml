@@ -1,11 +1,18 @@
 # Development docker-compose
 # Usage: docker compose up
+#
+# IMPORTANT: Never use "docker compose down -v" - the -v flag deletes all data!
+# Safe commands:
+#   - Rebuild: docker compose up --build -d
+#   - Stop:    docker compose down (no -v flag!)
+#   - Restart: docker compose restart
 
 services:
   app:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: artollo-app-1
     ports:
       - "3001:3001"
     environment:
@@ -13,14 +20,33 @@ services:
     env_file:
       - .env
     volumes:
-      # Persist database and images
-      - ./data:/app/data
-      - ./generated-images:/app/generated-images
-      - ./uploads:/app/uploads
+      # Named volumes persist across rebuilds (NEVER use 'docker compose down -v')
+      - artollo_data:/app/data
+      - artollo_images:/app/generated-images
+      - artollo_uploads:/app/uploads
+    networks:
+      - default
+      - web
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://localhost:3001/api/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
       interval: 5s
       timeout: 3s
       retries: 2
       start_period: 5s
+
+networks:
+  web:
+    external: true
+
+volumes:
+  artollo_data:
+    name: artollo_dev_data
+    external: true
+  artollo_images:
+    name: artollo_dev_images
+    external: true
+  artollo_uploads:
+    name: artollo_dev_uploads
+    external: true

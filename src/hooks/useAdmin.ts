@@ -1,6 +1,13 @@
 import { useCallback, useState } from "react";
 import { API_BASE } from "../config";
-import type { AdminStats, AdminUser, AdminUserDetail, SubscriptionProduct } from "../types";
+import type {
+	AdminStats,
+	AdminUser,
+	AdminUserDetail,
+	CreditPackage,
+	SubscriptionBoost,
+	SubscriptionProduct,
+} from "../types";
 
 export function useAdminStats(token: string | null) {
 	const [stats, setStats] = useState<AdminStats | null>(null);
@@ -310,4 +317,212 @@ export function useAdminProducts(token: string | null) {
 	);
 
 	return { products, loading, fetchProducts, createProduct, updateProduct, deleteProduct };
+}
+
+// ============================================
+// CREDIT PACKAGES
+// ============================================
+
+interface CreditPackagesResponse {
+	packages: CreditPackage[];
+}
+
+export function useAdminCreditPackages(token: string | null) {
+	const [packages, setPackages] = useState<CreditPackage[]>([]);
+	const [loading, setLoading] = useState(false);
+
+	const fetchPackages = useCallback(async () => {
+		if (!token) return;
+		setLoading(true);
+		try {
+			const response = await fetch(`${API_BASE}/api/admin/credit-packages`, {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			const data = (await response.json()) as CreditPackagesResponse;
+			setPackages(data.packages);
+		} catch (err) {
+			console.error("Failed to fetch credit packages:", err);
+		} finally {
+			setLoading(false);
+		}
+	}, [token]);
+
+	const createPackage = useCallback(
+		async (data: {
+			name: string;
+			credits: number;
+			priceSol: number;
+			isActive?: boolean;
+		}): Promise<CreditPackage | null> => {
+			if (!token) return null;
+			try {
+				const response = await fetch(`${API_BASE}/api/admin/credit-packages`, {
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${token}`,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(data),
+				});
+				if (response.ok) {
+					return (await response.json()) as CreditPackage;
+				}
+				return null;
+			} catch (err) {
+				console.error("Failed to create credit package:", err);
+				return null;
+			}
+		},
+		[token],
+	);
+
+	const updatePackage = useCallback(
+		async (
+			id: string,
+			updates: {
+				name?: string;
+				credits?: number;
+				priceSol?: number;
+				isActive?: boolean;
+			},
+		): Promise<boolean> => {
+			if (!token) return false;
+			try {
+				const response = await fetch(`${API_BASE}/api/admin/credit-packages/${id}`, {
+					method: "PATCH",
+					headers: {
+						Authorization: `Bearer ${token}`,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(updates),
+				});
+				return response.ok;
+			} catch (err) {
+				console.error("Failed to update credit package:", err);
+				return false;
+			}
+		},
+		[token],
+	);
+
+	const deletePackage = useCallback(
+		async (id: string): Promise<boolean> => {
+			if (!token) return false;
+			try {
+				const response = await fetch(`${API_BASE}/api/admin/credit-packages/${id}`, {
+					method: "DELETE",
+					headers: { Authorization: `Bearer ${token}` },
+				});
+				return response.ok;
+			} catch (err) {
+				console.error("Failed to delete credit package:", err);
+				return false;
+			}
+		},
+		[token],
+	);
+
+	return { packages, loading, fetchPackages, createPackage, updatePackage, deletePackage };
+}
+
+// ============================================
+// SUBSCRIPTION BOOSTS
+// ============================================
+
+interface BoostsResponse {
+	boosts: SubscriptionBoost[];
+}
+
+interface BoostResponse {
+	boost: SubscriptionBoost | null;
+}
+
+export function useAdminBoosts(token: string | null) {
+	const [boosts, setBoosts] = useState<SubscriptionBoost[]>([]);
+	const [loading, setLoading] = useState(false);
+
+	const fetchBoosts = useCallback(async () => {
+		if (!token) return;
+		setLoading(true);
+		try {
+			const response = await fetch(`${API_BASE}/api/admin/boosts`, {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			const data = (await response.json()) as BoostsResponse;
+			setBoosts(data.boosts);
+		} catch (err) {
+			console.error("Failed to fetch boosts:", err);
+		} finally {
+			setLoading(false);
+		}
+	}, [token]);
+
+	const getUserBoost = useCallback(
+		async (userId: string): Promise<SubscriptionBoost | null> => {
+			if (!token) return null;
+			try {
+				const response = await fetch(`${API_BASE}/api/admin/users/${userId}/boost`, {
+					headers: { Authorization: `Bearer ${token}` },
+				});
+				if (response.ok) {
+					const data = (await response.json()) as BoostResponse;
+					return data.boost;
+				}
+				return null;
+			} catch (err) {
+				console.error("Failed to get user boost:", err);
+				return null;
+			}
+		},
+		[token],
+	);
+
+	const grantBoost = useCallback(
+		async (
+			userId: string,
+			productId: string,
+			durationDays?: number,
+			reason?: string,
+		): Promise<{ success: boolean; boost?: SubscriptionBoost }> => {
+			if (!token) return { success: false };
+			try {
+				const response = await fetch(`${API_BASE}/api/admin/users/${userId}/boost`, {
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${token}`,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({ productId, durationDays, reason }),
+				});
+				if (response.ok) {
+					const data = (await response.json()) as { success: boolean; boost: SubscriptionBoost };
+					return data;
+				}
+				return { success: false };
+			} catch (err) {
+				console.error("Failed to grant boost:", err);
+				return { success: false };
+			}
+		},
+		[token],
+	);
+
+	const cancelBoost = useCallback(
+		async (userId: string): Promise<boolean> => {
+			if (!token) return false;
+			try {
+				const response = await fetch(`${API_BASE}/api/admin/users/${userId}/boost`, {
+					method: "DELETE",
+					headers: { Authorization: `Bearer ${token}` },
+				});
+				return response.ok;
+			} catch (err) {
+				console.error("Failed to cancel boost:", err);
+				return false;
+			}
+		},
+		[token],
+	);
+
+	return { boosts, loading, fetchBoosts, getUserBoost, grantBoost, cancelBoost };
 }

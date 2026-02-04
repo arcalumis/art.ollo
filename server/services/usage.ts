@@ -11,6 +11,7 @@ interface SubscriptionProduct {
 	bonus_credits: number;
 	price: number;
 	is_active: number;
+	allowed_models: string | null;
 }
 
 interface UserSubscription {
@@ -155,15 +156,72 @@ export function getUserUsageHistory(userId: string, days = 30): { date: string; 
 	return result;
 }
 
+interface BoostInfo {
+	isBoost: boolean;
+	boostId?: string;
+	boostEndsAt?: string;
+	originalProductId?: string | null;
+}
+
 /**
  * Get user's active subscription and associated product
+ * Now boost-aware: if user has an active boost, return the boost product instead
  */
 export function getUserSubscription(userId: string): {
 	subscription: UserSubscription | null;
 	product: SubscriptionProduct | null;
+	boost?: BoostInfo;
 } {
 	const db = getDb();
 
+	// First check for an active boost
+	const activeBoost = db
+		.prepare(`
+			SELECT sb.id, sb.boost_product_id, sb.original_product_id, sb.ends_at
+			FROM subscription_boosts sb
+			WHERE sb.user_id = ?
+			AND sb.status = 'active'
+			AND sb.ends_at > datetime('now')
+			ORDER BY sb.created_at DESC
+			LIMIT 1
+		`)
+		.get(userId) as {
+		id: string;
+		boost_product_id: string;
+		original_product_id: string | null;
+		ends_at: string;
+	} | undefined;
+
+	if (activeBoost) {
+		// User has an active boost - return the boost product
+		const boostProduct = db
+			.prepare("SELECT * FROM subscription_products WHERE id = ?")
+			.get(activeBoost.boost_product_id) as SubscriptionProduct | undefined;
+
+		// Get original subscription for reference
+		const originalSubscription = db
+			.prepare(
+				`SELECT us.* FROM user_subscriptions us
+				WHERE us.user_id = ?
+				AND (us.ends_at IS NULL OR us.ends_at > datetime('now'))
+				ORDER BY us.created_at DESC
+				LIMIT 1`,
+			)
+			.get(userId) as UserSubscription | undefined;
+
+		return {
+			subscription: originalSubscription || null,
+			product: boostProduct || null,
+			boost: {
+				isBoost: true,
+				boostId: activeBoost.id,
+				boostEndsAt: activeBoost.ends_at,
+				originalProductId: activeBoost.original_product_id,
+			},
+		};
+	}
+
+	// No boost - return normal subscription
 	const subscription = db
 		.prepare(
 			`SELECT us.* FROM user_subscriptions us
@@ -175,14 +233,18 @@ export function getUserSubscription(userId: string): {
 		.get(userId) as UserSubscription | undefined;
 
 	if (!subscription) {
-		return { subscription: null, product: null };
+		return { subscription: null, product: null, boost: { isBoost: false } };
 	}
 
 	const product = db
 		.prepare("SELECT * FROM subscription_products WHERE id = ?")
 		.get(subscription.product_id) as SubscriptionProduct | undefined;
 
-	return { subscription: subscription || null, product: product || null };
+	return {
+		subscription: subscription || null,
+		product: product || null,
+		boost: { isBoost: false },
+	};
 }
 
 /**
@@ -210,6 +272,37 @@ export function getAvailableCredits(userId: string): number {
 		.get(userId) as CreditRow;
 
 	return result.total;
+}
+
+/**
+ * Get allowed models for a user based on their subscription tier
+ * Returns null if all models are allowed, or an array of model IDs
+ */
+export function getAllowedModelsForUser(userId: string): string[] | null {
+	const { product } = getUserSubscription(userId);
+
+	if (!product || !product.allowed_models) {
+		return null; // No restriction - all models allowed
+	}
+
+	try {
+		return JSON.parse(product.allowed_models) as string[];
+	} catch {
+		return null; // Invalid JSON - allow all models as fallback
+	}
+}
+
+/**
+ * Check if a user can use a specific model
+ */
+export function canUserUseModel(userId: string, modelId: string): boolean {
+	const allowedModels = getAllowedModelsForUser(userId);
+
+	if (allowedModels === null) {
+		return true; // All models allowed
+	}
+
+	return allowedModels.includes(modelId);
 }
 
 /**

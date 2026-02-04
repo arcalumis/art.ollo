@@ -18,12 +18,13 @@ import { WelcomeScreen } from "./components/WelcomeScreen";
 import type { ProjectMetadata } from "./types/ollo";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { useEnhancePrompt, useGenerate, useHistory, useModels, useThreads, useUploads } from "./hooks/useApi";
-import { useUserUsage } from "./hooks/useUserSettings";
+import { useUserSubscription, useUserUsage } from "./hooks/useUserSettings";
 import { AdminLayout } from "./pages/AdminLayout";
 import { Billing } from "./pages/Billing";
 
 // Lazy load admin pages - these are only loaded when admin navigates to them
 const AdminCosts = lazy(() => import("./pages/AdminCosts"));
+const AdminCreditPackages = lazy(() => import("./pages/AdminCreditPackages"));
 const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
 const AdminFinancials = lazy(() => import("./pages/AdminFinancials"));
 const AdminMetrics = lazy(() => import("./pages/AdminMetrics"));
@@ -56,8 +57,8 @@ function MainApp() {
 		resolution: "2K",
 		outputFormat: "png",
 	});
-	const [viewMode, setViewMode] = useState<"gallery" | "chat">(
-		() => (localStorage.getItem("viewMode") as "gallery" | "chat") || "chat",
+	const [viewMode, setViewMode] = useState<"gallery" | "chat" | "billing">(
+		() => (localStorage.getItem("viewMode") as "gallery" | "chat" | "billing") || "chat",
 	);
 	const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 	const chatContainerRef = useRef<HTMLDivElement>(null);
@@ -102,6 +103,7 @@ function MainApp() {
 	} = useHistory(token);
 	const { uploads, fetchUploads, archiveUpload, unarchiveUpload, deleteUpload } = useUploads(token);
 	const { usage: userUsage, fetchUsage: fetchUserUsage } = useUserUsage(token);
+	const { subscription: userSubscription, fetchSubscription: fetchUserSubscription } = useUserSubscription(token);
 
 	const selectedModelInfo = models.find((m) => m.id === selectedModel);
 	const supportsImageInput = selectedModelInfo?.supportsImageInput || false;
@@ -194,8 +196,9 @@ function MainApp() {
 			refreshHistory();
 			fetchUploads(showArchived);
 			fetchUserUsage();
+			fetchUserSubscription();
 		}
-	}, [token, fetchThreads, refreshHistory, fetchUploads, showArchived, fetchUserUsage]);
+	}, [token, fetchThreads, refreshHistory, fetchUploads, showArchived, fetchUserUsage, fetchUserSubscription]);
 
 	useEffect(() => {
 		if (!supportsImageInput) {
@@ -232,9 +235,9 @@ function MainApp() {
 			prompt,
 			model: selectedModel,
 			imageInputs: supportsImageInput ? imageInputs : undefined,
-			aspectRatio: supportsImageInput ? creationOptions.aspectRatio : undefined,
-			resolution: supportsImageInput ? creationOptions.resolution : undefined,
-			outputFormat: supportsImageInput ? creationOptions.outputFormat : undefined,
+			aspectRatio: creationOptions.aspectRatio,
+			resolution: creationOptions.resolution,
+			outputFormat: creationOptions.outputFormat,
 			threadId: activeThread?.id,
 			// Variation models always generate 4 outputs
 			numOutputs: isVariation ? 4 : undefined,
@@ -535,7 +538,7 @@ function MainApp() {
 					</div>
 					<div className="flex items-center gap-3">
 						<ModelsHelpButton onClick={() => setShowModelsRef(true)} />
-						{userUsage?.limits?.dailyImageLimit && (
+						{userUsage?.limits?.dailyImageLimit != null && userUsage.limits.dailyImageLimit > 0 && (
 							<div className="text-xs text-[var(--text-secondary)]">
 								Today: <span className="text-[var(--accent)]">
 									{userUsage.dailyUsage?.imageCount ?? 0} / {userUsage.limits.dailyImageLimit}
@@ -548,7 +551,10 @@ function MainApp() {
 
 				{/* Scrollable Content Area */}
 				<div className="flex-1 overflow-y-auto" ref={chatContainerRef}>
-					{viewMode === "chat" ? (
+					{viewMode === "billing" ? (
+						/* Billing View */
+						<Billing embedded onBack={() => setViewMode("chat")} />
+					) : viewMode === "chat" ? (
 						<div className="max-w-2xl mx-auto px-4 py-6">
 							{showWelcome ? (
 								<WelcomeScreen
@@ -632,32 +638,41 @@ function MainApp() {
 					)}
 				</div>
 
-				{/* Creation Panel */}
-				<CreationPanel
-					models={models}
-					selectedModel={selectedModel}
-					onSelectModel={setSelectedModel}
-					supportsImageInput={supportsImageInput}
-					token={token}
-					imageInputs={imageInputs}
-					onImagesChange={setImageInputs}
-					maxImages={selectedModelInfo?.maxImages || 14}
-					options={creationOptions}
-					onOptionsChange={setCreationOptions}
-					onGenerate={handleGenerate}
-					onEnhance={enhancePrompt}
-					loading={generating}
-					queueCount={generationQueue.length}
-				/>
+				{/* Creation Panel - hide when viewing billing */}
+				{viewMode !== "billing" && (
+					<>
+						<CreationPanel
+							models={models}
+							selectedModel={selectedModel}
+							onSelectModel={setSelectedModel}
+							supportsImageInput={supportsImageInput}
+							token={token}
+							imageInputs={imageInputs}
+							onImagesChange={setImageInputs}
+							maxImages={selectedModelInfo?.maxImages || 14}
+							options={creationOptions}
+							onOptionsChange={setCreationOptions}
+							onGenerate={handleGenerate}
+							onEnhance={enhancePrompt}
+							loading={generating}
+							queueCount={generationQueue.filter(q => q.status !== 'failed').length}
+							allowedModels={userSubscription?.subscription?.allowedModels}
+						/>
 
-				{/* Generation status */}
-				<div className="px-4 pb-2">
-					<GenerationStatus loading={generating} error={generateError} />
-				</div>
+						{/* Generation status */}
+						<div className="px-4 pb-2">
+							<GenerationStatus loading={generating} error={generateError} />
+						</div>
+					</>
+				)}
 			</main>
 
 			{/* User Settings Modal */}
-			<UserSettings isOpen={showSettings} onClose={() => setShowSettings(false)} />
+			<UserSettings
+				isOpen={showSettings}
+				onClose={() => setShowSettings(false)}
+				onOpenBilling={() => setViewMode("billing")}
+			/>
 
 			{/* Thread Delete Dialog */}
 			<ThreadDeleteDialog
@@ -685,6 +700,11 @@ function MainApp() {
 					setShowModelsRef(false);
 				}}
 				currentModel={selectedModel}
+				allowedModels={userSubscription?.subscription?.allowedModels}
+				onUpgrade={() => {
+					setShowModelsRef(false);
+					window.location.href = "/billing";
+				}}
 			/>
 		</div>
 	);
@@ -756,6 +776,7 @@ function AppRoutes() {
 				<Route path="users" element={<Suspense fallback={<AdminLoading />}><AdminUsers /></Suspense>} />
 				<Route path="users/:id" element={<Suspense fallback={<AdminLoading />}><AdminUsers /></Suspense>} />
 				<Route path="products" element={<Suspense fallback={<AdminLoading />}><AdminProducts /></Suspense>} />
+				<Route path="credit-packages" element={<Suspense fallback={<AdminLoading />}><AdminCreditPackages /></Suspense>} />
 				<Route path="financials" element={<Suspense fallback={<AdminLoading />}><AdminFinancials /></Suspense>} />
 				<Route path="financials/revenue" element={<Suspense fallback={<AdminLoading />}><AdminRevenue /></Suspense>} />
 				<Route path="financials/costs" element={<Suspense fallback={<AdminLoading />}><AdminCosts /></Suspense>} />

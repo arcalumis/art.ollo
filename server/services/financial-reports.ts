@@ -143,8 +143,8 @@ export function calculateMetrics(startDate: Date, endDate: Date): FinancialMetri
 	for (const row of revenueByType) {
 		const amount = (row.total || 0) / 100; // Convert cents to dollars
 		revenue.total += amount;
-		if (row.event_type === "subscription") {
-			revenue.subscription = amount;
+		if (row.event_type === "subscription" || row.event_type === "sol_subscription") {
+			revenue.subscription += amount;
 		} else if (row.event_type === "overage") {
 			revenue.overage = amount;
 		} else if (row.event_type === "credit_usage" || row.event_type === "credit_purchase") {

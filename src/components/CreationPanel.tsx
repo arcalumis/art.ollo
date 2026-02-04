@@ -52,6 +52,9 @@ interface CreationPanelProps {
 	// State
 	loading: boolean;
 	queueCount: number;
+
+	// Subscription
+	allowedModels?: string[] | null;
 }
 
 export function CreationPanel({
@@ -69,7 +72,13 @@ export function CreationPanel({
 	onEnhance,
 	loading,
 	queueCount,
+	allowedModels,
 }: CreationPanelProps) {
+	// Check if a model is available on the user's plan
+	const isModelAvailable = (modelId: string) => {
+		if (allowedModels === null || allowedModels === undefined) return true;
+		return allowedModels.includes(modelId);
+	};
 	const [prompt, setPrompt] = useState("");
 	const [enhancing, setEnhancing] = useState(false);
 	const [uploading, setUploading] = useState(false);
@@ -270,43 +279,49 @@ export function CreationPanel({
 								onChange={(e) => onSelectModel(e.target.value)}
 								className="cyber-input flex-1 w-full min-w-40 px-2 rounded text-xs text-[var(--text-primary)] flex items-center"
 							>
-								{models.map((m) => (
-									<option key={m.id} value={m.id}>
-										{m.name}
+								{models.map((m) => {
+									const available = isModelAvailable(m.id);
+									return (
+										<option
+											key={m.id}
+											value={m.id}
+											disabled={!available}
+											className={!available ? "text-gray-500" : ""}
+										>
+											{m.name}{!available ? " 🔒" : ""}
+										</option>
+									);
+								})}
+							</select>
+						</div>
+
+						{/* Row 2: Aspect Ratio & Resolution (shown for all models) */}
+						<div className="flex-1 flex gap-2">
+							<select
+								value={options.aspectRatio}
+								onChange={(e) => onOptionsChange({ ...options, aspectRatio: e.target.value })}
+								className="cyber-input flex-1 px-2 rounded text-xs text-[var(--text-primary)]"
+								title="Aspect Ratio"
+							>
+								{(supportsImageInput ? ASPECT_RATIOS : ASPECT_RATIOS.filter(r => r.value !== "match_input_image")).map((r) => (
+									<option key={r.value} value={r.value}>
+										{r.label}
+									</option>
+								))}
+							</select>
+							<select
+								value={options.resolution}
+								onChange={(e) => onOptionsChange({ ...options, resolution: e.target.value })}
+								className="cyber-input flex-1 px-2 rounded text-xs text-[var(--text-primary)]"
+								title="Resolution"
+							>
+								{RESOLUTIONS.map((r) => (
+									<option key={r.value} value={r.value}>
+										{r.label}
 									</option>
 								))}
 							</select>
 						</div>
-
-						{/* Row 2: Aspect Ratio & Resolution */}
-						{supportsImageInput && (
-							<div className="flex-1 flex gap-2">
-								<select
-									value={options.aspectRatio}
-									onChange={(e) => onOptionsChange({ ...options, aspectRatio: e.target.value })}
-									className="cyber-input flex-1 px-2 rounded text-xs text-[var(--text-primary)]"
-									title="Aspect Ratio"
-								>
-									{ASPECT_RATIOS.map((r) => (
-										<option key={r.value} value={r.value}>
-											{r.label}
-										</option>
-									))}
-								</select>
-								<select
-									value={options.resolution}
-									onChange={(e) => onOptionsChange({ ...options, resolution: e.target.value })}
-									className="cyber-input flex-1 px-2 rounded text-xs text-[var(--text-primary)]"
-									title="Resolution"
-								>
-									{RESOLUTIONS.map((r) => (
-										<option key={r.value} value={r.value}>
-											{r.label}
-										</option>
-									))}
-								</select>
-							</div>
-						)}
 
 						{/* Row 3: Upload Buttons */}
 						{supportsImageInput && (
@@ -362,26 +377,22 @@ export function CreationPanel({
 						)}
 					</div>
 
-					{/* Column 2: Prompt */}
+					{/* Column 2: Prompt or Image Required notice */}
 					<div className="order-1 md:order-2 flex-1 flex flex-col">
 						{/* Image Required Tooltip */}
 						<ImageRequiredTooltip modelId={selectedModel} show={needsImageHighlight} />
-						<textarea
-							ref={textareaRef}
-							value={isVariation ? "" : prompt}
-							onChange={(e) => !isVariation && setPrompt(e.target.value)}
-							onKeyDown={handleKeyDown}
-							placeholder={
-								isVariation
-									? "No prompt needed — upload an image and we'll generate 4 variations"
-									: "Describe your vision..."
-							}
-							disabled={enhancing || isVariation}
-							className={`cyber-input w-full h-full px-4 py-3 rounded-lg text-sm resize-none ${
-								isVariation ? "opacity-60 cursor-not-allowed" : ""
-							}`}
-							style={{ minHeight: "120px" }}
-						/>
+						{!isVariation && (
+							<textarea
+								ref={textareaRef}
+								value={prompt}
+								onChange={(e) => setPrompt(e.target.value)}
+								onKeyDown={handleKeyDown}
+								placeholder="Describe your vision..."
+								disabled={enhancing}
+								className="cyber-input w-full h-full px-4 py-3 rounded-lg text-sm resize-none"
+								style={{ minHeight: "120px" }}
+							/>
+						)}
 					</div>
 
 					{/* Column 3: Action Buttons (2 rows) */}

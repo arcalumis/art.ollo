@@ -9,6 +9,31 @@ interface CheckEmailResponse {
 	username?: string;
 }
 
+interface WalletChallengeResponse {
+	challenge: string;
+	message: string;
+	isRegistered: boolean;
+	username?: string;
+}
+
+interface WalletVerifyRequest {
+	walletAddress: string;
+	challenge: string;
+	signature: string;
+	username?: string;
+}
+
+interface WalletVerifyResponse {
+	token?: string;
+	user?: {
+		id: string;
+		username: string;
+		isAdmin: boolean;
+	};
+	needsUsername?: boolean;
+	error?: string;
+}
+
 interface AuthContextType {
 	user: User | null;
 	token: string | null;
@@ -21,6 +46,8 @@ interface AuthContextType {
 	requestPasswordReset: (email: string) => Promise<boolean>;
 	resetPassword: (token: string, newPassword: string) => Promise<boolean>;
 	verifyResetToken: (token: string) => Promise<{ valid: boolean; email?: string }>;
+	requestWalletChallenge: (walletAddress: string) => Promise<WalletChallengeResponse | null>;
+	verifyWalletSignature: (data: WalletVerifyRequest) => Promise<WalletVerifyResponse | null>;
 	logout: () => void;
 }
 
@@ -201,6 +228,48 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		}
 	}, []);
 
+	// Request wallet challenge for signing
+	const requestWalletChallenge = useCallback(async (walletAddress: string): Promise<WalletChallengeResponse | null> => {
+		try {
+			const response = await fetch(`${API_BASE}/api/auth/wallet/challenge`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ walletAddress }),
+			});
+
+			if (!response.ok) {
+				return null;
+			}
+
+			return await response.json();
+		} catch {
+			return null;
+		}
+	}, []);
+
+	// Verify wallet signature and login/register
+	const verifyWalletSignature = useCallback(async (data: WalletVerifyRequest): Promise<WalletVerifyResponse | null> => {
+		try {
+			const response = await fetch(`${API_BASE}/api/auth/wallet/verify`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(data),
+			});
+
+			const result = await response.json();
+
+			if (response.ok && result.token) {
+				localStorage.setItem("token", result.token);
+				setToken(result.token);
+				setUser(result.user);
+			}
+
+			return result;
+		} catch {
+			return null;
+		}
+	}, []);
+
 	const logout = useCallback(() => {
 		localStorage.removeItem("token");
 		setToken(null);
@@ -221,6 +290,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 				requestPasswordReset,
 				resetPassword,
 				verifyResetToken,
+				requestWalletChallenge,
+				verifyWalletSignature,
 				logout,
 			}}
 		>

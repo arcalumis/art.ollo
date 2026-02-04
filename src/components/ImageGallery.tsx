@@ -168,6 +168,8 @@ export function ImageGallery({
 					return (
 						<div
 							key={gen.id}
+							role="button"
+							tabIndex={0}
 							className={`group relative aspect-square rounded overflow-hidden cyber-card cursor-pointer hover:neon-border transition-all ${
 								isTrashed ? "opacity-50" : ""
 							}`}
@@ -285,6 +287,8 @@ export function ImageGallery({
 				{!showTrash && uploads.map((upload) => (
 						<div
 							key={`upload-${upload.id}`}
+							role="button"
+							tabIndex={0}
 							className="group relative aspect-square rounded overflow-hidden cyber-card cursor-pointer hover:neon-border transition-all"
 							onClick={() => setSelectedUpload(upload)}
 							onKeyDown={(e) => e.key === "Enter" && setSelectedUpload(upload)}
@@ -384,127 +388,131 @@ export function ImageGallery({
 			{/* Lightbox Modal */}
 			{selectedImage && (
 				<div
-					className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4"
+					className="fixed inset-0 bg-black/90 z-50 overflow-y-auto"
 					onClick={() => setSelectedImage(null)}
 					onKeyDown={(e) => e.key === "Escape" && setSelectedImage(null)}
 				>
-					<div
-						className="max-w-4xl w-full bg-gray-900 rounded-lg overflow-hidden"
-						onClick={(e) => e.stopPropagation()}
-						onKeyDown={() => {}}
+					{/* Close button - fixed position */}
+					<button
+						type="button"
+						onClick={() => setSelectedImage(null)}
+						className="fixed top-4 right-4 z-[60] p-2 bg-gray-800/80 hover:bg-gray-700 rounded-full transition-colors"
+						title="Close"
 					>
-						<img
-							src={`${API_BASE}${selectedImage.imageUrl}`}
-							alt={selectedImage.prompt}
-							className={`w-full max-h-[70vh] object-contain ${selectedImage.deletedAt ? "grayscale opacity-60" : ""}`}
-						/>
-						<div className="p-4">
-							<p className="text-white mb-2">{selectedImage.prompt}</p>
-							{selectedImage.deletedAt && (
-								<p className="text-red-400 text-sm mb-2">
-									In trash - deletes in {getTimeRemaining(selectedImage.deletedAt)}
-								</p>
-							)}
-							<div className="flex items-center justify-between text-sm text-gray-400">
-								<span>{selectedImage.model}</span>
-								<span>{new Date(selectedImage.createdAt).toLocaleString()}</span>
-							</div>
-							<div className="flex gap-2 mt-4">
-								<a
-									href={`${API_BASE}${selectedImage.imageUrl}`}
-									download
-									className="px-4 py-2 cyber-button rounded-lg text-sm"
-								>
-									Download
-								</a>
-								{onAddToInputs && !selectedImage.deletedAt && (
-									<button
-										type="button"
-										onClick={() => onAddToInputs(selectedImage.imageUrl || "")}
-										className={`px-4 py-2 rounded-lg text-sm transition-colors ${
-											selectedInputUrls.includes(selectedImage.imageUrl || "")
-												? "bg-cyan-600 hover:bg-cyan-500"
-												: "bg-gray-600 hover:bg-cyan-600"
-										}`}
-									>
-										{selectedInputUrls.includes(selectedImage.imageUrl || "") ? "Added" : "Add to Inputs"}
-									</button>
+						<IconClose className="w-6 h-6" />
+					</button>
+					<div className="min-h-full flex items-center justify-center p-4 py-12">
+						<div
+							className="max-w-4xl w-full bg-gray-900 rounded-lg overflow-hidden"
+							onClick={(e) => e.stopPropagation()}
+							onKeyDown={() => {}}
+						>
+							<img
+								src={`${API_BASE}${selectedImage.imageUrl}`}
+								alt={selectedImage.prompt}
+								className={`w-full object-contain ${selectedImage.deletedAt ? "grayscale opacity-60" : ""}`}
+							/>
+							<div className="p-4">
+								<p className="text-white mb-2">{selectedImage.prompt}</p>
+								{selectedImage.deletedAt && (
+									<p className="text-red-400 text-sm mb-2">
+										In trash - deletes in {getTimeRemaining(selectedImage.deletedAt)}
+									</p>
 								)}
-								{selectedImage.deletedAt ? (
-									<>
-										{onRestore && (
-											<button
-												type="button"
-												onClick={() => {
-													onRestore(selectedImage.id);
-													setSelectedImage(null);
-												}}
-												className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg text-sm transition-colors"
-											>
-												Restore
-											</button>
-										)}
-										{onDelete && (
-											<button
-												type="button"
-												onClick={() => {
-													onDelete(selectedImage.id);
-													setSelectedImage(null);
-												}}
-												className="px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-sm transition-colors"
-											>
-												Delete Now
-											</button>
-										)}
-									</>
-								) : showArchived ? (
-									onUnarchive && (
+								<div className="flex items-center justify-between text-sm text-gray-400">
+									<span>{selectedImage.model}</span>
+									<span>{new Date(selectedImage.createdAt).toLocaleString()}</span>
+								</div>
+								<div className="flex flex-wrap gap-2 mt-4">
+									<a
+										href={`${API_BASE}${selectedImage.imageUrl}`}
+										download
+										className="px-4 py-2 cyber-button rounded-lg text-sm"
+									>
+										Download
+									</a>
+									{onAddToInputs && !selectedImage.deletedAt && (
 										<button
 											type="button"
-											onClick={() => {
-												onUnarchive(selectedImage.id);
-												setSelectedImage(null);
-											}}
-											className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm transition-colors"
+											onClick={() => onAddToInputs(selectedImage.imageUrl || "")}
+											className={`px-4 py-2 rounded-lg text-sm transition-colors ${
+												selectedInputUrls.includes(selectedImage.imageUrl || "")
+													? "bg-cyan-600 hover:bg-cyan-500"
+													: "bg-gray-600 hover:bg-cyan-600"
+											}`}
 										>
-											Unarchive
+											{selectedInputUrls.includes(selectedImage.imageUrl || "") ? "Added" : "Add to Inputs"}
 										</button>
-									)
-								) : (
-									<>
-										{onArchive && (
+									)}
+									{selectedImage.deletedAt ? (
+										<>
+											{onRestore && (
+												<button
+													type="button"
+													onClick={() => {
+														onRestore(selectedImage.id);
+														setSelectedImage(null);
+													}}
+													className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg text-sm transition-colors"
+												>
+													Restore
+												</button>
+											)}
+											{onDelete && (
+												<button
+													type="button"
+													onClick={() => {
+														onDelete(selectedImage.id);
+														setSelectedImage(null);
+													}}
+													className="px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-sm transition-colors"
+												>
+													Delete Now
+												</button>
+											)}
+										</>
+									) : showArchived ? (
+										onUnarchive && (
 											<button
 												type="button"
 												onClick={() => {
-													onArchive(selectedImage.id);
+													onUnarchive(selectedImage.id);
 													setSelectedImage(null);
 												}}
-												className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-lg text-sm transition-colors"
+												className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm transition-colors"
 											>
-												Archive
+												Unarchive
 											</button>
-										)}
-										{onTrash && (
-											<button
-												type="button"
-												onClick={() => {
-													onTrash(selectedImage.id);
-													setSelectedImage(null);
-												}}
-												className="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded-lg text-sm transition-colors"
-											>
-												Move to Trash
-											</button>
-										)}
-									</>
-								)}
-								<button
-									type="button"
-									onClick={() => setSelectedImage(null)}
-									className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors"
-								>
-									Close
-								</button>
+										)
+									) : (
+										<>
+											{onArchive && (
+												<button
+													type="button"
+													onClick={() => {
+														onArchive(selectedImage.id);
+														setSelectedImage(null);
+													}}
+													className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-lg text-sm transition-colors"
+												>
+													Archive
+												</button>
+											)}
+											{onTrash && (
+												<button
+													type="button"
+													onClick={() => {
+														onTrash(selectedImage.id);
+														setSelectedImage(null);
+													}}
+													className="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded-lg text-sm transition-colors"
+												>
+													Move to Trash
+												</button>
+											)}
+										</>
+									)}
+								</div>
 							</div>
 						</div>
 					</div>
@@ -514,97 +522,101 @@ export function ImageGallery({
 			{/* Upload Lightbox Modal */}
 			{selectedUpload && (
 				<div
-					className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4"
+					className="fixed inset-0 bg-black/90 z-50 overflow-y-auto"
 					onClick={() => setSelectedUpload(null)}
 					onKeyDown={(e) => e.key === "Escape" && setSelectedUpload(null)}
 				>
-					<div
-						className="max-w-4xl w-full bg-gray-900 rounded-lg overflow-hidden"
-						onClick={(e) => e.stopPropagation()}
-						onKeyDown={() => {}}
+					{/* Close button - fixed position */}
+					<button
+						type="button"
+						onClick={() => setSelectedUpload(null)}
+						className="fixed top-4 right-4 z-[60] p-2 bg-gray-800/80 hover:bg-gray-700 rounded-full transition-colors"
+						title="Close"
 					>
-						<img
-							src={`${API_BASE}${selectedUpload.imageUrl}`}
-							alt={selectedUpload.originalName}
-							className="w-full max-h-[70vh] object-contain"
-						/>
-						<div className="p-4">
-							<p className="text-white mb-2">{selectedUpload.originalName}</p>
-							<div className="flex items-center justify-between text-sm text-gray-400 mb-4">
-								<span className="px-2 py-0.5 bg-purple-600/40 rounded text-purple-300">Uploaded</span>
-								{selectedUpload.createdAt && (
-									<span>{new Date(selectedUpload.createdAt).toLocaleString()}</span>
-								)}
-							</div>
-							<div className="flex gap-2">
-								<a
-									href={`${API_BASE}${selectedUpload.imageUrl}`}
-									download
-									className="px-4 py-2 cyber-button rounded-lg text-sm"
-								>
-									Download
-								</a>
-								{onAddToInputs && (
-									<button
-										type="button"
-										onClick={() => onAddToInputs(selectedUpload.imageUrl)}
-										className={`px-4 py-2 rounded-lg text-sm transition-colors ${
-											selectedInputUrls.includes(selectedUpload.imageUrl)
-												? "bg-cyan-600 hover:bg-cyan-500"
-												: "bg-gray-600 hover:bg-cyan-600"
-										}`}
+						<IconClose className="w-6 h-6" />
+					</button>
+					<div className="min-h-full flex items-center justify-center p-4 py-12">
+						<div
+							className="max-w-4xl w-full bg-gray-900 rounded-lg overflow-hidden"
+							onClick={(e) => e.stopPropagation()}
+							onKeyDown={() => {}}
+						>
+							<img
+								src={`${API_BASE}${selectedUpload.imageUrl}`}
+								alt={selectedUpload.originalName}
+								className="w-full object-contain"
+							/>
+							<div className="p-4">
+								<p className="text-white mb-2">{selectedUpload.originalName}</p>
+								<div className="flex items-center justify-between text-sm text-gray-400 mb-4">
+									<span className="px-2 py-0.5 bg-purple-600/40 rounded text-purple-300">Uploaded</span>
+									{selectedUpload.createdAt && (
+										<span>{new Date(selectedUpload.createdAt).toLocaleString()}</span>
+									)}
+								</div>
+								<div className="flex flex-wrap gap-2">
+									<a
+										href={`${API_BASE}${selectedUpload.imageUrl}`}
+										download
+										className="px-4 py-2 cyber-button rounded-lg text-sm"
 									>
-										{selectedInputUrls.includes(selectedUpload.imageUrl) ? "Added" : "Add to Inputs"}
-									</button>
-								)}
-								{showArchived ? (
-									onUnarchiveUpload && (
+										Download
+									</a>
+									{onAddToInputs && (
 										<button
 											type="button"
-											onClick={() => {
-												onUnarchiveUpload(selectedUpload.id);
-												setSelectedUpload(null);
-											}}
-											className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm transition-colors"
+											onClick={() => onAddToInputs(selectedUpload.imageUrl)}
+											className={`px-4 py-2 rounded-lg text-sm transition-colors ${
+												selectedInputUrls.includes(selectedUpload.imageUrl)
+													? "bg-cyan-600 hover:bg-cyan-500"
+													: "bg-gray-600 hover:bg-cyan-600"
+											}`}
 										>
-											Unarchive
+											{selectedInputUrls.includes(selectedUpload.imageUrl) ? "Added" : "Add to Inputs"}
 										</button>
-									)
-								) : (
-									<>
-										{onArchiveUpload && (
+									)}
+									{showArchived ? (
+										onUnarchiveUpload && (
 											<button
 												type="button"
 												onClick={() => {
-													onArchiveUpload(selectedUpload.id);
+													onUnarchiveUpload(selectedUpload.id);
 													setSelectedUpload(null);
 												}}
-												className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-lg text-sm transition-colors"
+												className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm transition-colors"
 											>
-												Archive
+												Unarchive
 											</button>
-										)}
-										{onDeleteUpload && (
-											<button
-												type="button"
-												onClick={() => {
-													onDeleteUpload(selectedUpload.id);
-													setSelectedUpload(null);
-												}}
-												className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm transition-colors"
-											>
-												Delete
-											</button>
-										)}
-									</>
-								)}
-								<button
-									type="button"
-									onClick={() => setSelectedUpload(null)}
-									className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors"
-								>
-									Close
-								</button>
+										)
+									) : (
+										<>
+											{onArchiveUpload && (
+												<button
+													type="button"
+													onClick={() => {
+														onArchiveUpload(selectedUpload.id);
+														setSelectedUpload(null);
+													}}
+													className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-lg text-sm transition-colors"
+												>
+													Archive
+												</button>
+											)}
+											{onDeleteUpload && (
+												<button
+													type="button"
+													onClick={() => {
+														onDeleteUpload(selectedUpload.id);
+														setSelectedUpload(null);
+													}}
+													className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm transition-colors"
+												>
+													Delete
+												</button>
+											)}
+										</>
+									)}
+								</div>
 							</div>
 						</div>
 					</div>

@@ -15,6 +15,8 @@ import { billingRoutes } from "./routes/billing";
 import { generateRoutes } from "./routes/generate";
 import { historyRoutes } from "./routes/history";
 import { modelsRoutes } from "./routes/models";
+import { solanaBillingRoutes } from "./routes/solana-billing";
+import { solanaRpcRoutes } from "./routes/solana-rpc";
 import { stripeWebhookRoutes } from "./routes/stripe-webhooks";
 import { uploadsRoutes } from "./routes/uploads";
 import { userRoutes } from "./routes/user";
@@ -56,9 +58,16 @@ async function start() {
 		contentSecurityPolicy: isProduction ? {
 			directives: {
 				defaultSrc: ["'self'"],
+				connectSrc: [
+					"'self'",
+					"https://*.alchemy.com",      // Alchemy RPC
+					"https://*.solana.com",       // Public Solana RPC
+					"wss://*.alchemy.com",        // WebSocket connections
+				],
 				imgSrc: ["'self'", "data:", "blob:"],
 				scriptSrc: ["'self'", "'unsafe-inline'"],
-				styleSrc: ["'self'", "'unsafe-inline'"],
+				styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+				fontSrc: ["'self'", "https://fonts.gstatic.com"],
 			},
 		} : false, // Disable CSP in dev (different origins)
 		crossOriginEmbedderPolicy: false,
@@ -102,6 +111,8 @@ async function start() {
 	await fastify.register(adminRoutes);
 	await fastify.register(adminFinancialsRoutes);
 	await fastify.register(billingRoutes);
+	await fastify.register(solanaBillingRoutes);
+	await fastify.register(solanaRpcRoutes);
 	await fastify.register(stripeWebhookRoutes);
 	await fastify.register(threadRoutes);
 

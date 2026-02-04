@@ -67,7 +67,7 @@ export function ResetPasswordPage() {
 			<div className="w-full max-w-sm">
 				<div className="cyber-card rounded-lg p-6 shadow-2xl">
 					<h1 className="text-3xl font-bold text-center mb-2 gradient-text">ollo.art</h1>
-					<p className="text-cyan-400/70 text-center text-sm mb-6">neural image synthesis</p>
+					<p className="text-cyan-400/70 text-center text-sm mb-6">build with divine inspiration</p>
 
 					{status === "loading" && (
 						<div className="text-center py-8">

@@ -46,5 +46,8 @@ EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD bun -e "fetch('http://localhost:3001/api/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
+# Ensure Docker sends SIGTERM for graceful shutdown
+STOPSIGNAL SIGTERM
+
 # Run the server
 CMD ["bun", "run", "server/index.ts"]

@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Button } from "../components/Button";
 import { IconPlus } from "../components/Icons";
 import { Modal } from "../components/Modal";
+import { API_BASE } from "../config";
 import { useAuth } from "../contexts/AuthContext";
 import { useAdminProducts } from "../hooks/useAdmin";
-import type { SubscriptionProduct } from "../types";
+import type { Model, SubscriptionProduct } from "../types";
 
 interface ProductFormData {
 	name: string;
@@ -14,6 +15,10 @@ interface ProductFormData {
 	dailyImageLimit: string;
 	bonusCredits: string;
 	price: string;
+	priceSol: string;
+	availableForUsd: boolean;
+	availableForSol: boolean;
+	allowedModels: string[] | null;
 }
 
 const emptyForm: ProductFormData = {
@@ -24,6 +29,10 @@ const emptyForm: ProductFormData = {
 	dailyImageLimit: "",
 	bonusCredits: "0",
 	price: "0",
+	priceSol: "",
+	availableForUsd: true,
+	availableForSol: false,
+	allowedModels: null,
 };
 
 export default function AdminProducts() {
@@ -33,10 +42,24 @@ export default function AdminProducts() {
 	const [showForm, setShowForm] = useState(false);
 	const [editingProduct, setEditingProduct] = useState<SubscriptionProduct | null>(null);
 	const [formData, setFormData] = useState<ProductFormData>(emptyForm);
+	const [availableModels, setAvailableModels] = useState<Model[]>([]);
+
+	const fetchModels = useCallback(async () => {
+		try {
+			const res = await fetch(`${API_BASE}/api/models`);
+			if (res.ok) {
+				const data = await res.json();
+				setAvailableModels(data.models || []);
+			}
+		} catch (err) {
+			console.error("Failed to fetch models:", err);
+		}
+	}, []);
 
 	useEffect(() => {
 		fetchProducts();
-	}, [fetchProducts]);
+		fetchModels();
+	}, [fetchProducts, fetchModels]);
 
 	const handleSubmit = async (e: React.FormEvent) => {
 		e.preventDefault();
@@ -56,6 +79,10 @@ export default function AdminProducts() {
 				: undefined,
 			bonusCredits: Number.parseInt(formData.bonusCredits || "0", 10),
 			price: Number.parseFloat(formData.price || "0"),
+			priceSol: formData.priceSol ? Number.parseFloat(formData.priceSol) : undefined,
+			availableForUsd: formData.availableForUsd,
+			availableForSol: formData.availableForSol,
+			allowedModels: formData.allowedModels,
 		};
 
 		if (editingProduct) {
@@ -86,8 +113,40 @@ export default function AdminProducts() {
 			dailyImageLimit: product.dailyImageLimit?.toString() || "",
 			bonusCredits: product.bonusCredits.toString(),
 			price: product.price.toString(),
+			priceSol: product.priceSol?.toString() || "",
+			availableForUsd: product.availableForUsd,
+			availableForSol: product.availableForSol,
+			allowedModels: product.allowedModels,
 		});
 		setShowForm(true);
+	};
+
+	const toggleModel = (modelId: string) => {
+		setFormData((prev) => {
+			// If currently null (all models), switch to all models except this one
+			if (prev.allowedModels === null) {
+				const allModelIds = availableModels.map((m) => m.id);
+				return { ...prev, allowedModels: allModelIds.filter((id) => id !== modelId) };
+			}
+			// If model is in list, remove it
+			if (prev.allowedModels.includes(modelId)) {
+				const newAllowed = prev.allowedModels.filter((id) => id !== modelId);
+				return { ...prev, allowedModels: newAllowed.length > 0 ? newAllowed : [] };
+			}
+			// If model is not in list, add it
+			return { ...prev, allowedModels: [...prev.allowedModels, modelId] };
+		});
+	};
+
+	const toggleAllModels = () => {
+		setFormData((prev) => {
+			if (prev.allowedModels === null) {
+				// Currently all models - switch to none
+				return { ...prev, allowedModels: [] };
+			}
+			// Switch to all models (null)
+			return { ...prev, allowedModels: null };
+		});
 	};
 
 	const handleDelete = async (product: SubscriptionProduct) => {
@@ -141,10 +200,19 @@ export default function AdminProducts() {
 							<div className="flex items-start justify-between mb-2">
 								<div>
 									<h3 className="text-sm font-semibold">{product.name}</h3>
-									{!product.isActive && <span className="text-[10px] text-red-400">Inactive</span>}
+									<div className="flex gap-1 mt-0.5">
+										{!product.isActive && <span className="text-[10px] text-red-400">Inactive</span>}
+										{product.availableForUsd && <span className="text-[10px] px-1 bg-green-500/20 text-green-400 rounded">USD</span>}
+										{product.availableForSol && <span className="text-[10px] px-1 bg-purple-500/20 text-purple-400 rounded">SOL</span>}
+									</div>
 								</div>
-								<div className="text-lg font-bold text-pink-400">
-									{product.price > 0 ? `$${product.price}` : "Free"}
+								<div className="text-right">
+									<div className="text-lg font-bold text-pink-400">
+										{product.price > 0 ? `$${product.price}` : "Free"}
+									</div>
+									{product.priceSol != null && product.priceSol > 0 && (
+										<div className="text-xs text-purple-400">{product.priceSol} SOL</div>
+									)}
 								</div>
 							</div>
 
@@ -164,6 +232,12 @@ export default function AdminProducts() {
 								<div className="flex justify-between">
 									<span className="text-gray-500">Cost/mo</span>
 									<span className="text-cyan-400">{product.monthlyCostLimit ? `$${product.monthlyCostLimit}` : "∞"}</span>
+								</div>
+								<div className="flex justify-between">
+									<span className="text-gray-500">Models</span>
+									<span className="text-cyan-400">
+										{product.allowedModels === null ? "All" : product.allowedModels.length}
+									</span>
 								</div>
 								<div className="flex justify-between">
 									<span className="text-gray-500">Bonus</span>
@@ -278,7 +352,7 @@ export default function AdminProducts() {
 						</div>
 					</div>
 
-					<div className="grid grid-cols-2 gap-2">
+					<div className="grid grid-cols-3 gap-2">
 						<div>
 							<label htmlFor="product-bonus-credits" className="block text-xs font-medium text-gray-400 mb-1">Bonus Credits</label>
 							<input
@@ -300,6 +374,79 @@ export default function AdminProducts() {
 								className="cyber-input w-full px-2 py-1.5 rounded text-sm"
 							/>
 						</div>
+						<div>
+							<label htmlFor="product-price-sol" className="block text-xs font-medium text-gray-400 mb-1">Price (SOL)</label>
+							<input
+								id="product-price-sol"
+								type="number"
+								step="0.01"
+								value={formData.priceSol}
+								onChange={(e) => setFormData({ ...formData, priceSol: e.target.value })}
+								placeholder="Optional"
+								className="cyber-input w-full px-2 py-1.5 rounded text-sm"
+							/>
+						</div>
+					</div>
+
+					{/* Purchase Availability */}
+					<div className="flex gap-4 p-2 cyber-card rounded">
+						<label className="flex items-center gap-2 cursor-pointer">
+							<input
+								type="checkbox"
+								checked={formData.availableForUsd}
+								onChange={(e) => setFormData({ ...formData, availableForUsd: e.target.checked })}
+								className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-cyan-500"
+							/>
+							<span className="text-xs text-gray-300">Available for USD</span>
+						</label>
+						<label className="flex items-center gap-2 cursor-pointer">
+							<input
+								type="checkbox"
+								checked={formData.availableForSol}
+								onChange={(e) => setFormData({ ...formData, availableForSol: e.target.checked })}
+								className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-purple-500"
+							/>
+							<span className="text-xs text-gray-300">Available for SOL</span>
+						</label>
+					</div>
+
+					{/* Model Access */}
+					<div>
+						<div className="flex items-center justify-between mb-2">
+							<label className="block text-xs font-medium text-gray-400">Allowed Models</label>
+							<button
+								type="button"
+								onClick={toggleAllModels}
+								className="text-[10px] text-cyan-400 hover:text-cyan-300"
+							>
+								{formData.allowedModels === null ? "Restrict to specific models" : "Allow all models"}
+							</button>
+						</div>
+						{formData.allowedModels === null ? (
+							<p className="text-xs text-gray-500 italic">All models are accessible</p>
+						) : (
+							<div className="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto cyber-card p-2 rounded">
+								{availableModels.map((model) => (
+									<label
+										key={model.id}
+										className="flex items-center gap-1.5 text-xs cursor-pointer hover:bg-cyan-500/10 p-1 rounded"
+									>
+										<input
+											type="checkbox"
+											checked={formData.allowedModels?.includes(model.id) || false}
+											onChange={() => toggleModel(model.id)}
+											className="w-3 h-3 rounded border-gray-600 bg-gray-800 text-cyan-500 focus:ring-cyan-500 focus:ring-offset-0"
+										/>
+										<span className="truncate" title={model.name}>{model.name}</span>
+									</label>
+								))}
+							</div>
+						)}
+						{formData.allowedModels !== null && (
+							<p className="text-[10px] text-gray-500 mt-1">
+								{formData.allowedModels.length} of {availableModels.length} models selected
+							</p>
+						)}
 					</div>
 
 					<div className="flex gap-2 pt-2">

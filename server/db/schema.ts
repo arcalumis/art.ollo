@@ -34,6 +34,13 @@ export function initializeSchema(db: Database): void {
 		// Column already exists
 	}
 
+	// Add wallet_address column to users
+	try {
+		db.exec("ALTER TABLE users ADD COLUMN wallet_address TEXT UNIQUE");
+	} catch {
+		// Column already exists
+	}
+
 	// Subscription products table
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS subscription_products (
@@ -45,9 +52,16 @@ export function initializeSchema(db: Database): void {
 			bonus_credits INTEGER DEFAULT 0,
 			price REAL DEFAULT 0,
 			is_active INTEGER DEFAULT 1,
+			allowed_models TEXT,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`);
+
+	// Migration: Add allowed_models column if it doesn't exist
+	const columns = db.prepare("PRAGMA table_info(subscription_products)").all() as Array<{ name: string }>;
+	if (!columns.some((c) => c.name === "allowed_models")) {
+		db.exec("ALTER TABLE subscription_products ADD COLUMN allowed_models TEXT");
+	}
 
 	// User subscriptions table
 	db.exec(`
@@ -240,6 +254,22 @@ export function initializeSchema(db: Database): void {
 		CREATE INDEX IF NOT EXISTS idx_email_tokens_token ON email_tokens(token);
 		CREATE INDEX IF NOT EXISTS idx_email_tokens_user_id ON email_tokens(user_id);
 		CREATE INDEX IF NOT EXISTS idx_email_tokens_expires ON email_tokens(expires_at);
+	`);
+
+	// Wallet challenges table for Solana wallet authentication
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS wallet_challenges (
+			id TEXT PRIMARY KEY,
+			wallet_address TEXT NOT NULL,
+			challenge TEXT UNIQUE NOT NULL,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME DEFAULT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_wallet_challenges_challenge ON wallet_challenges(challenge);
+		CREATE INDEX IF NOT EXISTS idx_wallet_challenges_wallet ON wallet_challenges(wallet_address);
+		CREATE INDEX IF NOT EXISTS idx_wallet_challenges_expires ON wallet_challenges(expires_at);
 	`);
 
 	// ============================================
@@ -502,4 +532,133 @@ export function initializeSchema(db: Database): void {
 			WHERE user_id = ? AND thread_id IS NULL
 		`).run(historyThread.id, user_id);
 	}
+
+	// ============================================
+	// SOLANA PAYMENTS
+	// ============================================
+
+	// Track Solana payments
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS solana_transactions (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			wallet_address TEXT NOT NULL,
+			transaction_signature TEXT UNIQUE NOT NULL,
+			amount_lamports INTEGER NOT NULL,
+			amount_sol REAL NOT NULL,
+			credits_purchased INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			network TEXT NOT NULL DEFAULT 'mainnet-beta',
+			verified_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_solana_transactions_user_id ON solana_transactions(user_id);
+		CREATE INDEX IF NOT EXISTS idx_solana_transactions_signature ON solana_transactions(transaction_signature);
+		CREATE INDEX IF NOT EXISTS idx_solana_transactions_status ON solana_transactions(status);
+	`);
+
+	// Credit packages for SOL purchases
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS solana_credit_packages (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			credits INTEGER NOT NULL,
+			price_sol REAL NOT NULL,
+			is_active INTEGER DEFAULT 1,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`);
+
+	// Create default SOL credit packages if none exist
+	const existingSolPackage = db.prepare("SELECT id FROM solana_credit_packages LIMIT 1").get();
+	if (!existingSolPackage) {
+		const packages = [
+			{ name: "Starter", credits: 50, price_sol: 0.1 },
+			{ name: "Creator", credits: 200, price_sol: 0.35 },
+			{ name: "Pro", credits: 500, price_sol: 0.75 },
+		];
+		for (const pkg of packages) {
+			const pkgId = crypto.randomUUID();
+			db.prepare(`
+				INSERT INTO solana_credit_packages (id, name, credits, price_sol)
+				VALUES (?, ?, ?, ?)
+			`).run(pkgId, pkg.name, pkg.credits, pkg.price_sol);
+		}
+	}
+
+	// ============================================
+	// SUBSCRIPTION PRODUCTS - SOL PRICING
+	// ============================================
+
+	// Add price_sol column to subscription_products
+	try {
+		db.exec("ALTER TABLE subscription_products ADD COLUMN price_sol REAL DEFAULT NULL");
+	} catch {
+		// Column already exists
+	}
+
+	// Add available_for_usd column to subscription_products
+	try {
+		db.exec("ALTER TABLE subscription_products ADD COLUMN available_for_usd INTEGER DEFAULT 1");
+	} catch {
+		// Column already exists
+	}
+
+	// Add available_for_sol column to subscription_products
+	try {
+		db.exec("ALTER TABLE subscription_products ADD COLUMN available_for_sol INTEGER DEFAULT 0");
+	} catch {
+		// Column already exists
+	}
+
+	// ============================================
+	// SUBSCRIPTION BOOSTS
+	// ============================================
+
+	// Track temporary premium access grants
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS subscription_boosts (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			boost_product_id TEXT NOT NULL REFERENCES subscription_products(id),
+			original_product_id TEXT REFERENCES subscription_products(id),
+			granted_by_user_id TEXT REFERENCES users(id),
+			reason TEXT,
+			starts_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			ends_at DATETIME NOT NULL,
+			status TEXT DEFAULT 'active',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_subscription_boosts_user_id ON subscription_boosts(user_id);
+		CREATE INDEX IF NOT EXISTS idx_subscription_boosts_status ON subscription_boosts(status);
+		CREATE INDEX IF NOT EXISTS idx_subscription_boosts_ends_at ON subscription_boosts(ends_at);
+	`);
+
+	// ============================================
+	// SOLANA SUBSCRIPTION TRANSACTIONS
+	// ============================================
+
+	// Track SOL-based subscription purchases
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS solana_subscription_transactions (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			product_id TEXT NOT NULL REFERENCES subscription_products(id),
+			wallet_address TEXT NOT NULL,
+			transaction_signature TEXT UNIQUE NOT NULL,
+			amount_lamports INTEGER NOT NULL,
+			amount_sol REAL NOT NULL,
+			status TEXT DEFAULT 'pending',
+			network TEXT DEFAULT 'mainnet-beta',
+			subscription_id TEXT REFERENCES user_subscriptions(id),
+			verified_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_solana_sub_tx_user_id ON solana_subscription_transactions(user_id);
+		CREATE INDEX IF NOT EXISTS idx_solana_sub_tx_signature ON solana_subscription_transactions(transaction_signature);
+		CREATE INDEX IF NOT EXISTS idx_solana_sub_tx_status ON solana_subscription_transactions(status);
+	`);
 }

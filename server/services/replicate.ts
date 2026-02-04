@@ -83,6 +83,47 @@ const MODEL_PRICING: Record<string, ModelPricing> = {
 const DEFAULT_PRICING: ModelPricing = { type: "per_image", baseCost: 0.025 };
 
 /**
+ * Convert aspect ratio and resolution to width/height dimensions
+ * Used for models that don't support aspect_ratio parameter directly
+ */
+function aspectRatioToWidthHeight(aspectRatio: string, resolution: string): { width: number; height: number } {
+	// Parse aspect ratio (e.g., "16:9", "4:3", "1:1")
+	const [wRatio, hRatio] = aspectRatio.split(":").map(Number);
+	if (!wRatio || !hRatio) {
+		return { width: 1024, height: 1024 }; // Default fallback
+	}
+
+	// Base dimensions for each resolution
+	// 1K ≈ 1MP, 2K ≈ 2MP, 4K ≈ 8MP
+	let targetPixels: number;
+	switch (resolution) {
+		case "4K":
+			targetPixels = 8_000_000; // ~8MP
+			break;
+		case "2K":
+			targetPixels = 2_000_000; // ~2MP
+			break;
+		case "1K":
+		default:
+			targetPixels = 1_000_000; // ~1MP
+			break;
+	}
+
+	// Calculate dimensions maintaining aspect ratio
+	// width * height = targetPixels
+	// width / height = wRatio / hRatio
+	// Therefore: width = sqrt(targetPixels * wRatio / hRatio)
+	const width = Math.round(Math.sqrt(targetPixels * wRatio / hRatio));
+	const height = Math.round(width * hRatio / wRatio);
+
+	// Round to nearest 8 (some models require this)
+	const roundedWidth = Math.round(width / 8) * 8;
+	const roundedHeight = Math.round(height / 8) * 8;
+
+	return { width: roundedWidth, height: roundedHeight };
+}
+
+/**
  * Calculate megapixels from resolution string or dimensions
  */
 function calculateMegapixels(resolution?: string, width?: number, height?: number): number {
@@ -524,8 +565,15 @@ async function buildModelInput(
 
 	// These models support width/height instead of aspect_ratio
 	if (model.includes("flux-schnell") || model === "black-forest-labs/flux-dev") {
-		input.width = width;
-		input.height = height;
+		// Convert aspect ratio and resolution to width/height
+		if (options.aspectRatio && options.aspectRatio !== "match_input_image") {
+			const dims = aspectRatioToWidthHeight(options.aspectRatio, options.resolution || "1K");
+			input.width = dims.width;
+			input.height = dims.height;
+		} else {
+			input.width = width || 1024;
+			input.height = height || 1024;
+		}
 	} else {
 		input.aspect_ratio = options.aspectRatio || "1:1";
 	}

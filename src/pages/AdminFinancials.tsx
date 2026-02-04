@@ -154,6 +154,7 @@ export default function AdminFinancials() {
 							<div className="flex gap-2 mt-1 text-[10px] text-gray-500">
 								<span>Sub: {formatCurrency(overview?.revenue.subscription || 0)}</span>
 								<span>Overage: {formatCurrency(overview?.revenue.overage || 0)}</span>
+								<span>Credits: {formatCurrency(overview?.revenue.credits || 0)}</span>
 							</div>
 						</div>
 

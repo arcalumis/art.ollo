@@ -9,6 +9,7 @@ import {
 	getUserSubscription,
 	isStripeConfigured,
 } from "../services/stripe";
+import { getAvailableCredits } from "../services/usage";
 
 interface CheckoutBody {
 	priceId: string;
@@ -107,7 +108,11 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			created_at: string;
 		}>;
 
+		// Get available credits
+		const availableCredits = getAvailableCredits(userId);
+
 		return {
+			availableCredits,
 			subscription: subscription
 				? {
 						id: subscription.id,
@@ -151,6 +156,9 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 					monthly_cost_limit,
 					bonus_credits,
 					price,
+					price_sol,
+					available_for_usd,
+					available_for_sol,
 					stripe_price_id,
 					overage_price_cents
 				FROM subscription_products
@@ -165,6 +173,9 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			monthly_cost_limit: number | null;
 			bonus_credits: number;
 			price: number;
+			price_sol: number | null;
+			available_for_usd: number;
+			available_for_sol: number;
 			stripe_price_id: string | null;
 			overage_price_cents: number;
 		}>;
@@ -178,6 +189,9 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 				monthlyCostLimit: p.monthly_cost_limit,
 				bonusCredits: p.bonus_credits,
 				price: p.price,
+				priceSol: p.price_sol,
+				availableForUsd: p.available_for_usd === 1,
+				availableForSol: p.available_for_sol === 1,
 				stripePriceId: p.stripe_price_id,
 				overagePriceCents: p.overage_price_cents,
 			})),
@@ -249,7 +263,8 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 	// Get invoices (from Stripe)
 	fastify.get("/api/billing/invoices", { preHandler: authMiddleware }, async (request, reply) => {
 		if (!isStripeConfigured()) {
-			return reply.status(400).send({ error: "Billing is not configured" });
+			// Return empty array if Stripe isn't configured
+			return { invoices: [] };
 		}
 
 		const userId = request.user?.userId;

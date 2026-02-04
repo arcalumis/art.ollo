@@ -1,6 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { getDb } from "../db";
+import { optionalAuthMiddleware } from "../middleware/auth";
 import { getModels } from "../services/replicate";
+import { getAllowedModelsForUser } from "../services/usage";
 
 interface ModelStats {
 	model: string;
@@ -9,9 +11,18 @@ interface ModelStats {
 }
 
 export async function modelsRoutes(fastify: FastifyInstance): Promise<void> {
-	fastify.get("/api/models", async () => {
+	fastify.get("/api/models", { preHandler: optionalAuthMiddleware }, async (request) => {
 		const models = getModels();
 		const db = getDb();
+
+		// Filter models based on user's subscription tier
+		let filteredModels = models;
+		if (request.user) {
+			const allowedModels = getAllowedModelsForUser(request.user.userId);
+			if (allowedModels !== null) {
+				filteredModels = models.filter((m) => allowedModels.includes(m.id));
+			}
+		}
 
 		// Calculate average predict_time per model from recent generations
 		const statsQuery = `
@@ -30,7 +41,7 @@ export async function modelsRoutes(fastify: FastifyInstance): Promise<void> {
 		const statsMap = new Map(stats.map((s) => [s.model, s]));
 
 		// Merge stats into models
-		const modelsWithStats = models.map((m) => ({
+		const modelsWithStats = filteredModels.map((m) => ({
 			...m,
 			avgGenerationTime: statsMap.get(m.id)?.avg_time || null,
 			sampleCount: statsMap.get(m.id)?.sample_count || 0,

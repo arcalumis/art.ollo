@@ -1,10 +1,14 @@
-import { useState } from "react";
+import { useWallet } from "@solana/wallet-adapter-react";
+import { useState, useEffect, useRef } from "react";
 import { useAuth } from "../contexts/AuthContext";
+import { SolanaWalletButton } from "./SolanaWalletButton";
+import treasureCrowRight from "../assets/treasure_crow_right.png";
 
-type Step = "email" | "options" | "password" | "magic-link-sent" | "forgot-password" | "forgot-password-sent";
+type Step = "email" | "options" | "password" | "magic-link-sent" | "forgot-password" | "forgot-password-sent" | "wallet-signing" | "wallet-username";
 
 export function LoginForm() {
-	const { checkEmail, loginWithEmail, requestMagicLink, requestPasswordReset, login } = useAuth();
+	const { checkEmail, loginWithEmail, requestMagicLink, requestPasswordReset, login, requestWalletChallenge, verifyWalletSignature } = useAuth();
+	const { publicKey, signMessage, connected, connecting, disconnect } = useWallet();
 	const [step, setStep] = useState<Step>("email");
 	const [email, setEmail] = useState("");
 	const [password, setPassword] = useState("");
@@ -16,6 +20,33 @@ export function LoginForm() {
 	// For legacy username login
 	const [useLegacyLogin, setUseLegacyLogin] = useState(false);
 	const [username, setUsername] = useState("");
+
+	// For wallet login
+	const [walletUsername, setWalletUsername] = useState("");
+
+	// Track if user initiated wallet connection (to auto-trigger login)
+	const wasConnectingRef = useRef(false);
+	const hasAutoTriggeredRef = useRef(false);
+
+	// Track when connecting starts (user-initiated)
+	useEffect(() => {
+		if (connecting) {
+			wasConnectingRef.current = true;
+			hasAutoTriggeredRef.current = false;
+		}
+	}, [connecting]);
+
+	// Auto-trigger wallet login when connection completes after user initiated
+	useEffect(() => {
+		if (connected && wasConnectingRef.current && !hasAutoTriggeredRef.current && step === "email" && !loading) {
+			hasAutoTriggeredRef.current = true;
+			wasConnectingRef.current = false;
+			// Small delay to ensure wallet state is fully ready
+			setTimeout(() => {
+				handleWalletLogin();
+			}, 100);
+		}
+	}, [connected, step, loading]);
 
 	const handleEmailSubmit = async (e: React.FormEvent) => {
 		e.preventDefault();
@@ -92,16 +123,153 @@ export function LoginForm() {
 		setStep("email");
 		setPassword("");
 		setError("");
+		setWalletUsername("");
+	};
+
+	const handleWalletLogin = async () => {
+		if (!publicKey || !signMessage) {
+			setError("Wallet not connected or does not support signing");
+			return;
+		}
+
+		setError("");
+		setLoading(true);
+		setStep("wallet-signing");
+
+		const walletAddress = publicKey.toBase58();
+
+		// Request challenge from server
+		const challengeResponse = await requestWalletChallenge(walletAddress);
+		if (!challengeResponse) {
+			setError("Failed to get authentication challenge");
+			setLoading(false);
+			setStep("email");
+			return;
+		}
+
+		try {
+			// Sign the message with wallet
+			const messageBytes = new TextEncoder().encode(challengeResponse.message);
+			const signatureBytes = await signMessage(messageBytes);
+
+			// Convert signature to base58
+			const bs58 = await import("bs58");
+			const signature = bs58.default.encode(signatureBytes);
+
+			// Verify signature with server
+			const verifyResponse = await verifyWalletSignature({
+				walletAddress,
+				challenge: challengeResponse.challenge,
+				signature,
+			});
+
+			if (!verifyResponse) {
+				setError("Failed to verify signature");
+				setLoading(false);
+				setStep("email");
+				return;
+			}
+
+			if (verifyResponse.needsUsername) {
+				// New wallet, needs username
+				setStep("wallet-username");
+				setLoading(false);
+				return;
+			}
+
+			if (verifyResponse.error) {
+				setError(verifyResponse.error);
+				setLoading(false);
+				setStep("email");
+				return;
+			}
+
+			// Successfully logged in - AuthContext handles setting user/token
+			setLoading(false);
+		} catch (err) {
+			setError("Failed to sign message. Please try again.");
+			setLoading(false);
+			setStep("email");
+		}
+	};
+
+	const handleWalletUsernameSubmit = async (e: React.FormEvent) => {
+		e.preventDefault();
+
+		if (!publicKey || !signMessage) {
+			setError("Wallet not connected");
+			return;
+		}
+
+		if (!walletUsername.trim()) {
+			setError("Username is required");
+			return;
+		}
+
+		setError("");
+		setLoading(true);
+
+		const walletAddress = publicKey.toBase58();
+
+		// Request new challenge since previous one might be used
+		const challengeResponse = await requestWalletChallenge(walletAddress);
+		if (!challengeResponse) {
+			setError("Failed to get authentication challenge");
+			setLoading(false);
+			return;
+		}
+
+		try {
+			// Sign the message with wallet
+			const messageBytes = new TextEncoder().encode(challengeResponse.message);
+			const signatureBytes = await signMessage(messageBytes);
+
+			// Convert signature to base58
+			const bs58 = await import("bs58");
+			const signature = bs58.default.encode(signatureBytes);
+
+			// Verify signature with username
+			const verifyResponse = await verifyWalletSignature({
+				walletAddress,
+				challenge: challengeResponse.challenge,
+				signature,
+				username: walletUsername.trim(),
+			});
+
+			if (!verifyResponse) {
+				setError("Failed to create account");
+				setLoading(false);
+				return;
+			}
+
+			if (verifyResponse.error) {
+				setError(verifyResponse.error);
+				setLoading(false);
+				return;
+			}
+
+			// Successfully created account and logged in
+			setLoading(false);
+		} catch (err) {
+			setError("Failed to sign message. Please try again.");
+			setLoading(false);
+		}
+	};
+
+	const backgroundStyle = {
+		backgroundImage: `url(${treasureCrowRight})`,
+		backgroundPosition: 'top right',
+		backgroundRepeat: 'no-repeat',
 	};
 
 	// Legacy username/password login form
 	if (useLegacyLogin) {
 		return (
-			<div className="min-h-screen flex items-center justify-center p-4">
+			<div className="min-h-screen flex items-center justify-center p-4" style={backgroundStyle}>
 				<div className="w-full max-w-sm">
 					<div className="cyber-card rounded-lg p-6 shadow-2xl">
 						<h1 className="text-3xl font-bold text-center mb-2 gradient-text">ollo.art</h1>
-						<p className="text-cyan-400/70 text-center text-sm mb-6">neural image synthesis</p>
+						<p className="text-cyan-400/70 text-center text-sm mb-6">build with divine inspiration</p>
 
 						<form onSubmit={handleLegacyLogin} className="space-y-4">
 							<div>
@@ -159,11 +327,11 @@ export function LoginForm() {
 	}
 
 	return (
-		<div className="min-h-screen flex items-center justify-center p-4">
+		<div className="min-h-screen flex items-center justify-center p-4" style={backgroundStyle}>
 			<div className="w-full max-w-sm">
 				<div className="cyber-card rounded-lg p-6 shadow-2xl">
 					<h1 className="text-3xl font-bold text-center mb-2 gradient-text">ollo.art</h1>
-					<p className="text-cyan-400/70 text-center text-sm mb-6">neural image synthesis</p>
+					<p className="text-cyan-400/70 text-center text-sm mb-6">build with divine inspiration</p>
 
 					{/* Step 1: Email Input */}
 					{step === "email" && (
@@ -194,6 +362,40 @@ export function LoginForm() {
 							<button type="submit" disabled={loading} className="cyber-button w-full py-2.5 rounded font-medium text-white text-sm">
 								{loading ? "Checking..." : "Continue"}
 							</button>
+
+							<div className="relative my-4">
+								<div className="absolute inset-0 flex items-center">
+									<div className="w-full border-t border-gray-700" />
+								</div>
+								<div className="relative flex justify-center text-xs">
+									<span className="bg-gray-900 px-2 text-gray-500">or</span>
+								</div>
+							</div>
+
+							{connected && publicKey ? (
+								<div className="space-y-2">
+									<button
+										type="button"
+										onClick={handleWalletLogin}
+										disabled={loading}
+										className="w-full py-2.5 rounded font-medium text-sm cyber-card hover:neon-border transition-all flex items-center justify-center gap-2"
+									>
+										<svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+											<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+										</svg>
+										Continue with {publicKey.toBase58().slice(0, 4)}...{publicKey.toBase58().slice(-4)}
+									</button>
+									<button
+										type="button"
+										onClick={() => disconnect()}
+										className="w-full text-xs text-gray-500 hover:text-pink-400 transition-colors"
+									>
+										Disconnect wallet
+									</button>
+								</div>
+							) : (
+								<SolanaWalletButton className="w-full justify-center" />
+							)}
 
 							<button
 								type="button"
@@ -400,6 +602,76 @@ export function LoginForm() {
 								Back to login
 							</button>
 						</div>
+					)}
+
+					{/* Wallet Signing */}
+					{step === "wallet-signing" && (
+						<div className="text-center space-y-4">
+							<div className="w-16 h-16 mx-auto mb-4 rounded-full bg-purple-500/20 flex items-center justify-center">
+								<svg className="w-8 h-8 text-purple-400 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+									<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+								</svg>
+							</div>
+							<h2 className="text-lg font-medium text-white">Sign message in wallet</h2>
+							<p className="text-sm text-gray-400">
+								Please approve the signature request in your wallet to authenticate.
+							</p>
+
+							{error && (
+								<div className="p-2 bg-red-900/30 border border-red-500/30 rounded">
+									<p className="text-red-400 text-xs">{error}</p>
+								</div>
+							)}
+
+							<button type="button" onClick={resetToEmail} className="w-full text-xs text-gray-500 hover:text-cyan-400 transition-colors mt-4">
+								Cancel
+							</button>
+						</div>
+					)}
+
+					{/* Wallet Username */}
+					{step === "wallet-username" && (
+						<form onSubmit={handleWalletUsernameSubmit} className="space-y-4">
+							<div className="text-center mb-4">
+								<h2 className="text-lg font-medium text-white">Welcome to ollo.art</h2>
+								<p className="text-sm text-gray-400 mt-1">Choose a username for your account</p>
+							</div>
+
+							<div>
+								<label htmlFor="walletUsername" className="block text-xs font-medium mb-1 text-gray-400">
+									Username
+								</label>
+								<input
+									id="walletUsername"
+									type="text"
+									value={walletUsername}
+									onChange={(e) => setWalletUsername(e.target.value)}
+									className="cyber-input w-full px-3 py-2 rounded text-white text-sm"
+									placeholder="Choose a username"
+									required
+									disabled={loading}
+									autoFocus
+									minLength={3}
+									maxLength={30}
+									pattern="[a-zA-Z0-9_-]+"
+								/>
+								<p className="text-xs text-gray-500 mt-1">3-30 characters, letters, numbers, underscores, hyphens</p>
+							</div>
+
+							{error && (
+								<div className="p-2 bg-red-900/30 border border-red-500/30 rounded">
+									<p className="text-red-400 text-xs">{error}</p>
+								</div>
+							)}
+
+							<button type="submit" disabled={loading} className="cyber-button w-full py-2.5 rounded font-medium text-white text-sm">
+								{loading ? "Creating account..." : "Create Account"}
+							</button>
+
+							<button type="button" onClick={resetToEmail} className="w-full text-xs text-gray-500 hover:text-cyan-400 transition-colors">
+								Cancel
+							</button>
+						</form>
 					)}
 				</div>
 			</div>
