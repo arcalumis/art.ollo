@@ -42,11 +42,8 @@ networks:
 
 volumes:
   artollo_data:
-    name: artollo_dev_data
-    external: true
+    name: ollo_art_data
   artollo_images:
-    name: artollo_dev_images
-    external: true
+    name: ollo_art_images
   artollo_uploads:
-    name: artollo_dev_uploads
-    external: true
+    name: ollo_art_uploads

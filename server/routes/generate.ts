@@ -4,7 +4,7 @@ import type { GenerateRequest } from "../../src/types";
 import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
 import { enhancePrompt, generateImage, MODELS } from "../services/replicate";
-import { canUserGenerate, canUserUseModel, deductCredit, recordUsage } from "../services/usage";
+import { canUserGenerate, canUserUseModel, deductCredit, getModelCreditCost, recordUsage } from "../services/usage";
 import { getUserApiKey } from "./user";
 
 interface ExtendedGenerateRequest extends GenerateRequest {
@@ -73,22 +73,19 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 				});
 			}
 
-			// Check if user can generate based on subscription limits
-			const limitCheck = canUserGenerate(userId);
+			// Check if user can generate based on subscription limits and credit balance
+			const limitCheck = canUserGenerate(userId, model);
 			if (!limitCheck.allowed) {
 				return reply.status(403).send({
 					error: limitCheck.reason || "Generation limit reached",
 					limitReached: true,
 					usage: limitCheck.usage,
 					limits: limitCheck.limits,
+					creditCost: limitCheck.creditCost,
 				});
 			}
 
-			// Check if user needs to use credits (over limit but has credits)
-			const needsCredit =
-				limitCheck.subscription?.monthly_image_limit !== null &&
-				limitCheck.usage &&
-				limitCheck.usage.imageCount >= (limitCheck.subscription?.monthly_image_limit || 0);
+			const creditCost = getModelCreditCost(model);
 
 			// Get user's API key if they have one
 			const userApiKey = getUserApiKey(userId);
@@ -139,13 +136,9 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 
 				const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
 
-				// Record usage
+				// Record usage and deduct credits
 				recordUsage(userId, totalCost, usedOwnKey);
-
-				// Deduct credit if needed
-				if (needsCredit) {
-					deductCredit(userId, "Used bonus credit for generation");
-				}
+				deductCredit(userId, creditCost, `Generation: ${model}`);
 
 				const insertStmt = db.prepare(`
 					INSERT INTO generations (id, prompt, model, image_path, width, height, parameters, user_id, cost, replicate_id, predict_time, thread_id)

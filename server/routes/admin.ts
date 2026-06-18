@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
 import { sendWelcomeEmail } from "../services/email";
-import { calculateGenerationCost } from "../services/replicate";
+import { calculateGenerationCost, MODELS } from "../services/replicate";
 import {
 	cancelBoost,
 	getAllActiveBoosts,
@@ -14,9 +14,18 @@ import {
 	createCreditPackage,
 	deleteCreditPackage,
 	getAllCreditPackages,
+	getSolPriceHistory,
 	updateCreditPackage,
 } from "../services/solana";
-import { addCredits, assignSubscription, getCurrentYearMonth, getUserUsageHistory } from "../services/usage";
+import {
+	addCredits,
+	assignSubscription,
+	deleteModelCreditCost,
+	getAllModelCreditCosts,
+	getCurrentYearMonth,
+	getUserUsageHistory,
+	setModelCreditCost,
+} from "../services/usage";
 
 interface UserRow {
 	id: string;
@@ -42,6 +51,8 @@ interface ProductRow {
 	available_for_sol: number;
 	is_active: number;
 	allowed_models: string | null;
+	credit_refill_amount: number;
+	topoff_interval_hours: number;
 	created_at: string;
 }
 
@@ -512,7 +523,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 
 		const products = db
 			.prepare("SELECT * FROM subscription_products ORDER BY price ASC, created_at ASC")
-			.all() as ProductRow[];
+			.all() as (ProductRow & { stripe_price_id: string | null })[];
 
 		// Get user count for each product
 		const productsWithStats = products.map((product) => {
@@ -538,6 +549,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 				availableForSol: product.available_for_sol === 1,
 				isActive: product.is_active === 1,
 				allowedModels: product.allowed_models ? JSON.parse(product.allowed_models) : null,
+				creditRefillAmount: product.credit_refill_amount || 0,
+				topoffIntervalHours: product.topoff_interval_hours || 24,
+				stripePriceId: product.stripe_price_id || null,
 				createdAt: product.created_at,
 				activeUsers: userCount.count,
 			};
@@ -560,6 +574,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			availableForUsd?: boolean;
 			availableForSol?: boolean;
 			allowedModels?: string[] | null;
+			creditRefillAmount?: number;
+			topoffIntervalHours?: number;
+			stripePriceId?: string;
 		};
 	}>("/api/admin/products", async (request, reply) => {
 		const db = getDb();
@@ -575,6 +592,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			availableForUsd,
 			availableForSol,
 			allowedModels,
+			creditRefillAmount,
+			topoffIntervalHours,
+			stripePriceId,
 		} = request.body;
 
 		if (!name) {
@@ -585,8 +605,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 
 		db.prepare(
 			`INSERT INTO subscription_products
-			(id, name, description, monthly_image_limit, monthly_cost_limit, daily_image_limit, bonus_credits, price, price_sol, available_for_usd, available_for_sol, allowed_models)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, name, description, monthly_image_limit, monthly_cost_limit, daily_image_limit, bonus_credits, price, price_sol, available_for_usd, available_for_sol, allowed_models, credit_refill_amount, topoff_interval_hours, stripe_price_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		).run(
 			id,
 			name,
@@ -600,6 +620,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			availableForUsd !== false ? 1 : 0,
 			availableForSol === true ? 1 : 0,
 			allowedModels ? JSON.stringify(allowedModels) : null,
+			creditRefillAmount ?? 0,
+			topoffIntervalHours ?? 24,
+			stripePriceId || null,
 		);
 
 		return {
@@ -615,6 +638,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			availableForUsd: availableForUsd !== false,
 			availableForSol: availableForSol === true,
 			allowedModels: allowedModels ?? null,
+			creditRefillAmount: creditRefillAmount ?? 0,
+			topoffIntervalHours: topoffIntervalHours ?? 24,
+			stripePriceId: stripePriceId || null,
 			isActive: true,
 		};
 	});
@@ -635,6 +661,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			availableForSol?: boolean;
 			isActive?: boolean;
 			allowedModels?: string[] | null;
+			creditRefillAmount?: number;
+			topoffIntervalHours?: number;
+			stripePriceId?: string | null;
 		};
 	}>("/api/admin/products/:id", async (request, reply) => {
 		const db = getDb();
@@ -652,6 +681,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			availableForSol,
 			isActive,
 			allowedModels,
+			creditRefillAmount,
+			topoffIntervalHours,
+			stripePriceId,
 		} = request.body;
 
 		const product = db.prepare("SELECT id FROM subscription_products WHERE id = ?").get(id);
@@ -709,6 +741,18 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 		if (allowedModels !== undefined) {
 			updates.push("allowed_models = ?");
 			params.push(allowedModels ? JSON.stringify(allowedModels) : null);
+		}
+		if (creditRefillAmount !== undefined) {
+			updates.push("credit_refill_amount = ?");
+			params.push(creditRefillAmount);
+		}
+		if (topoffIntervalHours !== undefined) {
+			updates.push("topoff_interval_hours = ?");
+			params.push(topoffIntervalHours);
+		}
+		if (stripePriceId !== undefined) {
+			updates.push("stripe_price_id = ?");
+			params.push(stripePriceId || null);
 		}
 
 		if (updates.length > 0) {
@@ -978,15 +1022,24 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 
 	// POST /api/admin/credit-packages - Create credit package
 	fastify.post<{
-		Body: { name: string; credits: number; priceSol: number; isActive?: boolean };
+		Body: {
+			name: string;
+			credits: number;
+			priceSol: number;
+			priceCents?: number | null;
+			stripePriceId?: string | null;
+			availableForUsd?: boolean;
+			availableForSol?: boolean;
+			isActive?: boolean;
+		};
 	}>("/api/admin/credit-packages", async (request, reply) => {
-		const { name, credits, priceSol, isActive } = request.body;
+		const { name, credits, priceSol, priceCents, stripePriceId, availableForUsd, availableForSol, isActive } = request.body;
 
 		if (!name || !credits || !priceSol) {
 			return reply.status(400).send({ error: "Name, credits, and priceSol are required" });
 		}
 
-		const pkg = createCreditPackage({ name, credits, priceSol, isActive });
+		const pkg = createCreditPackage({ name, credits, priceSol, priceCents, stripePriceId, availableForUsd, availableForSol, isActive });
 
 		if (!pkg) {
 			return reply.status(500).send({ error: "Failed to create package" });
@@ -998,12 +1051,21 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 	// PATCH /api/admin/credit-packages/:id - Update credit package
 	fastify.patch<{
 		Params: { id: string };
-		Body: { name?: string; credits?: number; priceSol?: number; isActive?: boolean };
+		Body: {
+			name?: string;
+			credits?: number;
+			priceSol?: number;
+			priceCents?: number | null;
+			stripePriceId?: string | null;
+			availableForUsd?: boolean;
+			availableForSol?: boolean;
+			isActive?: boolean;
+		};
 	}>("/api/admin/credit-packages/:id", async (request, reply) => {
 		const { id } = request.params;
-		const { name, credits, priceSol, isActive } = request.body;
+		const { name, credits, priceSol, priceCents, stripePriceId, availableForUsd, availableForSol, isActive } = request.body;
 
-		const success = updateCreditPackage(id, { name, credits, priceSol, isActive });
+		const success = updateCreditPackage(id, { name, credits, priceSol, priceCents, stripePriceId, availableForUsd, availableForSol, isActive });
 
 		if (!success) {
 			return reply.status(404).send({ error: "Package not found" });
@@ -1024,4 +1086,105 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 
 		return { success: true };
 	});
+
+	// ============================================
+	// FINANCIAL ANALYSIS
+	// ============================================
+
+	// GET /api/admin/financials/sol-analysis - SOL price history + margin analysis
+	fastify.get<{ Querystring: { days?: string } }>(
+		"/api/admin/financials/sol-analysis",
+		async (request) => {
+			const days = Math.min(365, Math.max(1, Number.parseInt(request.query.days || "30", 10) || 30));
+			const priceHistory = getSolPriceHistory(days);
+
+			const db = getDb();
+
+			// Get refill/breakage stats
+			const refillStats = db
+				.prepare(`
+					SELECT
+						COUNT(*) as total_events,
+						SUM(CASE WHEN credits_added > 0 THEN 1 ELSE 0 END) as refills_with_credits,
+						SUM(CASE WHEN credits_added = 0 THEN 1 ELSE 0 END) as breakage_events,
+						SUM(credits_added) as total_credits_refilled
+					FROM credit_topoff_log
+					WHERE created_at >= datetime('now', '-' || ? || ' days')
+				`)
+				.get(days) as {
+				total_events: number;
+				refills_with_credits: number;
+				breakage_events: number;
+				total_credits_refilled: number;
+			};
+
+			return {
+				priceHistory,
+				refillStats: {
+					totalEvents: refillStats.total_events || 0,
+					refillsWithCredits: refillStats.refills_with_credits || 0,
+					breakageEvents: refillStats.breakage_events || 0,
+					totalCreditsRefilled: refillStats.total_credits_refilled || 0,
+				},
+			};
+		},
+	);
+
+	// ============================================
+	// MODEL CREDIT COSTS
+	// ============================================
+
+	// GET /api/admin/model-costs - List all models with credit costs
+	fastify.get("/api/admin/model-costs", async () => {
+		const creditCosts = getAllModelCreditCosts();
+		const creditCostMap = new Map(creditCosts.map((c) => [c.modelId, c]));
+
+		const models = MODELS.map((model) => {
+			const costInfo = creditCostMap.get(model.id);
+			const baseCost = calculateGenerationCost(model.id, { numOutputs: 1 });
+
+			return {
+				id: model.id,
+				name: model.name,
+				category: model.category || "quality",
+				creditCost: costInfo?.creditCost ?? 2,
+				isOverride: costInfo?.isOverride ?? false,
+				baseCostUsd: Math.round(baseCost * 10000) / 10000,
+			};
+		});
+
+		return { models };
+	});
+
+	// PATCH /api/admin/model-costs/:modelId - Set credit cost for a model
+	fastify.patch<{
+		Params: { modelId: string };
+		Body: { creditCost: number };
+	}>("/api/admin/model-costs/:modelId", async (request, reply) => {
+		const modelId = decodeURIComponent(request.params.modelId);
+		const { creditCost } = request.body;
+
+		if (creditCost == null || creditCost < 0 || !Number.isInteger(creditCost)) {
+			return reply.status(400).send({ error: "creditCost must be a non-negative integer" });
+		}
+
+		setModelCreditCost(modelId, creditCost);
+
+		return { success: true, modelId, creditCost };
+	});
+
+	// DELETE /api/admin/model-costs/:modelId - Reset to hardcoded default
+	fastify.delete<{ Params: { modelId: string } }>(
+		"/api/admin/model-costs/:modelId",
+		async (request, reply) => {
+			const modelId = decodeURIComponent(request.params.modelId);
+			const deleted = deleteModelCreditCost(modelId);
+
+			if (!deleted) {
+				return reply.status(404).send({ error: "No override found for this model" });
+			}
+
+			return { success: true, modelId };
+		},
+	);
 }

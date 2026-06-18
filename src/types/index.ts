@@ -71,6 +71,7 @@ export interface User {
 	id: string;
 	username: string;
 	isAdmin: boolean;
+	tutorialCompleted?: boolean;
 }
 
 export interface AuthResponse {
@@ -108,6 +109,9 @@ export interface SubscriptionProduct {
 	availableForSol: boolean;
 	isActive: boolean;
 	allowedModels: string[] | null;
+	creditRefillAmount: number;
+	topoffIntervalHours: number;
+	stripePriceId: string | null;
 	createdAt: string;
 	activeUsers?: number;
 }
@@ -135,6 +139,10 @@ export interface CreditPackage {
 	name: string;
 	credits: number;
 	priceSol: number;
+	priceCents: number | null;
+	stripePriceId: string | null;
+	availableForUsd: boolean;
+	availableForSol: boolean;
 	isActive: boolean;
 	createdAt?: string;
 }
@@ -224,16 +232,13 @@ export interface UserSubscriptionInfo {
 export interface UserUsageInfo {
 	yearMonth: string;
 	usage: UserUsage;
-	dailyUsage?: {
-		imageCount: number;
-	};
 	canGenerate: boolean;
 	limitReason?: string;
 	limits?: {
-		monthlyImageLimit: number | null;
 		monthlyCostLimit: number | null;
-		dailyImageLimit: number | null;
 	};
+	availableCredits?: number;
+	creditRefillAmount?: number;
 }
 
 export interface UserCredits {

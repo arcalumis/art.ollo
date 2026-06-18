@@ -8,7 +8,6 @@ import {
 	canUserGenerate,
 	getAvailableCredits,
 	getCurrentYearMonth,
-	getDailyUsage,
 	getMonthlyUsage,
 	getUserSubscription,
 } from "../services/usage";
@@ -56,9 +55,10 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
 				description: product.description,
 				price: product.price,
 				allowedModels: product.allowed_models ? JSON.parse(product.allowed_models) : null,
+				creditRefillAmount: product.credit_refill_amount || 0,
+				topoffIntervalHours: product.topoff_interval_hours || 24,
 			},
 			limits: {
-				monthlyImageLimit: product.monthly_image_limit,
 				monthlyCostLimit: product.monthly_cost_limit,
 			},
 		};
@@ -72,8 +72,7 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
 		}
 
 		const usage = getMonthlyUsage(userId);
-		const dailyUsage = getDailyUsage(userId);
-		const result = canUserGenerate(userId);
+		const result = canUserGenerate(userId, "black-forest-labs/flux-schnell");
 
 		return {
 			yearMonth: getCurrentYearMonth(),
@@ -88,12 +87,11 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
 						totalCost: 0,
 						usedOwnKey: 0,
 					},
-			dailyUsage: {
-				imageCount: dailyUsage?.image_count ?? 0,
-			},
 			canGenerate: result.allowed,
 			limitReason: result.reason,
 			limits: result.limits,
+			availableCredits: result.availableCredits,
+			creditRefillAmount: result.creditRefillAmount,
 		};
 	});
 
@@ -227,6 +225,32 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
 		return { success: true };
 	});
 
+	// POST /api/user/tutorial-complete - Mark tutorial as completed
+	fastify.post("/api/user/tutorial-complete", async (request, reply) => {
+		const userId = request.user?.userId;
+		if (!userId) {
+			return reply.status(401).send({ error: "Unauthorized" });
+		}
+
+		const db = getDb();
+		db.prepare("UPDATE users SET tutorial_completed_at = datetime('now') WHERE id = ?").run(userId);
+
+		return { success: true };
+	});
+
+	// POST /api/user/tutorial-reset - Reset tutorial completion
+	fastify.post("/api/user/tutorial-reset", async (request, reply) => {
+		const userId = request.user?.userId;
+		if (!userId) {
+			return reply.status(401).send({ error: "Unauthorized" });
+		}
+
+		const db = getDb();
+		db.prepare("UPDATE users SET tutorial_completed_at = NULL WHERE id = ?").run(userId);
+
+		return { success: true };
+	});
+
 	// GET /api/user/can-generate - Check if user can generate (for UI)
 	fastify.get("/api/user/can-generate", async (request) => {
 		const userId = request.user?.userId;
@@ -234,7 +258,7 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
 			return { allowed: false, reason: "Not authenticated" };
 		}
 
-		return canUserGenerate(userId);
+		return canUserGenerate(userId, "black-forest-labs/flux-schnell");
 	});
 }
 

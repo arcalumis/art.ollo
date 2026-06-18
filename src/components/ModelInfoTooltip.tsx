@@ -81,9 +81,14 @@ export function ModelInfoTooltip({ modelId, className = "" }: ModelInfoTooltipPr
 					{/* Pricing */}
 					<div className="mt-2 pt-2 border-t border-[var(--border)] flex items-center justify-between">
 						<span className="text-[10px] text-[var(--text-secondary)]">Cost:</span>
-						<span className="text-xs font-mono text-[var(--accent)]">
-							{config.pricing.displayCost}
-						</span>
+						<div className="flex items-center gap-2">
+							<span className="text-xs font-mono text-[var(--text-secondary)]">
+								{config.pricing.displayCost}
+							</span>
+							<span className="text-xs font-mono text-[var(--accent)]">
+								{config.pricing.creditCost} {config.pricing.creditCost === 1 ? "credit" : "credits"}
+							</span>
+						</div>
 					</div>
 
 					{/* Image input indicator */}

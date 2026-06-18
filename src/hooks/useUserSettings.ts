@@ -13,6 +13,7 @@ export function useUserSubscription(token: string | null) {
 			const response = await fetch(`${API_BASE}/api/user/subscription`, {
 				headers: { Authorization: `Bearer ${token}` },
 			});
+			if (!response.ok) return;
 			const data = (await response.json()) as UserSubscriptionInfo;
 			setSubscription(data);
 		} catch (err) {
@@ -36,6 +37,7 @@ export function useUserUsage(token: string | null) {
 			const response = await fetch(`${API_BASE}/api/user/usage`, {
 				headers: { Authorization: `Bearer ${token}` },
 			});
+			if (!response.ok) return;
 			const data = (await response.json()) as UserUsageInfo;
 			setUsage(data);
 		} catch (err) {
@@ -69,6 +71,52 @@ export function useUserCredits(token: string | null) {
 	}, [token]);
 
 	return { credits, loading, fetchCredits };
+}
+
+export function useTutorial(token: string | null) {
+	const [loading, setLoading] = useState(false);
+
+	const completeTutorial = useCallback(async () => {
+		if (!token) return false;
+		setLoading(true);
+		try {
+			const response = await fetch(`${API_BASE}/api/user/tutorial-complete`, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+			});
+			return response.ok;
+		} catch (err) {
+			console.error("Failed to complete tutorial:", err);
+			return false;
+		} finally {
+			setLoading(false);
+		}
+	}, [token]);
+
+	const resetTutorial = useCallback(async () => {
+		if (!token) return false;
+		setLoading(true);
+		try {
+			const response = await fetch(`${API_BASE}/api/user/tutorial-reset`, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+			});
+			return response.ok;
+		} catch (err) {
+			console.error("Failed to reset tutorial:", err);
+			return false;
+		} finally {
+			setLoading(false);
+		}
+	}, [token]);
+
+	return { loading, completeTutorial, resetTutorial };
 }
 
 export function useUserApiKey(token: string | null) {

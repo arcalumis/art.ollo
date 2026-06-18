@@ -245,8 +245,16 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
 
 	// Get current user
 	fastify.get("/api/me", { preHandler: authMiddleware }, async (request) => {
+		const db = getDb();
+		const row = db.prepare("SELECT tutorial_completed_at FROM users WHERE id = ?").get(request.user?.userId) as
+			| { tutorial_completed_at: string | null }
+			| undefined;
+
 		return {
-			user: request.user,
+			user: {
+				...request.user,
+				tutorialCompleted: !!row?.tutorial_completed_at,
+			},
 		};
 	});
 

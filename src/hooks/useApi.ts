@@ -110,6 +110,7 @@ export function useHistory(token: string | null) {
 					`${API_BASE}/api/history?page=${page}&limit=${limit}&trash=${trash}&archived=${archived}`,
 					{ headers: getAuthHeaders(token) },
 				);
+				if (!response.ok) return;
 				const data = (await response.json()) as HistoryResponse;
 				setHistory(data);
 			} catch (err) {
@@ -137,6 +138,7 @@ export function useHistory(token: string | null) {
 					`${API_BASE}/api/history?page=${nextPage}&limit=${limit}&trash=${trash}&archived=${archived}`,
 					{ headers: getAuthHeaders(token) },
 				);
+				if (!response.ok) return;
 				const data = (await response.json()) as HistoryResponse;
 
 				// Append new generations to existing ones
@@ -268,6 +270,7 @@ export function useUploads(token: string | null) {
 				const response = await fetch(`${API_BASE}/api/uploads?archived=${archived}`, {
 					headers: getAuthHeaders(token),
 				});
+				if (!response.ok) return;
 				const data = await response.json();
 				setUploads(data.uploads);
 			} catch (err) {
@@ -354,6 +357,7 @@ export function useThreads(token: string | null) {
 			const response = await fetch(`${API_BASE}/api/threads`, {
 				headers: getAuthHeaders(token),
 			});
+			if (!response.ok) return;
 			const data = (await response.json()) as ThreadsResponse;
 			setThreads(data.threads);
 		} catch (err) {
@@ -387,14 +391,14 @@ export function useThreads(token: string | null) {
 	);
 
 	const createThread = useCallback(
-		async (title?: string) => {
+		async (title?: string, projectMetadata?: Record<string, unknown>) => {
 			if (!token) return null;
 
 			try {
 				const response = await fetch(`${API_BASE}/api/threads`, {
 					method: "POST",
 					headers: getAuthHeaders(token),
-					body: JSON.stringify({ title }),
+					body: JSON.stringify({ title, projectMetadata }),
 				});
 				if (!response.ok) return null;
 				const data = (await response.json()) as Thread;

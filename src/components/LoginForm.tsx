@@ -8,7 +8,7 @@ type Step = "email" | "options" | "password" | "magic-link-sent" | "forgot-passw
 
 export function LoginForm() {
 	const { checkEmail, loginWithEmail, requestMagicLink, requestPasswordReset, login, requestWalletChallenge, verifyWalletSignature } = useAuth();
-	const { publicKey, signMessage, connected, connecting, disconnect } = useWallet();
+	const { publicKey, signMessage, connected, disconnect } = useWallet();
 	const [step, setStep] = useState<Step>("email");
 	const [email, setEmail] = useState("");
 	const [password, setPassword] = useState("");
@@ -24,23 +24,16 @@ export function LoginForm() {
 	// For wallet login
 	const [walletUsername, setWalletUsername] = useState("");
 
-	// Track if user initiated wallet connection (to auto-trigger login)
-	const wasConnectingRef = useRef(false);
+	// Track if user explicitly clicked wallet connect on login page
+	const userInitiatedConnectRef = useRef(false);
 	const hasAutoTriggeredRef = useRef(false);
 
-	// Track when connecting starts (user-initiated)
+	// Auto-trigger wallet login ONLY when user explicitly clicked connect on login page
+	// (not on autoConnect from a previous session, which could be from billing page usage)
 	useEffect(() => {
-		if (connecting) {
-			wasConnectingRef.current = true;
-			hasAutoTriggeredRef.current = false;
-		}
-	}, [connecting]);
-
-	// Auto-trigger wallet login when connection completes after user initiated
-	useEffect(() => {
-		if (connected && wasConnectingRef.current && !hasAutoTriggeredRef.current && step === "email" && !loading) {
+		if (connected && userInitiatedConnectRef.current && !hasAutoTriggeredRef.current && step === "email" && !loading) {
 			hasAutoTriggeredRef.current = true;
-			wasConnectingRef.current = false;
+			userInitiatedConnectRef.current = false;
 			// Small delay to ensure wallet state is fully ready
 			setTimeout(() => {
 				handleWalletLogin();
@@ -394,7 +387,9 @@ export function LoginForm() {
 									</button>
 								</div>
 							) : (
-								<SolanaWalletButton className="w-full justify-center" />
+								<div onClick={() => { userInitiatedConnectRef.current = true; }}>
+									<SolanaWalletButton className="w-full justify-center" />
+								</div>
 							)}
 
 							<button

@@ -13,12 +13,13 @@ import { ThreadDeleteDialog } from "./components/ThreadDeleteDialog";
 import { UserSettings } from "./components/UserSettings";
 import { ModelsHelpButton, ModelsReferenceModal } from "./components/ModelsReferenceModal";
 import { OlloWelcomeFlow } from "./components/OlloWelcomeFlow";
+import { TutorialFlow } from "./components/TutorialFlow";
 import { isVariationModel } from "./config/models";
 import { WelcomeScreen } from "./components/WelcomeScreen";
 import type { ProjectMetadata } from "./types/ollo";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { useEnhancePrompt, useGenerate, useHistory, useModels, useThreads, useUploads } from "./hooks/useApi";
-import { useUserSubscription, useUserUsage } from "./hooks/useUserSettings";
+import { useTutorial, useUserSubscription, useUserUsage } from "./hooks/useUserSettings";
 import { AdminLayout } from "./pages/AdminLayout";
 import { Billing } from "./pages/Billing";
 
@@ -28,6 +29,7 @@ const AdminCreditPackages = lazy(() => import("./pages/AdminCreditPackages"));
 const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
 const AdminFinancials = lazy(() => import("./pages/AdminFinancials"));
 const AdminMetrics = lazy(() => import("./pages/AdminMetrics"));
+const AdminModels = lazy(() => import("./pages/AdminModels"));
 const AdminPnL = lazy(() => import("./pages/AdminPnL"));
 const AdminProducts = lazy(() => import("./pages/AdminProducts"));
 const AdminRevenue = lazy(() => import("./pages/AdminRevenue"));
@@ -46,7 +48,8 @@ import type { Generation, QueuedGeneration, Thread } from "./types";
 import "./App.css";
 
 function MainApp() {
-	const { user, token, loading: authLoading, logout } = useAuth();
+	const { user, token, loading: authLoading, updateUser, logout } = useAuth();
+	const { completeTutorial, resetTutorial } = useTutorial(token);
 	const [selectedModel, setSelectedModel] = useState("black-forest-labs/flux-2-dev");
 	const [imageInputs, setImageInputs] = useState<string[]>([]);
 	const [showTrash] = useState(false);
@@ -75,6 +78,7 @@ function MainApp() {
 		activeThread,
 		fetchThreads,
 		fetchThread,
+		createThread,
 		renameThread,
 		deleteThreadWithOptions,
 		clearActiveThread,
@@ -87,6 +91,9 @@ function MainApp() {
 
 	// Ollo welcome flow state
 	const [showOlloFlow, setShowOlloFlow] = useState(false);
+
+	// Tutorial state
+	const [showTutorial, setShowTutorial] = useState(false);
 
 	// Models reference modal state
 	const [showModelsRef, setShowModelsRef] = useState(false);
@@ -191,14 +198,14 @@ function MainApp() {
 	}, [fetchModels]);
 
 	useEffect(() => {
-		if (token) {
+		if (token && user) {
 			fetchThreads();
 			refreshHistory();
 			fetchUploads(showArchived);
 			fetchUserUsage();
 			fetchUserSubscription();
 		}
-	}, [token, fetchThreads, refreshHistory, fetchUploads, showArchived, fetchUserUsage, fetchUserSubscription]);
+	}, [token, user, fetchThreads, refreshHistory, fetchUploads, showArchived, fetchUserUsage, fetchUserSubscription]);
 
 	useEffect(() => {
 		if (!supportsImageInput) {
@@ -209,6 +216,14 @@ function MainApp() {
 	useEffect(() => {
 		localStorage.setItem("viewMode", viewMode);
 	}, [viewMode]);
+
+	// Auto-show tutorial for new users
+	useEffect(() => {
+		if (user && user.tutorialCompleted === false) {
+			const timer = setTimeout(() => setShowTutorial(true), 1000);
+			return () => clearTimeout(timer);
+		}
+	}, [user]);
 
 	// Infinite scroll handler - must be before conditional returns
 	const handleLoadMore = useCallback(() => {
@@ -271,10 +286,7 @@ function MainApp() {
 		const queueId = crypto.randomUUID();
 		const randomSeed = Math.floor(Math.random() * 2147483647);
 
-		// If this is already a variation (has imageInputs in parameters), use the original source
-		// This ensures "Vary Again" always uses the original image, not the variation
-		const originalImageInputs = gen.parameters?.imageInputs as string[] | undefined;
-		const sourceImage = originalImageInputs?.[0] || gen.imageUrl;
+		const sourceImage = gen.imageUrl;
 
 		const request = {
 			prompt: gen.prompt,
@@ -449,12 +461,28 @@ function MainApp() {
 
 	const handleOlloComplete = async (metadata: ProjectMetadata) => {
 		setShowOlloFlow(false);
+
+		// Build thread title from purpose
+		const purposeLabels: Record<string, string> = {
+			personal: "Personal Project",
+			social: "Social Media",
+			print: "Print / Poster",
+			concept: "Concept Art",
+			reference: "Design Reference",
+		};
+		const title = purposeLabels[metadata.purpose || ""] || "New Project";
+
+		// Create a new thread with project metadata
+		const thread = await createThread(`${title}`, metadata as Record<string, unknown>);
+
 		// Update creation options with Ollo's selections
 		if (metadata.aspectRatio) {
 			setCreationOptions((prev) => ({ ...prev, aspectRatio: metadata.aspectRatio as string }));
 		}
-		// Clear active thread to show the new project is ready
-		clearActiveThread();
+
+		if (thread) {
+			await fetchThread(thread.id);
+		}
 		setViewMode("chat");
 	};
 
@@ -462,6 +490,26 @@ function MainApp() {
 		setShowOlloFlow(false);
 		clearActiveThread();
 		setViewMode("chat");
+	};
+
+	const handleTutorialComplete = async () => {
+		await completeTutorial();
+		updateUser({ tutorialCompleted: true });
+		setShowTutorial(false);
+	};
+
+	const handleTutorialTryGeneration = (prompt: string, model: string, aspectRatio: string) => {
+		setSelectedModel(model);
+		setCreationOptions((prev) => ({ ...prev, aspectRatio }));
+		setShowTutorial(false);
+		handleGenerate(prompt);
+	};
+
+	const handleRelaunchTutorial = async () => {
+		await resetTutorial();
+		updateUser({ tutorialCompleted: false });
+		setShowSettings(false);
+		setShowTutorial(true);
 	};
 
 	const handleSelectThread = async (thread: Thread) => {
@@ -538,10 +586,10 @@ function MainApp() {
 					</div>
 					<div className="flex items-center gap-3">
 						<ModelsHelpButton onClick={() => setShowModelsRef(true)} />
-						{userUsage?.limits?.dailyImageLimit != null && userUsage.limits.dailyImageLimit > 0 && (
+						{userUsage?.availableCredits != null && (
 							<div className="text-xs text-[var(--text-secondary)]">
-								Today: <span className="text-[var(--accent)]">
-									{userUsage.dailyUsage?.imageCount ?? 0} / {userUsage.limits.dailyImageLimit}
+								Credits: <span className="text-[var(--accent)]">
+									{userUsage.availableCredits}
 								</span>
 							</div>
 						)}
@@ -672,6 +720,7 @@ function MainApp() {
 				isOpen={showSettings}
 				onClose={() => setShowSettings(false)}
 				onOpenBilling={() => setViewMode("billing")}
+				onRelaunchTutorial={handleRelaunchTutorial}
 			/>
 
 			{/* Thread Delete Dialog */}
@@ -690,6 +739,13 @@ function MainApp() {
 				onClose={() => setShowOlloFlow(false)}
 				onComplete={handleOlloComplete}
 				onSkip={handleOlloSkip}
+			/>
+
+			<TutorialFlow
+				isOpen={showTutorial}
+				onClose={() => setShowTutorial(false)}
+				onComplete={handleTutorialComplete}
+				onTryGeneration={handleTutorialTryGeneration}
 			/>
 
 			<ModelsReferenceModal
@@ -776,6 +832,7 @@ function AppRoutes() {
 				<Route path="users" element={<Suspense fallback={<AdminLoading />}><AdminUsers /></Suspense>} />
 				<Route path="users/:id" element={<Suspense fallback={<AdminLoading />}><AdminUsers /></Suspense>} />
 				<Route path="products" element={<Suspense fallback={<AdminLoading />}><AdminProducts /></Suspense>} />
+				<Route path="models" element={<Suspense fallback={<AdminLoading />}><AdminModels /></Suspense>} />
 				<Route path="credit-packages" element={<Suspense fallback={<AdminLoading />}><AdminCreditPackages /></Suspense>} />
 				<Route path="financials" element={<Suspense fallback={<AdminLoading />}><AdminFinancials /></Suspense>} />
 				<Route path="financials/revenue" element={<Suspense fallback={<AdminLoading />}><AdminRevenue /></Suspense>} />

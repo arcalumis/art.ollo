@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { SolanaCreditPurchase } from "../components/SolanaCreditPurchase";
 import { SolanaSubscriptionPurchase } from "../components/SolanaSubscriptionPurchase";
+import { StripeCreditPurchase } from "../components/StripeCreditPurchase";
 import { API_BASE } from "../config";
 import { useAuth } from "../contexts/AuthContext";
 
@@ -12,6 +13,9 @@ interface BillingInfo {
 		price: number;
 		monthlyImageLimit: number | null;
 		monthlyCostLimit: number | null;
+		creditRefillAmount: number;
+		topoffIntervalHours: number;
+		nextRefillAt: string | null;
 		periodStart: string | null;
 		periodEnd: string | null;
 	} | null;
@@ -39,10 +43,13 @@ interface Product {
 	description: string | null;
 	monthlyImageLimit: number | null;
 	monthlyCostLimit: number | null;
+	creditRefillAmount?: number;
+	topoffIntervalHours?: number;
 	bonusCredits: number;
 	price: number;
 	stripePriceId: string | null;
 	overagePriceCents: number;
+	allowedModels: string[] | null;
 }
 
 interface Invoice {
@@ -70,6 +77,19 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 	const [solanaEnabled, setSolanaEnabled] = useState(false);
 	const [loading, setLoading] = useState(true);
 	const [checkoutLoading, setCheckoutLoading] = useState<string | null>(null);
+	const [creditSuccess, setCreditSuccess] = useState(false);
+	const [paymentTab, setPaymentTab] = useState<"card" | "sol">("card");
+
+	// Handle credit_success URL param
+	useEffect(() => {
+		const params = new URLSearchParams(window.location.search);
+		if (params.get("credit_success") === "true") {
+			setCreditSuccess(true);
+			const url = new URL(window.location.href);
+			url.searchParams.delete("credit_success");
+			window.history.replaceState({}, "", url.toString());
+		}
+	}, []);
 
 	const fetchData = useCallback(async () => {
 		if (!token) return;
@@ -122,7 +142,7 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 	}, [fetchData]);
 
 	const handleCheckout = async (priceId: string, productId: string) => {
-		if (!token || !priceId) return;
+		if (!token || !priceId || checkoutLoading) return;
 
 		setCheckoutLoading(productId);
 		try {
@@ -143,13 +163,13 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 				const data = await response.json();
 				if (data.url) {
 					window.location.href = data.url;
+					return;
 				}
 			}
 		} catch (err) {
 			console.error("Failed to create checkout:", err);
-		} finally {
-			setCheckoutLoading(null);
 		}
+		setCheckoutLoading(null);
 	};
 
 	const handleManageBilling = async () => {
@@ -202,9 +222,24 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 		);
 	}
 
-	const usagePercent = billing?.subscription?.monthlyImageLimit
-		? Math.min(100, (billing.usage.imageCount / billing.subscription.monthlyImageLimit) * 100)
-		: 0;
+	const formatTimeUntil = (dateStr: string | null) => {
+		if (!dateStr) return null;
+		const target = new Date(dateStr);
+		const now = new Date();
+		const diffMs = target.getTime() - now.getTime();
+		if (diffMs <= 0) return "soon";
+		const hours = Math.floor(diffMs / (1000 * 60 * 60));
+		const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+		if (hours > 0) return `${hours}h ${minutes}m`;
+		return `${minutes}m`;
+	};
+
+	const refillLabel = (hours?: number) => {
+		if (!hours) return "daily";
+		if (hours >= 720) return "monthly";
+		if (hours >= 168) return "weekly";
+		return "daily";
+	};
 
 	return (
 		<div className="p-4 max-w-4xl mx-auto space-y-6">
@@ -212,7 +247,7 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 			<div className="flex items-center justify-between">
 				<div>
 					<h1 className="text-xl font-bold text-[var(--text-primary)]">Credits & Billing</h1>
-					<p className="text-xs text-[var(--text-secondary)]">Purchase credits to generate images</p>
+					<p className="text-xs text-[var(--text-secondary)]">Manage your plan and purchase credits</p>
 				</div>
 				{embedded && onBack && (
 					<button
@@ -228,107 +263,139 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 				)}
 			</div>
 
-			{/* Credit Balance */}
-			<div className="cyber-card p-4 border-[var(--accent)] border">
-				<div className="flex items-center justify-between">
-					<div>
-						<h2 className="text-sm font-semibold text-[var(--text-primary)]">Available Credits</h2>
-						<p className="text-3xl font-bold text-[var(--accent)]">{billing?.availableCredits || 0}</p>
-						<p className="text-xs text-[var(--text-secondary)]">Credits can be used when your monthly limit is reached</p>
-					</div>
-					<div className="text-6xl opacity-20">⚡</div>
-				</div>
-			</div>
-
-			{/* Current Subscription */}
-			<div className="cyber-card p-4">
-				<h2 className="text-sm font-semibold text-[var(--text-primary)] mb-3">Current Plan</h2>
-				{billing?.subscription ? (
-					<div className="space-y-4">
-						<div className="flex items-center justify-between">
+			{/* Credit Purchase Success */}
+			{creditSuccess && (
+				<div className="cyber-card p-4 border border-green-500/50 bg-green-500/10">
+					<div className="flex items-center justify-between">
+						<div className="flex items-center gap-3">
+							<span className="text-green-400 text-2xl">&#10003;</span>
 							<div>
-								<p className="text-lg font-bold text-[var(--accent)]">{billing.subscription.planName}</p>
-								<p className="text-xs text-[var(--text-secondary)]">
-									{formatCurrency(billing.subscription.price)}/month
-								</p>
+								<p className="text-sm font-semibold text-green-400">Credits purchased successfully!</p>
+								<p className="text-xs text-[var(--text-secondary)]">Your credits have been added to your balance.</p>
 							</div>
-							<span
-								className={`px-2 py-1 text-xs rounded ${
-									billing.subscription.status === "active"
-										? "bg-green-500/20 text-green-400"
-										: billing.subscription.status === "past_due"
-											? "bg-yellow-500/20 text-yellow-400"
-											: "bg-gray-500/20 text-gray-400"
-								}`}
-							>
-								{billing.subscription.status}
-							</span>
 						</div>
-
-						{billing.subscription.periodStart && billing.subscription.periodEnd && (
-							<p className="text-xs text-[var(--text-secondary)]">
-								Current period: {formatDate(billing.subscription.periodStart)} -{" "}
-								{formatDate(billing.subscription.periodEnd)}
-							</p>
-						)}
-
-						{billing.hasStripeCustomer && stripeEnabled && (
-							<button
-								type="button"
-								onClick={handleManageBilling}
-								className="cyber-button text-xs py-2 px-4"
-							>
-								Manage Subscription
-							</button>
-						)}
+						<button
+							type="button"
+							onClick={() => setCreditSuccess(false)}
+							className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] text-lg"
+						>
+							&times;
+						</button>
 					</div>
-				) : (
-					<div className="text-center py-4">
-						<p className="text-[var(--text-secondary)]">No active subscription</p>
-						<p className="text-xs text-[var(--text-secondary)] mt-1">Purchase credits below to get started</p>
+				</div>
+			)}
+
+			{/* Credit Balance + Current Plan row */}
+			<div className="grid md:grid-cols-2 gap-4">
+				{/* Credit Balance */}
+				<div className="cyber-card p-4 border-[var(--accent)] border">
+					<div className="flex items-center justify-between">
+						<div>
+							<h2 className="text-sm font-semibold text-[var(--text-primary)]">Available Credits</h2>
+							<p className="text-3xl font-bold text-[var(--accent)]">{billing?.availableCredits || 0}</p>
+							{billing?.subscription?.creditRefillAmount && billing.subscription.creditRefillAmount > 0 ? (
+								<div className="space-y-0.5">
+									<p className="text-xs text-[var(--text-secondary)]">
+										Refills to {billing.subscription.creditRefillAmount} credits {refillLabel(billing.subscription.topoffIntervalHours)}
+									</p>
+									{billing.subscription.nextRefillAt && (
+										<p className="text-xs text-[var(--accent)]">
+											Next refill: {formatTimeUntil(billing.subscription.nextRefillAt)}
+										</p>
+									)}
+								</div>
+							) : (
+								<p className="text-xs text-[var(--text-secondary)]">Subscribe to a plan for monthly refills</p>
+							)}
+						</div>
+						<div className="text-5xl opacity-20">&#9889;</div>
 					</div>
-				)}
+				</div>
+
+				{/* Current Plan */}
+				<div className="cyber-card p-4">
+					<h2 className="text-sm font-semibold text-[var(--text-primary)] mb-2">Current Plan</h2>
+					{billing?.subscription ? (
+						<div className="space-y-3">
+							<div className="flex items-center justify-between">
+								<div>
+									<p className="text-lg font-bold text-[var(--accent)]">{billing.subscription.planName}</p>
+									{billing.subscription.price > 0 && (
+										<p className="text-xs text-[var(--text-secondary)]">
+											{formatCurrency(billing.subscription.price)}/month
+										</p>
+									)}
+								</div>
+								<span
+									className={`px-2 py-1 text-xs rounded ${
+										billing.subscription.status === "active"
+											? "bg-green-500/20 text-green-400"
+											: billing.subscription.status === "past_due"
+												? "bg-yellow-500/20 text-yellow-400"
+												: "bg-gray-500/20 text-gray-400"
+									}`}
+								>
+									{billing.subscription.status}
+								</span>
+							</div>
+
+							{billing.subscription.periodStart && billing.subscription.periodEnd && (
+								<p className="text-xs text-[var(--text-secondary)]">
+									Period: {formatDate(billing.subscription.periodStart)} - {formatDate(billing.subscription.periodEnd)}
+								</p>
+							)}
+
+							{billing.hasStripeCustomer && stripeEnabled && (
+								<button
+									type="button"
+									onClick={handleManageBilling}
+									className="cyber-button text-xs py-2 px-4"
+								>
+									Manage Subscription
+								</button>
+							)}
+						</div>
+					) : (
+						<div className="py-2">
+							<p className="text-[var(--text-secondary)] text-sm">No active plan</p>
+							<p className="text-xs text-[var(--text-secondary)] mt-1">Choose a plan below to get started</p>
+						</div>
+					)}
+				</div>
 			</div>
 
 			{/* Usage */}
 			<div className="cyber-card p-4">
-				<h2 className="text-sm font-semibold text-[var(--text-primary)] mb-3">This Month's Usage</h2>
-				<div>
-					<p className="text-[10px] text-[var(--text-secondary)] uppercase">Images Generated</p>
-					<p className="text-2xl font-bold text-[var(--text-primary)]">{billing?.usage.imageCount || 0}</p>
-					{billing?.subscription?.monthlyImageLimit && (
-						<>
+				<h2 className="text-sm font-semibold text-[var(--text-primary)] mb-3">This Month</h2>
+				<div className="grid grid-cols-2 gap-4">
+					<div>
+						<p className="text-[10px] text-[var(--text-secondary)] uppercase">Images Generated</p>
+						<p className="text-2xl font-bold text-[var(--text-primary)]">{billing?.usage.imageCount || 0}</p>
+					</div>
+					<div>
+						<p className="text-[10px] text-[var(--text-secondary)] uppercase">Platform Cost</p>
+						<p className="text-2xl font-bold text-[var(--text-primary)]">{formatCurrency(billing?.usage.totalCost || 0)}</p>
+						{billing?.subscription?.monthlyCostLimit && (
 							<p className="text-xs text-[var(--text-secondary)]">
-								of {billing.subscription.monthlyImageLimit} included
+								of {formatCurrency(billing.subscription.monthlyCostLimit)} limit
 							</p>
-							<div className="mt-2 h-2 bg-[var(--bg-tertiary)] rounded-full overflow-hidden">
-								<div
-									className={`h-full rounded-full transition-all ${
-										usagePercent >= 90
-											? "bg-red-500"
-											: usagePercent >= 70
-												? "bg-yellow-500"
-												: "bg-[var(--accent)]"
-									}`}
-									style={{ width: `${usagePercent}%` }}
-								/>
-							</div>
-						</>
-					)}
+						)}
+					</div>
 				</div>
 			</div>
 
 			{/* Subscription Plans */}
 			{stripeEnabled && products.length > 0 && (
 				<div className="cyber-card p-4">
-					<h2 className="text-sm font-semibold text-[var(--text-primary)] mb-3">Available Plans</h2>
+					<h2 className="text-sm font-semibold text-[var(--text-primary)] mb-4">Subscription Plans</h2>
 					<div className="grid md:grid-cols-3 gap-4">
 						{products.map((product) => {
 							const isCurrentPlan = billing?.subscription?.planName === product.name;
+							const isLoading = checkoutLoading === product.id;
 							return (
 								<div
 									key={product.id}
-									className={`p-4 rounded-lg border transition-all ${
+									className={`p-4 rounded-lg border transition-all flex flex-col ${
 										isCurrentPlan
 											? "border-[var(--accent)] bg-[var(--accent)]/10"
 											: "border-[var(--border)] hover:border-[var(--accent)]/50"
@@ -336,30 +403,36 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 								>
 									<h3 className="text-lg font-bold text-[var(--text-primary)]">{product.name}</h3>
 									<p className="text-2xl font-bold text-[var(--accent)] mt-1">
-										{product.price === 0 ? "Free" : formatCurrency(product.price)}
-										{product.price > 0 && <span className="text-xs text-[var(--text-secondary)]">/mo</span>}
+										{formatCurrency(product.price)}
+										<span className="text-xs text-[var(--text-secondary)]">/mo</span>
 									</p>
 									{product.description && (
 										<p className="text-xs text-[var(--text-secondary)] mt-2">{product.description}</p>
 									)}
-									<ul className="mt-3 space-y-1 text-xs text-[var(--text-secondary)]">
-										{product.monthlyImageLimit && (
-											<li>{product.monthlyImageLimit} images/month</li>
-										)}
-										{product.bonusCredits > 0 && <li>{product.bonusCredits} bonus credits</li>}
+									<ul className="mt-3 space-y-1.5 text-xs text-[var(--text-secondary)] flex-1">
+										{product.creditRefillAmount ? (
+											<li>&#10003; {product.creditRefillAmount} credits/{refillLabel(product.topoffIntervalHours).replace("ly", "")}</li>
+										) : null}
+										{product.bonusCredits > 0 && <li>&#10003; {product.bonusCredits} bonus credits on signup</li>}
+										<li>&#10003; {product.allowedModels ? `${product.allowedModels.length} models` : "All models"}</li>
 									</ul>
 									{isCurrentPlan ? (
-										<div className="mt-4 py-2 text-center text-xs text-[var(--accent)]">
-											Current Plan
+										<div className="mt-4 py-2 text-center text-xs font-semibold text-[var(--accent)]">
+											Your Plan
 										</div>
 									) : product.stripePriceId ? (
 										<button
 											type="button"
 											onClick={() => handleCheckout(product.stripePriceId!, product.id)}
-											disabled={!!checkoutLoading}
+											disabled={isLoading}
 											className="mt-4 w-full cyber-button text-xs py-2"
 										>
-											{checkoutLoading === product.id ? "Loading..." : "Subscribe"}
+											{isLoading ? (
+												<span className="flex items-center justify-center gap-2">
+													<span className="animate-spin inline-block w-3 h-3 border-t-2 border-b-2 border-current rounded-full" />
+													Redirecting...
+												</span>
+											) : "Subscribe"}
 										</button>
 									) : (
 										<div className="mt-4 py-2 text-center text-xs text-[var(--text-secondary)]">
@@ -370,28 +443,50 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 							);
 						})}
 					</div>
+
+					{/* SOL subscription alternative */}
+					{solanaEnabled && (
+						<div className="mt-4 pt-4 border-t border-[var(--border)]">
+							<SolanaSubscriptionPurchase />
+						</div>
+					)}
 				</div>
 			)}
 
-			{/* Upgrade with SOL */}
-			{solanaEnabled && (
+			{/* Buy Credits */}
+			{(stripeEnabled || solanaEnabled) && (
 				<div className="cyber-card p-4">
-					<h2 className="text-sm font-semibold text-[var(--text-primary)] mb-3">Upgrade with SOL</h2>
-					<p className="text-xs text-[var(--text-secondary)] mb-4">
-						Get premium access by paying with Solana. 30-day access activated instantly.
-					</p>
-					<SolanaSubscriptionPurchase />
+					<div className="flex items-center justify-between mb-4">
+						<div>
+							<h2 className="text-sm font-semibold text-[var(--text-primary)]">Buy Credits</h2>
+							<p className="text-xs text-[var(--text-secondary)]">One-time credit top-ups</p>
+						</div>
+						{stripeEnabled && solanaEnabled && (
+							<div className="flex rounded-lg border border-[var(--border)] overflow-hidden text-xs">
+								<button
+									type="button"
+									onClick={() => setPaymentTab("card")}
+									className={`px-3 py-1.5 transition-colors ${paymentTab === "card" ? "bg-[var(--accent)]/20 text-[var(--accent)]" : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"}`}
+								>
+									Card
+								</button>
+								<button
+									type="button"
+									onClick={() => setPaymentTab("sol")}
+									className={`px-3 py-1.5 transition-colors ${paymentTab === "sol" ? "bg-purple-500/20 text-purple-400" : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"}`}
+								>
+									SOL
+								</button>
+							</div>
+						)}
+					</div>
+					{paymentTab === "card" && stripeEnabled ? (
+						<StripeCreditPurchase />
+					) : solanaEnabled ? (
+						<SolanaCreditPurchase />
+					) : null}
 				</div>
 			)}
-
-			{/* Buy Credits with SOL */}
-			<div className="cyber-card p-4">
-				<h2 className="text-sm font-semibold text-[var(--text-primary)] mb-3">Buy Credits with SOL</h2>
-				<p className="text-xs text-[var(--text-secondary)] mb-4">
-					Purchase credits instantly using Solana. Connect your wallet to get started.
-				</p>
-				<SolanaCreditPurchase />
-			</div>
 
 			{/* Payment History */}
 			{billing?.recentPayments && billing.recentPayments.length > 0 && (
@@ -449,7 +544,7 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 				</div>
 			)}
 
-			{/* Billing not enabled notice - only show if NEITHER Stripe nor Solana is enabled */}
+			{/* Billing not enabled */}
 			{!stripeEnabled && !solanaEnabled && (
 				<div className="cyber-card p-4 text-center">
 					<p className="text-[var(--text-secondary)]">Billing is not yet configured for this instance.</p>

@@ -244,6 +244,7 @@ export function useAdminProducts(token: string | null) {
 			monthlyCostLimit?: number;
 			bonusCredits?: number;
 			price?: number;
+			stripePriceId?: string | null;
 		}): Promise<SubscriptionProduct | null> => {
 			if (!token) return null;
 			try {
@@ -278,6 +279,7 @@ export function useAdminProducts(token: string | null) {
 				bonusCredits?: number;
 				price?: number;
 				isActive?: boolean;
+				stripePriceId?: string | null;
 			},
 		): Promise<boolean> => {
 			if (!token) return false;
@@ -352,6 +354,10 @@ export function useAdminCreditPackages(token: string | null) {
 			name: string;
 			credits: number;
 			priceSol: number;
+			priceCents?: number | null;
+			stripePriceId?: string | null;
+			availableForUsd?: boolean;
+			availableForSol?: boolean;
 			isActive?: boolean;
 		}): Promise<CreditPackage | null> => {
 			if (!token) return null;
@@ -383,6 +389,10 @@ export function useAdminCreditPackages(token: string | null) {
 				name?: string;
 				credits?: number;
 				priceSol?: number;
+				priceCents?: number | null;
+				stripePriceId?: string | null;
+				availableForUsd?: boolean;
+				availableForSol?: boolean;
 				isActive?: boolean;
 			},
 		): Promise<boolean> => {

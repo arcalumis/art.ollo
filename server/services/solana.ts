@@ -36,7 +36,7 @@ function getConnection(): Connection {
 /**
  * Fetch current SOL/USD price from CoinGecko
  */
-async function getSolUsdPrice(): Promise<number> {
+export async function getSolUsdPrice(): Promise<number> {
 	try {
 		const res = await fetch(
 			"https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
@@ -48,11 +48,59 @@ async function getSolUsdPrice(): Promise<number> {
 	}
 }
 
+/**
+ * Capture current SOL price and store as a snapshot
+ */
+export async function captureAndGetSolPrice(): Promise<number> {
+	const price = await getSolUsdPrice();
+	const db = getDb();
+	const id = crypto.randomUUID();
+	db.prepare(
+		"INSERT INTO sol_price_snapshots (id, price_usd, source, captured_at) VALUES (?, ?, 'coingecko', datetime('now'))",
+	).run(id, price);
+	return price;
+}
+
+/**
+ * Get SOL price history for admin dashboard
+ */
+export function getSolPriceHistory(days = 30): Array<{ priceUsd: number; capturedAt: string }> {
+	const db = getDb();
+	const rows = db
+		.prepare(
+			`SELECT price_usd, captured_at FROM sol_price_snapshots
+			 WHERE captured_at >= datetime('now', '-' || ? || ' days')
+			 ORDER BY captured_at ASC`,
+		)
+		.all(days) as Array<{ price_usd: number; captured_at: string }>;
+
+	return rows.map((r) => ({ priceUsd: r.price_usd, capturedAt: r.captured_at }));
+}
+
+/**
+ * Get most recent cached SOL price (from snapshots)
+ */
+export function getLatestSolPrice(): { priceUsd: number; capturedAt: string } | null {
+	const db = getDb();
+	const row = db
+		.prepare(
+			"SELECT price_usd, captured_at FROM sol_price_snapshots ORDER BY captured_at DESC LIMIT 1",
+		)
+		.get() as { price_usd: number; captured_at: string } | undefined;
+
+	if (!row) return null;
+	return { priceUsd: row.price_usd, capturedAt: row.captured_at };
+}
+
 export interface SolanaCreditPackage {
 	id: string;
 	name: string;
 	credits: number;
 	priceSol: number;
+	priceCents: number | null;
+	stripePriceId: string | null;
+	availableForUsd: boolean;
+	availableForSol: boolean;
 	isActive: boolean;
 }
 
@@ -107,7 +155,7 @@ export function getCreditPackages(): SolanaCreditPackage[] {
 	const db = getDb();
 	const packages = db
 		.prepare(`
-			SELECT id, name, credits, price_sol, is_active
+			SELECT id, name, credits, price_sol, price_cents, stripe_price_id, available_for_usd, available_for_sol, is_active
 			FROM solana_credit_packages
 			WHERE is_active = 1
 			ORDER BY credits ASC
@@ -117,6 +165,10 @@ export function getCreditPackages(): SolanaCreditPackage[] {
 		name: string;
 		credits: number;
 		price_sol: number;
+		price_cents: number | null;
+		stripe_price_id: string | null;
+		available_for_usd: number;
+		available_for_sol: number;
 		is_active: number;
 	}>;
 
@@ -125,6 +177,10 @@ export function getCreditPackages(): SolanaCreditPackage[] {
 		name: pkg.name,
 		credits: pkg.credits,
 		priceSol: pkg.price_sol,
+		priceCents: pkg.price_cents,
+		stripePriceId: pkg.stripe_price_id,
+		availableForUsd: pkg.available_for_usd === 1,
+		availableForSol: pkg.available_for_sol === 1,
 		isActive: pkg.is_active === 1,
 	}));
 }
@@ -135,9 +191,9 @@ export function getCreditPackages(): SolanaCreditPackage[] {
 export function getCreditPackage(packageId: string): SolanaCreditPackage | null {
 	const db = getDb();
 	const pkg = db
-		.prepare("SELECT id, name, credits, price_sol, is_active FROM solana_credit_packages WHERE id = ?")
+		.prepare("SELECT id, name, credits, price_sol, price_cents, stripe_price_id, available_for_usd, available_for_sol, is_active FROM solana_credit_packages WHERE id = ?")
 		.get(packageId) as
-		| { id: string; name: string; credits: number; price_sol: number; is_active: number }
+		| { id: string; name: string; credits: number; price_sol: number; price_cents: number | null; stripe_price_id: string | null; available_for_usd: number; available_for_sol: number; is_active: number }
 		| undefined;
 
 	if (!pkg) return null;
@@ -147,6 +203,10 @@ export function getCreditPackage(packageId: string): SolanaCreditPackage | null 
 		name: pkg.name,
 		credits: pkg.credits,
 		priceSol: pkg.price_sol,
+		priceCents: pkg.price_cents,
+		stripePriceId: pkg.stripe_price_id,
+		availableForUsd: pkg.available_for_usd === 1,
+		availableForSol: pkg.available_for_sol === 1,
 		isActive: pkg.is_active === 1,
 	};
 }
@@ -743,7 +803,7 @@ export function getAllCreditPackages(): Array<SolanaCreditPackage & { createdAt:
 	const db = getDb();
 	const packages = db
 		.prepare(`
-			SELECT id, name, credits, price_sol, is_active, created_at
+			SELECT id, name, credits, price_sol, price_cents, stripe_price_id, available_for_usd, available_for_sol, is_active, created_at
 			FROM solana_credit_packages
 			ORDER BY credits ASC
 		`)
@@ -752,6 +812,10 @@ export function getAllCreditPackages(): Array<SolanaCreditPackage & { createdAt:
 		name: string;
 		credits: number;
 		price_sol: number;
+		price_cents: number | null;
+		stripe_price_id: string | null;
+		available_for_usd: number;
+		available_for_sol: number;
 		is_active: number;
 		created_at: string;
 	}>;
@@ -761,6 +825,10 @@ export function getAllCreditPackages(): Array<SolanaCreditPackage & { createdAt:
 		name: pkg.name,
 		credits: pkg.credits,
 		priceSol: pkg.price_sol,
+		priceCents: pkg.price_cents,
+		stripePriceId: pkg.stripe_price_id,
+		availableForUsd: pkg.available_for_usd === 1,
+		availableForSol: pkg.available_for_sol === 1,
 		isActive: pkg.is_active === 1,
 		createdAt: pkg.created_at,
 	}));
@@ -773,21 +841,39 @@ export function createCreditPackage(data: {
 	name: string;
 	credits: number;
 	priceSol: number;
+	priceCents?: number | null;
+	stripePriceId?: string | null;
+	availableForUsd?: boolean;
+	availableForSol?: boolean;
 	isActive?: boolean;
 }): SolanaCreditPackage | null {
 	const db = getDb();
 	const id = crypto.randomUUID();
 
 	db.prepare(`
-		INSERT INTO solana_credit_packages (id, name, credits, price_sol, is_active)
-		VALUES (?, ?, ?, ?, ?)
-	`).run(id, data.name, data.credits, data.priceSol, data.isActive !== false ? 1 : 0);
+		INSERT INTO solana_credit_packages (id, name, credits, price_sol, price_cents, stripe_price_id, available_for_usd, available_for_sol, is_active)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`).run(
+		id,
+		data.name,
+		data.credits,
+		data.priceSol,
+		data.priceCents ?? null,
+		data.stripePriceId ?? null,
+		data.availableForUsd === true ? 1 : 0,
+		data.availableForSol !== false ? 1 : 0,
+		data.isActive !== false ? 1 : 0,
+	);
 
 	return {
 		id,
 		name: data.name,
 		credits: data.credits,
 		priceSol: data.priceSol,
+		priceCents: data.priceCents ?? null,
+		stripePriceId: data.stripePriceId ?? null,
+		availableForUsd: data.availableForUsd === true,
+		availableForSol: data.availableForSol !== false,
 		isActive: data.isActive !== false,
 	};
 }
@@ -801,6 +887,10 @@ export function updateCreditPackage(
 		name?: string;
 		credits?: number;
 		priceSol?: number;
+		priceCents?: number | null;
+		stripePriceId?: string | null;
+		availableForUsd?: boolean;
+		availableForSol?: boolean;
 		isActive?: boolean;
 	},
 ): boolean {
@@ -820,6 +910,22 @@ export function updateCreditPackage(
 	if (data.priceSol !== undefined) {
 		updates.push("price_sol = ?");
 		params.push(data.priceSol);
+	}
+	if (data.priceCents !== undefined) {
+		updates.push("price_cents = ?");
+		params.push(data.priceCents);
+	}
+	if (data.stripePriceId !== undefined) {
+		updates.push("stripe_price_id = ?");
+		params.push(data.stripePriceId);
+	}
+	if (data.availableForUsd !== undefined) {
+		updates.push("available_for_usd = ?");
+		params.push(data.availableForUsd ? 1 : 0);
+	}
+	if (data.availableForSol !== undefined) {
+		updates.push("available_for_sol = ?");
+		params.push(data.availableForSol ? 1 : 0);
 	}
 	if (data.isActive !== undefined) {
 		updates.push("is_active = ?");

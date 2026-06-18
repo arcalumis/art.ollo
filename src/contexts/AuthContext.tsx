@@ -48,6 +48,7 @@ interface AuthContextType {
 	verifyResetToken: (token: string) => Promise<{ valid: boolean; email?: string }>;
 	requestWalletChallenge: (walletAddress: string) => Promise<WalletChallengeResponse | null>;
 	verifyWalletSignature: (data: WalletVerifyRequest) => Promise<WalletVerifyResponse | null>;
+	updateUser: (updates: Partial<User>) => void;
 	logout: () => void;
 }
 
@@ -270,6 +271,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		}
 	}, []);
 
+	const updateUser = useCallback((updates: Partial<User>) => {
+		setUser((prev) => (prev ? { ...prev, ...updates } : null));
+	}, []);
+
 	const logout = useCallback(() => {
 		localStorage.removeItem("token");
 		setToken(null);
@@ -292,6 +297,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 				verifyResetToken,
 				requestWalletChallenge,
 				verifyWalletSignature,
+				updateUser,
 				logout,
 			}}
 		>

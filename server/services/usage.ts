@@ -1,6 +1,69 @@
 import crypto from "node:crypto";
 import { getDb } from "../db";
 
+export const MODEL_CREDIT_COSTS: Record<string, number> = {
+	"black-forest-labs/flux-schnell": 1,
+	"black-forest-labs/flux-2-dev": 2,
+	"black-forest-labs/flux-dev": 2,
+	"black-forest-labs/flux-redux-schnell": 2,
+	"black-forest-labs/flux-2-pro": 3,
+	"black-forest-labs/flux-1.1-pro": 3,
+	"black-forest-labs/flux-kontext-pro": 3,
+	"black-forest-labs/flux-1.1-pro-ultra": 4,
+	"black-forest-labs/flux-redux-dev": 5,
+	"google/nano-banana-pro": 10,
+};
+const DEFAULT_CREDIT_COST = 2;
+
+export function getModelCreditCost(modelId: string): number {
+	const db = getDb();
+	const row = db
+		.prepare("SELECT credit_cost FROM model_credit_costs WHERE model_id = ?")
+		.get(modelId) as { credit_cost: number } | undefined;
+	if (row) return row.credit_cost;
+	return MODEL_CREDIT_COSTS[modelId] ?? DEFAULT_CREDIT_COST;
+}
+
+export function getAllModelCreditCosts(): { modelId: string; creditCost: number; isOverride: boolean }[] {
+	const db = getDb();
+	const overrides = db
+		.prepare("SELECT model_id, credit_cost FROM model_credit_costs")
+		.all() as { model_id: string; credit_cost: number }[];
+	const overrideMap = new Map(overrides.map((r) => [r.model_id, r.credit_cost]));
+
+	// Merge all known models from the hardcoded map
+	const allModelIds = new Set([
+		...Object.keys(MODEL_CREDIT_COSTS),
+		...overrideMap.keys(),
+	]);
+
+	return Array.from(allModelIds).map((modelId) => {
+		const override = overrideMap.get(modelId);
+		return {
+			modelId,
+			creditCost: override ?? MODEL_CREDIT_COSTS[modelId] ?? DEFAULT_CREDIT_COST,
+			isOverride: override !== undefined,
+		};
+	});
+}
+
+export function setModelCreditCost(modelId: string, creditCost: number): void {
+	const db = getDb();
+	db.prepare(
+		`INSERT INTO model_credit_costs (model_id, credit_cost, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT(model_id) DO UPDATE SET credit_cost = ?, updated_at = datetime('now')`,
+	).run(modelId, creditCost, creditCost);
+}
+
+export function deleteModelCreditCost(modelId: string): boolean {
+	const db = getDb();
+	const result = db
+		.prepare("DELETE FROM model_credit_costs WHERE model_id = ?")
+		.run(modelId);
+	return result.changes > 0;
+}
+
 interface SubscriptionProduct {
 	id: string;
 	name: string;
@@ -12,6 +75,8 @@ interface SubscriptionProduct {
 	price: number;
 	is_active: number;
 	allowed_models: string | null;
+	credit_refill_amount: number;
+	topoff_interval_hours: number;
 }
 
 interface UserSubscription {
@@ -51,15 +116,12 @@ export interface UsageLimitResult {
 		totalCost: number;
 		usedOwnKey: number;
 	};
-	dailyUsage?: {
-		imageCount: number;
-	};
 	limits?: {
-		monthlyImageLimit: number | null;
 		monthlyCostLimit: number | null;
-		dailyImageLimit: number | null;
 	};
 	availableCredits?: number;
+	creditCost?: number;
+	creditRefillAmount?: number;
 }
 
 /**
@@ -306,26 +368,29 @@ export function canUserUseModel(userId: string, modelId: string): boolean {
 }
 
 /**
- * Check if user can generate an image based on their subscription limits
+ * Check if user can generate an image based on credit balance and safety limits
+ * Credits are the primary gate. Monthly cost limit is a safety backstop.
  */
-export function canUserGenerate(userId: string): UsageLimitResult {
-	const { subscription, product } = getUserSubscription(userId);
+export function canUserGenerate(userId: string, modelId: string): UsageLimitResult {
+	const { product } = getUserSubscription(userId);
 	const usage = getMonthlyUsage(userId);
-	const dailyUsageRecord = getDailyUsage(userId);
 	const availableCredits = getAvailableCredits(userId);
+	const creditCost = getModelCreditCost(modelId);
 
 	// If no subscription, check for credits only
 	if (!product) {
-		if (availableCredits > 0) {
+		if (availableCredits >= creditCost) {
 			return {
 				allowed: true,
 				availableCredits,
+				creditCost,
 			};
 		}
 		return {
 			allowed: false,
-			reason: "No active subscription. Please subscribe to continue generating images.",
-			availableCredits: 0,
+			reason: `No active subscription. This model costs ${creditCost} credits but you have ${availableCredits}. Please subscribe to continue generating images.`,
+			availableCredits,
+			creditCost,
 		};
 	}
 
@@ -335,66 +400,37 @@ export function canUserGenerate(userId: string): UsageLimitResult {
 		usedOwnKey: usage?.used_own_key || 0,
 	};
 
-	const currentDailyUsage = {
-		imageCount: dailyUsageRecord?.image_count || 0,
-	};
-
 	const limits = {
-		monthlyImageLimit: product.monthly_image_limit,
 		monthlyCostLimit: product.monthly_cost_limit,
-		dailyImageLimit: product.daily_image_limit,
 	};
 
-	// Check daily limit first (resets more frequently)
-	if (
-		product.daily_image_limit !== null &&
-		currentDailyUsage.imageCount >= product.daily_image_limit
-	) {
-		// Check for bonus credits to override daily limit
-		if (availableCredits <= 0) {
-			return {
-				allowed: false,
-				reason: `Daily limit (${product.daily_image_limit}) reached. Come back tomorrow or upgrade your plan.`,
-				subscription: product,
-				usage: currentUsage,
-				dailyUsage: currentDailyUsage,
-				limits,
-				availableCredits: 0,
-			};
-		}
-		// Has credits, can proceed (credits will be deducted)
+	const creditRefillAmount = product.credit_refill_amount || 0;
+
+	// Primary gate: credit balance
+	if (availableCredits < creditCost) {
+		return {
+			allowed: false,
+			reason: `Not enough credits. This model costs ${creditCost} credits but you have ${availableCredits}.`,
+			subscription: product,
+			usage: currentUsage,
+			limits,
+			availableCredits,
+			creditCost,
+			creditRefillAmount,
+		};
 	}
 
-	// Check monthly image limit
-	if (
-		product.monthly_image_limit !== null &&
-		currentUsage.imageCount >= product.monthly_image_limit
-	) {
-		// Check for bonus credits
-		if (availableCredits <= 0) {
-			return {
-				allowed: false,
-				reason: `Monthly image limit (${product.monthly_image_limit}) reached. Upgrade your plan or wait for next month.`,
-				subscription: product,
-				usage: currentUsage,
-				dailyUsage: currentDailyUsage,
-				limits,
-				availableCredits: 0,
-			};
-		}
-		// Has credits, can proceed (credits will be deducted)
-	}
-
-	// Check cost limit (hard cap, no credit override)
+	// Safety backstop: monthly cost limit
 	if (product.monthly_cost_limit !== null && currentUsage.totalCost >= product.monthly_cost_limit) {
 		return {
 			allowed: false,
-			reason: `Monthly cost limit ($${product.monthly_cost_limit.toFixed(2)}) reached. Upgrade your plan or wait for next month.`,
+			reason: "Platform safety limit reached. Please contact support or wait for next month.",
 			subscription: product,
 			usage: currentUsage,
-			dailyUsage: currentDailyUsage,
 			limits,
 			availableCredits,
+			creditCost,
+			creditRefillAmount,
 		};
 	}
 
@@ -402,9 +438,10 @@ export function canUserGenerate(userId: string): UsageLimitResult {
 		allowed: true,
 		subscription: product,
 		usage: currentUsage,
-		dailyUsage: currentDailyUsage,
 		limits,
 		availableCredits,
+		creditCost,
+		creditRefillAmount,
 	};
 }
 
@@ -441,21 +478,21 @@ export function recordUsage(userId: string, cost: number, usedOwnKey: boolean): 
 }
 
 /**
- * Deduct a credit from user (for when they exceed limits but have credits)
+ * Deduct credits from user for a generation
  */
-export function deductCredit(userId: string, reason: string): boolean {
+export function deductCredit(userId: string, amount: number, reason: string): boolean {
 	const db = getDb();
 	const credits = getAvailableCredits(userId);
 
-	if (credits <= 0) {
+	if (credits < amount) {
 		return false;
 	}
 
 	const id = crypto.randomUUID();
 	db.prepare(
 		`INSERT INTO user_credits (id, user_id, credit_type, amount, reason)
-		VALUES (?, ?, 'used', -1, ?)`,
-	).run(id, userId, reason);
+		VALUES (?, ?, 'used', ?, ?)`,
+	).run(id, userId, -amount, reason);
 
 	return true;
 }
@@ -524,4 +561,85 @@ export function assignDefaultSubscription(userId: string): void {
 	if (freeProduct) {
 		assignSubscription(userId, freeProduct.id);
 	}
+
+	// Grant initial credits to new users
+	const initialCredits = Number(process.env.INITIAL_CREDITS) || 10;
+	addCredits(userId, initialCredits, "initial", "Welcome credits for new account");
+}
+
+/**
+ * Process subscription credit refills for all eligible users.
+ * Refills credits to the target level (not additive -- "top off" model).
+ * Returns count of users actually refilled.
+ */
+export function processSubscriptionRefills(): number {
+	const db = getDb();
+
+	// Find all active subscriptions eligible for refill
+	const eligibleSubscriptions = db
+		.prepare(`
+			SELECT
+				us.id as subscription_id,
+				us.user_id,
+				us.last_credit_topoff_at,
+				sp.credit_refill_amount,
+				sp.topoff_interval_hours
+			FROM user_subscriptions us
+			JOIN subscription_products sp ON sp.id = us.product_id
+			WHERE sp.credit_refill_amount > 0
+			AND (us.ends_at IS NULL OR us.ends_at > datetime('now'))
+			AND us.status = 'active'
+			AND (
+				us.last_credit_topoff_at IS NULL
+				OR us.last_credit_topoff_at < datetime('now', '-' || sp.topoff_interval_hours || ' hours')
+			)
+		`)
+		.all() as Array<{
+		subscription_id: string;
+		user_id: string;
+		last_credit_topoff_at: string | null;
+		credit_refill_amount: number;
+		topoff_interval_hours: number;
+	}>;
+
+	let refillCount = 0;
+
+	for (const sub of eligibleSubscriptions) {
+		const currentBalance = getAvailableCredits(sub.user_id);
+		let creditsAdded = 0;
+
+		if (currentBalance < sub.credit_refill_amount) {
+			creditsAdded = sub.credit_refill_amount - currentBalance;
+			addCredits(sub.user_id, creditsAdded, "refill", "Subscription credit refill");
+			refillCount++;
+		}
+
+		// Log the refill event (even if no credits were added -- for breakage analysis)
+		const logId = crypto.randomUUID();
+		db.prepare(`
+			INSERT INTO credit_topoff_log (id, user_id, subscription_id, credits_added, balance_before, balance_after, refill_target)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`).run(
+			logId,
+			sub.user_id,
+			sub.subscription_id,
+			creditsAdded,
+			currentBalance,
+			currentBalance + creditsAdded,
+			sub.credit_refill_amount,
+		);
+
+		// Update timestamp
+		db.prepare(
+			"UPDATE user_subscriptions SET last_credit_topoff_at = datetime('now') WHERE id = ?",
+		).run(sub.subscription_id);
+	}
+
+	if (eligibleSubscriptions.length > 0) {
+		console.log(
+			`Credit refills: ${refillCount} users topped off, ${eligibleSubscriptions.length - refillCount} already at target`,
+		);
+	}
+
+	return refillCount;
 }

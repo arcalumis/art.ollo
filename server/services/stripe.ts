@@ -124,6 +124,68 @@ export async function createCheckoutSession(
 	return session.url;
 }
 
+// Create checkout session for one-time credit purchase
+export async function createCreditCheckoutSession(
+	userId: string,
+	packageId: string,
+	successUrl: string,
+	cancelUrl: string,
+): Promise<string | null> {
+	if (!stripe) return null;
+
+	const db = getDb();
+
+	// Look up credit package
+	const pkg = db
+		.prepare(
+			"SELECT id, name, credits, price_cents, stripe_price_id FROM solana_credit_packages WHERE id = ? AND is_active = 1 AND available_for_usd = 1",
+		)
+		.get(packageId) as
+		| { id: string; name: string; credits: number; price_cents: number | null; stripe_price_id: string | null }
+		| undefined;
+
+	if (!pkg || !pkg.stripe_price_id || !pkg.price_cents) {
+		return null;
+	}
+
+	// Get user info
+	const user = db.prepare("SELECT email, username FROM users WHERE id = ?").get(userId) as
+		| { email: string | null; username: string }
+		| undefined;
+
+	if (!user) return null;
+
+	// Get or create customer
+	const customerId = await getOrCreateStripeCustomer(
+		userId,
+		user.email || undefined,
+		user.username,
+	);
+
+	if (!customerId) return null;
+
+	const session = await stripe.checkout.sessions.create({
+		customer: customerId,
+		mode: "payment",
+		line_items: [
+			{
+				price: pkg.stripe_price_id,
+				quantity: 1,
+			},
+		],
+		success_url: successUrl,
+		cancel_url: cancelUrl,
+		metadata: {
+			user_id: userId,
+			package_id: pkg.id,
+			credits: pkg.credits.toString(),
+			type: "credit_purchase",
+		},
+	});
+
+	return session.url;
+}
+
 // Create customer portal session
 export async function createPortalSession(
 	userId: string,
@@ -312,11 +374,12 @@ export function getProductByStripePriceId(stripePriceId: string): {
 	name: string;
 	monthly_image_limit: number | null;
 	monthly_cost_limit: number | null;
+	bonus_credits: number;
 } | null {
 	const db = getDb();
 	const result = db
 		.prepare(
-			"SELECT id, name, monthly_image_limit, monthly_cost_limit FROM subscription_products WHERE stripe_price_id = ?",
+			"SELECT id, name, monthly_image_limit, monthly_cost_limit, bonus_credits FROM subscription_products WHERE stripe_price_id = ?",
 		)
 		.get(stripePriceId) as
 		| {
@@ -324,6 +387,7 @@ export function getProductByStripePriceId(stripePriceId: string): {
 				name: string;
 				monthly_image_limit: number | null;
 				monthly_cost_limit: number | null;
+				bonus_credits: number;
 		  }
 		| undefined;
 

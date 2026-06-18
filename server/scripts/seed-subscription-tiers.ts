@@ -1,5 +1,5 @@
 /**
- * Seed subscription tiers with model access restrictions
+ * Seed subscription tiers with credit refill system
  *
  * Run with: bun run server/scripts/seed-subscription-tiers.ts
  */
@@ -27,97 +27,103 @@ const PRO_MODELS = [
 // Premium has access to ALL models (null = no restriction)
 const PREMIUM_MODELS = null;
 
+// Tier definitions with credit refill system
+const TIERS = [
+	{
+		name: "Free",
+		description: "Try ollo.art with free credits",
+		credit_refill_amount: 0,
+		bonus_credits: 0,
+		monthly_cost_limit: 1.5,
+		price: 0,
+		allowed_models: JSON.stringify(FREE_MODELS),
+	},
+	{
+		name: "Pro",
+		description: "Professional tier with daily credit refills",
+		credit_refill_amount: 10,
+		bonus_credits: 10,
+		monthly_cost_limit: 25.0,
+		price: 5.0,
+		allowed_models: JSON.stringify(PRO_MODELS),
+	},
+	{
+		name: "Premium",
+		description: "Unlimited access to all models with generous daily refills",
+		credit_refill_amount: 30,
+		bonus_credits: 50,
+		monthly_cost_limit: 100.0,
+		price: 13.0,
+		allowed_models: null,
+	},
+];
+
 function seedTiers() {
 	const db = getDb();
 
-	// Update existing Free tier with allowed models
-	const freeResult = db
-		.prepare("UPDATE subscription_products SET allowed_models = ? WHERE name = 'Free'")
-		.run(JSON.stringify(FREE_MODELS));
+	for (const tier of TIERS) {
+		const existing = db
+			.prepare("SELECT id FROM subscription_products WHERE name = ?")
+			.get(tier.name) as { id: string } | undefined;
 
-	if (freeResult.changes > 0) {
-		console.log(`Updated Free tier with ${FREE_MODELS.length} allowed models`);
-	} else {
-		console.log("Free tier not found - creating it");
-		db.prepare(`
-			INSERT INTO subscription_products (id, name, description, monthly_image_limit, monthly_cost_limit, bonus_credits, price, allowed_models)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`).run(
-			crypto.randomUUID(),
-			"Free",
-			"Try ollo.art with 5 free generations per month",
-			5,
-			1.5,
-			0,
-			0,
-			JSON.stringify(FREE_MODELS),
-		);
-	}
-
-	// Check if Pro tier exists
-	const proExists = db.prepare("SELECT id FROM subscription_products WHERE name = 'Pro'").get();
-	if (proExists) {
-		db.prepare("UPDATE subscription_products SET allowed_models = ?, price = ? WHERE name = 'Pro'").run(
-			JSON.stringify(PRO_MODELS),
-			5.0,
-		);
-		console.log(`Updated Pro tier with ${PRO_MODELS.length} allowed models, $5/mo`);
-	} else {
-		db.prepare(`
-			INSERT INTO subscription_products (id, name, description, monthly_image_limit, monthly_cost_limit, bonus_credits, price, allowed_models)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`).run(
-			crypto.randomUUID(),
-			"Pro",
-			"Professional tier with access to most models",
-			100,
-			25.0,
-			10,
-			5.0,
-			JSON.stringify(PRO_MODELS),
-		);
-		console.log(`Created Pro tier with ${PRO_MODELS.length} allowed models, $5/mo`);
-	}
-
-	// Check if Premium tier exists
-	const premiumExists = db.prepare("SELECT id FROM subscription_products WHERE name = 'Premium'").get();
-	if (premiumExists) {
-		db.prepare("UPDATE subscription_products SET allowed_models = ?, price = ? WHERE name = 'Premium'").run(
-			null,
-			13.0,
-		);
-		console.log("Updated Premium tier with access to ALL models, $13/mo");
-	} else {
-		db.prepare(`
-			INSERT INTO subscription_products (id, name, description, monthly_image_limit, monthly_cost_limit, bonus_credits, price, allowed_models)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`).run(
-			crypto.randomUUID(),
-			"Premium",
-			"Unlimited access to all models including experimental ones",
-			500,
-			100.0,
-			50,
-			13.0,
-			null, // null = all models allowed
-		);
-		console.log("Created Premium tier with access to ALL models, $13/mo");
+		if (existing) {
+			db.prepare(`
+				UPDATE subscription_products SET
+					description = ?,
+					monthly_image_limit = NULL,
+					daily_image_limit = NULL,
+					monthly_cost_limit = ?,
+					bonus_credits = ?,
+					price = ?,
+					allowed_models = ?,
+					credit_refill_amount = ?,
+					topoff_interval_hours = 24
+				WHERE name = ?
+			`).run(
+				tier.description,
+				tier.monthly_cost_limit,
+				tier.bonus_credits,
+				tier.price,
+				tier.allowed_models,
+				tier.credit_refill_amount,
+				tier.name,
+			);
+			console.log(`Updated ${tier.name} tier: refill=${tier.credit_refill_amount}, $${tier.price}/mo`);
+		} else {
+			db.prepare(`
+				INSERT INTO subscription_products (id, name, description, monthly_image_limit, daily_image_limit, monthly_cost_limit, bonus_credits, price, allowed_models, credit_refill_amount, topoff_interval_hours)
+				VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, 24)
+			`).run(
+				crypto.randomUUID(),
+				tier.name,
+				tier.description,
+				tier.monthly_cost_limit,
+				tier.bonus_credits,
+				tier.price,
+				tier.allowed_models,
+				tier.credit_refill_amount,
+			);
+			console.log(`Created ${tier.name} tier: refill=${tier.credit_refill_amount}, $${tier.price}/mo`);
+		}
 	}
 
 	// Display current tiers
 	console.log("\nCurrent subscription tiers:");
 	const tiers = db
-		.prepare("SELECT name, monthly_image_limit, price, allowed_models FROM subscription_products ORDER BY price")
+		.prepare("SELECT name, credit_refill_amount, monthly_cost_limit, price, allowed_models FROM subscription_products ORDER BY price")
 		.all() as Array<{
 		name: string;
-		monthly_image_limit: number;
+		credit_refill_amount: number;
+		monthly_cost_limit: number | null;
 		price: number;
 		allowed_models: string | null;
 	}>;
 
 	for (const tier of tiers) {
 		const modelCount = tier.allowed_models ? JSON.parse(tier.allowed_models).length : "ALL";
-		console.log(`  ${tier.name}: ${tier.monthly_image_limit} images/mo, $${tier.price}/mo, ${modelCount} models`);
+		console.log(
+			`  ${tier.name}: refill=${tier.credit_refill_amount}/day, cost_limit=$${tier.monthly_cost_limit}, $${tier.price}/mo, ${modelCount} models`,
+		);
 	}
 }
 

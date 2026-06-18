@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getDb } from "../db";
+import { captureAndGetSolPrice } from "./solana";
 import { processExpiredBoosts } from "./subscription-boost";
+import { processSubscriptionRefills } from "./usage";
 
 interface TrashRow {
 	id: string;
@@ -57,6 +59,19 @@ export function cleanupTrashedItems(): void {
 
 	// Process expired subscription boosts
 	processExpiredBoosts();
+
+	// Process subscription credit refills
+	processSubscriptionRefills();
+
+	// Capture SOL price snapshot (~every 15 min)
+	const recentSnapshot = db
+		.prepare(
+			"SELECT id FROM sol_price_snapshots WHERE captured_at >= datetime('now', '-14 minutes') LIMIT 1",
+		)
+		.get();
+	if (!recentSnapshot) {
+		captureAndGetSolPrice().catch(console.error);
+	}
 }
 
 export function startCleanupJob(intervalMs = 5 * 60 * 1000): NodeJS.Timeout {

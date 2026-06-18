@@ -21,6 +21,7 @@ export interface ModelConfig {
 		type: "per_image" | "per_megapixel";
 		baseCost: number;
 		displayCost: string;
+		creditCost: number;
 	};
 	bestFor: string[];
 	similarTo?: string[];
@@ -81,6 +82,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_image",
 			baseCost: 0.003,
 			displayCost: "$0.003",
+			creditCost: 1,
 		},
 		bestFor: ["Quick sketches", "Prompt exploration", "Rapid iterations"],
 		similarTo: ["FLUX 2 Dev"],
@@ -105,6 +107,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_megapixel",
 			baseCost: 0.012,
 			displayCost: "~$0.024/2MP",
+			creditCost: 2,
 		},
 		bestFor: ["Reference-guided generation", "Style matching", "Quick iterations with images"],
 		similarTo: ["FLUX.1 Schnell"],
@@ -131,6 +134,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_image",
 			baseCost: 0.025,
 			displayCost: "$0.025",
+			creditCost: 2,
 		},
 		bestFor: ["Production-quality images", "Detailed artwork", "Multi-output generation"],
 		similarTo: ["FLUX 1.1 Pro"],
@@ -155,6 +159,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_image",
 			baseCost: 0.04,
 			displayCost: "$0.04",
+			creditCost: 3,
 		},
 		bestFor: ["Complex prompts", "Professional work", "Consistent quality"],
 		similarTo: ["FLUX.1 Dev", "FLUX 2 Pro"],
@@ -179,6 +184,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_megapixel",
 			baseCost: 0.015,
 			displayCost: "~$0.03/2MP",
+			creditCost: 3,
 		},
 		bestFor: ["Reference-guided quality work", "Multi-reference composition", "High-resolution output"],
 		similarTo: ["FLUX 1.1 Pro"],
@@ -205,6 +211,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_image",
 			baseCost: 0.06,
 			displayCost: "$0.06",
+			creditCost: 4,
 		},
 		bestFor: ["Maximum resolution", "Print-ready images", "Photorealistic renders"],
 		similarTo: ["FLUX 2 Pro"],
@@ -231,6 +238,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_image",
 			baseCost: 0.025,
 			displayCost: "$0.025",
+			creditCost: 2,
 		},
 		bestFor: ["Quick variations", "Exploring alternatives", "Iterating on concepts"],
 		similarTo: ["FLUX Redux Dev"],
@@ -255,6 +263,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_image",
 			baseCost: 0.1,
 			displayCost: "$0.10",
+			creditCost: 5,
 		},
 		bestFor: ["High-quality variations", "Controlled iteration", "Final variation renders"],
 		similarTo: ["FLUX Redux Schnell"],
@@ -281,6 +290,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_image",
 			baseCost: 0.04,
 			displayCost: "$0.04",
+			creditCost: 3,
 		},
 		bestFor: ["Image editing", "Adding/removing elements", "Style changes", "Scene modifications"],
 		differentiators: "Only model that edits existing images based on text instructions. Describe what to change, not what to create.",
@@ -306,6 +316,7 @@ export const MODELS_CONFIG: ModelConfig[] = [
 			type: "per_image",
 			baseCost: 0.2,
 			displayCost: "~$0.20",
+			creditCost: 10,
 		},
 		bestFor: ["Multi-reference composition", "Context-aware generation", "Complex scene building"],
 		differentiators: "Supports the most reference images (14). Different generation style from FLUX models.",

@@ -71,12 +71,10 @@ export const OLLO_MESSAGES = {
 };
 
 export const ASPECT_RATIO_OPTIONS: OlloOption[] = [
-	{ id: "1:1", label: "Square", value: "1:1", description: "Perfect for social media and profiles" },
-	{ id: "16:9", label: "Landscape", value: "16:9", description: "Cinematic, great for headers and banners" },
-	{ id: "9:16", label: "Portrait", value: "9:16", description: "Stories, phone wallpapers, posters" },
-	{ id: "4:3", label: "Classic", value: "4:3", description: "Traditional photo format" },
-	{ id: "3:4", label: "Portrait Classic", value: "3:4", description: "Classic portrait orientation" },
-	{ id: "21:9", label: "Ultrawide", value: "21:9", description: "Cinematic ultrawide format" },
+	{ id: "4:3", label: "Painting Horizontal", value: "4:3", description: "Traditional landscape canvas", icon: "horizontal" },
+	{ id: "3:4", label: "Painting Vertical", value: "3:4", description: "Traditional portrait canvas", icon: "vertical" },
+	{ id: "16:9", label: "Cinematic", value: "16:9", description: "Widescreen, great for scenes and banners", icon: "cinematic" },
+	{ id: "9:16", label: "Mobile", value: "9:16", description: "Stories, phone wallpapers, reels", icon: "mobile" },
 ];
 
 export const PURPOSE_OPTIONS: OlloOption[] = [

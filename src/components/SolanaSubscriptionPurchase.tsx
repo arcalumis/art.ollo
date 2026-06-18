@@ -190,14 +190,8 @@ export function SolanaSubscriptionPurchase() {
 										</p>
 									)}
 									<ul className="mt-3 space-y-1 text-xs text-[var(--text-secondary)]">
-										{product.monthlyImageLimit && (
-											<li>{product.monthlyImageLimit} images/month</li>
-										)}
-										{product.dailyImageLimit && (
-											<li>{product.dailyImageLimit} images/day</li>
-										)}
 										{product.bonusCredits > 0 && (
-											<li>{product.bonusCredits} bonus credits</li>
+											<li>{product.bonusCredits} bonus credits on signup</li>
 										)}
 									</ul>
 									<button

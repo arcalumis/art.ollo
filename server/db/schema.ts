@@ -41,6 +41,17 @@ export function initializeSchema(db: Database): void {
 		// Column already exists
 	}
 
+	// Add tutorial_completed_at column to users
+	try {
+		db.exec("ALTER TABLE users ADD COLUMN tutorial_completed_at DATETIME DEFAULT NULL");
+	} catch {
+		// Column already exists
+	}
+
+	// Mark existing users as tutorial-completed so they don't get the tutorial unexpectedly.
+	// New users created after this migration will have NULL (tutorial not completed).
+	db.exec("UPDATE users SET tutorial_completed_at = datetime('now') WHERE tutorial_completed_at IS NULL AND last_login IS NOT NULL");
+
 	// Subscription products table
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS subscription_products (
@@ -570,6 +581,31 @@ export function initializeSchema(db: Database): void {
 		);
 	`);
 
+	// Add USD pricing columns to solana_credit_packages
+	try {
+		db.exec("ALTER TABLE solana_credit_packages ADD COLUMN price_cents INTEGER DEFAULT NULL");
+	} catch {
+		// Column already exists
+	}
+
+	try {
+		db.exec("ALTER TABLE solana_credit_packages ADD COLUMN stripe_price_id TEXT DEFAULT NULL");
+	} catch {
+		// Column already exists
+	}
+
+	try {
+		db.exec("ALTER TABLE solana_credit_packages ADD COLUMN available_for_usd INTEGER DEFAULT 0");
+	} catch {
+		// Column already exists
+	}
+
+	try {
+		db.exec("ALTER TABLE solana_credit_packages ADD COLUMN available_for_sol INTEGER DEFAULT 1");
+	} catch {
+		// Column already exists
+	}
+
 	// Create default SOL credit packages if none exist
 	const existingSolPackage = db.prepare("SELECT id FROM solana_credit_packages LIMIT 1").get();
 	if (!existingSolPackage) {
@@ -613,6 +649,68 @@ export function initializeSchema(db: Database): void {
 	}
 
 	// ============================================
+	// CREDIT REFILL SYSTEM
+	// ============================================
+
+	// Add credit_refill_amount to subscription_products (daily refill target)
+	try {
+		db.exec("ALTER TABLE subscription_products ADD COLUMN credit_refill_amount INTEGER DEFAULT 0");
+	} catch {
+		// Column already exists
+	}
+
+	// Add topoff_interval_hours to subscription_products (refill frequency)
+	try {
+		db.exec("ALTER TABLE subscription_products ADD COLUMN topoff_interval_hours INTEGER DEFAULT 24");
+	} catch {
+		// Column already exists
+	}
+
+	// Add last_credit_topoff_at to user_subscriptions
+	try {
+		db.exec("ALTER TABLE user_subscriptions ADD COLUMN last_credit_topoff_at DATETIME DEFAULT NULL");
+	} catch {
+		// Column already exists
+	}
+
+	// SOL price snapshots for tracking exchange rates
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS sol_price_snapshots (
+			id TEXT PRIMARY KEY,
+			price_usd REAL NOT NULL,
+			source TEXT DEFAULT 'coingecko',
+			captured_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_sol_price_captured ON sol_price_snapshots(captured_at DESC);
+	`);
+
+	// Credit topoff log for audit trail and breakage analysis
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS credit_topoff_log (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			subscription_id TEXT NOT NULL,
+			credits_added INTEGER NOT NULL,
+			balance_before INTEGER NOT NULL,
+			balance_after INTEGER NOT NULL,
+			refill_target INTEGER NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_credit_topoff_user ON credit_topoff_log(user_id);
+		CREATE INDEX IF NOT EXISTS idx_credit_topoff_created ON credit_topoff_log(created_at);
+	`);
+
+	// Processed webhook events for idempotency (Stripe can deliver the same event multiple times)
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS processed_webhook_events (
+			stripe_event_id TEXT PRIMARY KEY,
+			event_type TEXT NOT NULL,
+			processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_processed_webhooks_processed_at ON processed_webhook_events(processed_at);
+	`);
+
+	// ============================================
 	// SUBSCRIPTION BOOSTS
 	// ============================================
 
@@ -639,6 +737,15 @@ export function initializeSchema(db: Database): void {
 	// ============================================
 	// SOLANA SUBSCRIPTION TRANSACTIONS
 	// ============================================
+
+	// Model credit cost overrides (admin-configurable)
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS model_credit_costs (
+			model_id TEXT PRIMARY KEY,
+			credit_cost INTEGER NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`);
 
 	// Track SOL-based subscription purchases
 	db.exec(`

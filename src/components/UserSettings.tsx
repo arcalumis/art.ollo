@@ -10,9 +10,10 @@ interface UserSettingsProps {
 	isOpen: boolean;
 	onClose: () => void;
 	onOpenBilling?: () => void;
+	onRelaunchTutorial?: () => void;
 }
 
-export function UserSettings({ isOpen, onClose, onOpenBilling }: UserSettingsProps) {
+export function UserSettings({ isOpen, onClose, onOpenBilling, onRelaunchTutorial }: UserSettingsProps) {
 	const { token } = useAuth();
 	const { subscription, fetchSubscription } = useUserSubscription(token);
 	const { usage, fetchUsage } = useUserUsage(token);
@@ -27,10 +28,6 @@ export function UserSettings({ isOpen, onClose, onOpenBilling }: UserSettingsPro
 	}, [isOpen, fetchSubscription, fetchUsage, fetchCredits]);
 
 	if (!isOpen) return null;
-
-	const usagePercent = usage?.limits?.monthlyImageLimit
-		? Math.min(100, (usage.usage.imageCount / usage.limits.monthlyImageLimit) * 100)
-		: 0;
 
 	return (
 		<div
@@ -94,21 +91,24 @@ export function UserSettings({ isOpen, onClose, onOpenBilling }: UserSettingsPro
 						<h3 className="text-sm font-medium text-[var(--text-secondary)] mb-3">This Month&apos;s Usage</h3>
 						<div className="bg-[var(--bg-tertiary)] rounded-lg p-4">
 							<div className="flex justify-between text-sm mb-2">
-								<span className="text-[var(--text-primary)]">Images Generated</span>
-								<span className="text-[var(--text-primary)]">
-									{usage?.usage.imageCount || 0}
-									{usage?.limits?.monthlyImageLimit ? ` / ${usage.limits.monthlyImageLimit}` : ""}
+								<span className="text-[var(--text-primary)]">Credits</span>
+								<span className="text-[var(--accent)] font-bold">
+									{usage?.availableCredits ?? 0}
 								</span>
 							</div>
 
-							{usage?.limits?.monthlyImageLimit && (
-								<div className="h-2 bg-[var(--bg-primary)] rounded-full overflow-hidden mb-3">
-									<div
-										className={`h-full transition-all ${usagePercent >= 90 ? "bg-red-500" : usagePercent >= 70 ? "bg-yellow-500" : "bg-[var(--accent)]"}`}
-										style={{ width: `${usagePercent}%` }}
-									/>
-								</div>
+							{usage?.creditRefillAmount && usage.creditRefillAmount > 0 && (
+								<p className="text-xs text-[var(--text-secondary)] mb-2">
+									Refills to {usage.creditRefillAmount} daily
+								</p>
 							)}
+
+							<div className="flex justify-between text-sm mb-2">
+								<span className="text-[var(--text-primary)]">Images This Month</span>
+								<span className="text-[var(--text-primary)]">
+									{usage?.usage.imageCount || 0}
+								</span>
+							</div>
 
 							{usage && !usage.canGenerate && (
 								<div className="mt-3 p-2 bg-red-900/30 border border-red-800 rounded text-sm text-red-300">
@@ -157,6 +157,29 @@ export function UserSettings({ isOpen, onClose, onOpenBilling }: UserSettingsPro
 							</button>
 						</div>
 					</section>
+
+					{/* Tutorial */}
+					{onRelaunchTutorial && (
+						<section>
+							<h3 className="text-sm font-medium text-[var(--text-secondary)] mb-3">Tutorial</h3>
+							<div className="bg-[var(--bg-tertiary)] rounded-lg p-4">
+								<p className="text-sm text-[var(--text-secondary)] mb-3">
+									Learn the full workflow — character creation, scene composition, and multi-image input.
+								</p>
+								<button
+									type="button"
+									onClick={onRelaunchTutorial}
+									className="w-full cyber-button py-2 flex items-center justify-center gap-2 rounded-lg"
+								>
+									<svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+										<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+										<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+									</svg>
+									Relaunch Tutorial
+								</button>
+							</div>
+						</section>
+					)}
 				</div>
 			</div>
 		</div>

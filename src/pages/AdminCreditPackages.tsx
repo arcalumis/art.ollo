@@ -10,6 +10,10 @@ interface PackageFormData {
 	name: string;
 	credits: string;
 	priceSol: string;
+	priceCents: string;
+	stripePriceId: string;
+	availableForUsd: boolean;
+	availableForSol: boolean;
 	isActive: boolean;
 }
 
@@ -17,6 +21,10 @@ const emptyForm: PackageFormData = {
 	name: "",
 	credits: "",
 	priceSol: "",
+	priceCents: "",
+	stripePriceId: "",
+	availableForUsd: false,
+	availableForSol: true,
 	isActive: true,
 };
 
@@ -40,6 +48,10 @@ export default function AdminCreditPackages() {
 			name: formData.name,
 			credits: Number.parseInt(formData.credits, 10),
 			priceSol: Number.parseFloat(formData.priceSol),
+			priceCents: formData.priceCents ? Number.parseInt(formData.priceCents, 10) : null,
+			stripePriceId: formData.stripePriceId || null,
+			availableForUsd: formData.availableForUsd,
+			availableForSol: formData.availableForSol,
 			isActive: formData.isActive,
 		};
 
@@ -67,6 +79,10 @@ export default function AdminCreditPackages() {
 			name: pkg.name,
 			credits: pkg.credits.toString(),
 			priceSol: pkg.priceSol.toString(),
+			priceCents: pkg.priceCents?.toString() || "",
+			stripePriceId: pkg.stripePriceId || "",
+			availableForUsd: pkg.availableForUsd,
+			availableForSol: pkg.availableForSol,
 			isActive: pkg.isActive,
 		});
 		setShowForm(true);
@@ -95,9 +111,9 @@ export default function AdminCreditPackages() {
 		<div className="p-4">
 			<div className="flex items-center justify-between mb-4">
 				<div>
-					<h1 className="text-xl font-bold gradient-text">SOL Credit Packages</h1>
+					<h1 className="text-xl font-bold gradient-text">Credit Packages</h1>
 					<p className="text-xs text-gray-400 mt-1">
-						Manage credit packages available for purchase with Solana
+						Manage credit packages for SOL and USD purchase
 					</p>
 				</div>
 				<Button
@@ -132,14 +148,19 @@ export default function AdminCreditPackages() {
 							<div className="flex items-start justify-between mb-3">
 								<div>
 									<h3 className="text-base font-semibold">{pkg.name}</h3>
-									{!pkg.isActive && (
-										<span className="text-[10px] text-red-400">Inactive</span>
-									)}
+									<div className="flex gap-1 mt-0.5">
+										{!pkg.isActive && <span className="text-[10px] text-red-400">Inactive</span>}
+										{pkg.availableForSol && <span className="text-[10px] px-1 bg-purple-500/20 text-purple-400 rounded">SOL</span>}
+										{pkg.availableForUsd && <span className="text-[10px] px-1 bg-green-500/20 text-green-400 rounded">USD</span>}
+									</div>
 								</div>
 								<div className="text-right">
 									<div className="text-xl font-bold text-purple-400">
 										{pkg.priceSol} SOL
 									</div>
+									{pkg.priceCents != null && pkg.priceCents > 0 && (
+										<div className="text-sm font-bold text-green-400">${(pkg.priceCents / 100).toFixed(2)}</div>
+									)}
 									<div className="text-xs text-gray-500">
 										{pkg.credits} credits
 									</div>
@@ -159,6 +180,14 @@ export default function AdminCreditPackages() {
 										{(pkg.priceSol / pkg.credits).toFixed(4)} SOL
 									</span>
 								</div>
+								{pkg.stripePriceId && (
+									<div className="flex justify-between">
+										<span className="text-gray-500">Stripe Price</span>
+										<span className="text-green-400 font-mono text-[10px] truncate max-w-[120px]" title={pkg.stripePriceId}>
+											{pkg.stripePriceId}
+										</span>
+									</div>
+								)}
 							</div>
 
 							<div className="flex gap-1.5 pt-2 border-t border-cyan-500/20">
@@ -224,7 +253,7 @@ export default function AdminCreditPackages() {
 						/>
 					</div>
 
-					<div className="grid grid-cols-2 gap-2">
+					<div className="grid grid-cols-3 gap-2">
 						<div>
 							<label
 								htmlFor="package-credits"
@@ -266,23 +295,88 @@ export default function AdminCreditPackages() {
 								min="0.001"
 							/>
 						</div>
+						<div>
+							<label
+								htmlFor="package-price-cents"
+								className="block text-xs font-medium text-gray-400 mb-1"
+							>
+								Price (cents)
+							</label>
+							<input
+								id="package-price-cents"
+								type="number"
+								value={formData.priceCents}
+								onChange={(e) =>
+									setFormData({ ...formData, priceCents: e.target.value })
+								}
+								placeholder="e.g., 999"
+								className="cyber-input w-full px-2 py-1.5 rounded text-sm"
+								min="1"
+							/>
+						</div>
+					</div>
+
+					<div>
+						<label
+							htmlFor="package-stripe-price-id"
+							className="block text-xs font-medium text-gray-400 mb-1"
+						>
+							Stripe Price ID
+						</label>
+						<input
+							id="package-stripe-price-id"
+							type="text"
+							value={formData.stripePriceId}
+							onChange={(e) =>
+								setFormData({ ...formData, stripePriceId: e.target.value })
+							}
+							placeholder="price_..."
+							className="cyber-input w-full px-2 py-1.5 rounded text-sm font-mono"
+						/>
+						<p className="text-[10px] text-gray-500 mt-0.5">Required for USD purchases via Stripe</p>
 					</div>
 
 					{formData.credits && formData.priceSol && (
 						<div className="p-2 bg-purple-500/10 rounded text-xs text-purple-300">
-							Rate:{" "}
+							SOL rate:{" "}
 							{formatCreditsPerSol(
 								Number.parseInt(formData.credits, 10),
 								Number.parseFloat(formData.priceSol),
 							)}{" "}
-							credits per SOL (
-							{(
-								Number.parseFloat(formData.priceSol) /
-								Number.parseInt(formData.credits, 10)
-							).toFixed(4)}{" "}
-							SOL per credit)
+							credits per SOL
+							{formData.priceCents && (
+								<span className="text-green-300 ml-2">
+									| USD: ${(Number.parseInt(formData.priceCents, 10) / 100).toFixed(2)}
+								</span>
+							)}
 						</div>
 					)}
+
+					{/* Availability toggles */}
+					<div className="flex gap-4 p-2 cyber-card rounded">
+						<label className="flex items-center gap-2 cursor-pointer">
+							<input
+								type="checkbox"
+								checked={formData.availableForSol}
+								onChange={(e) =>
+									setFormData({ ...formData, availableForSol: e.target.checked })
+								}
+								className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-purple-500"
+							/>
+							<span className="text-xs text-gray-300">Available for SOL</span>
+						</label>
+						<label className="flex items-center gap-2 cursor-pointer">
+							<input
+								type="checkbox"
+								checked={formData.availableForUsd}
+								onChange={(e) =>
+									setFormData({ ...formData, availableForUsd: e.target.checked })
+								}
+								className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-green-500"
+							/>
+							<span className="text-xs text-gray-300">Available for USD</span>
+						</label>
+					</div>
 
 					<label className="flex items-center gap-2 cursor-pointer p-2 cyber-card rounded">
 						<input

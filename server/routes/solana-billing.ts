@@ -3,6 +3,7 @@ import { authMiddleware } from "../middleware/auth";
 import {
 	cleanupPendingTransactions,
 	getCreditPackages,
+	getLatestSolPrice,
 	getSolanaNetwork,
 	getSolanaSubscriptionProducts,
 	getTreasuryWallet,
@@ -315,5 +316,14 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 	fastify.post("/api/billing/solana/cleanup", async () => {
 		cleanupPendingTransactions();
 		return { success: true };
+	});
+
+	// GET /api/billing/solana/price - Current cached SOL/USD price
+	fastify.get("/api/billing/solana/price", async () => {
+		const latest = getLatestSolPrice();
+		return {
+			priceUsd: latest?.priceUsd ?? null,
+			capturedAt: latest?.capturedAt ?? null,
+		};
 	});
 }

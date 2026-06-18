@@ -10,12 +10,13 @@ import type { Model, SubscriptionProduct } from "../types";
 interface ProductFormData {
 	name: string;
 	description: string;
-	monthlyImageLimit: string;
+	creditRefillAmount: string;
+	topoffIntervalHours: string;
 	monthlyCostLimit: string;
-	dailyImageLimit: string;
 	bonusCredits: string;
 	price: string;
 	priceSol: string;
+	stripePriceId: string;
 	availableForUsd: boolean;
 	availableForSol: boolean;
 	allowedModels: string[] | null;
@@ -24,12 +25,13 @@ interface ProductFormData {
 const emptyForm: ProductFormData = {
 	name: "",
 	description: "",
-	monthlyImageLimit: "",
+	creditRefillAmount: "0",
+	topoffIntervalHours: "24",
 	monthlyCostLimit: "",
-	dailyImageLimit: "",
 	bonusCredits: "0",
 	price: "0",
 	priceSol: "",
+	stripePriceId: "",
 	availableForUsd: true,
 	availableForSol: false,
 	allowedModels: null,
@@ -68,18 +70,15 @@ export default function AdminProducts() {
 		const productData = {
 			name: formData.name,
 			description: formData.description || undefined,
-			monthlyImageLimit: formData.monthlyImageLimit
-				? Number.parseInt(formData.monthlyImageLimit, 10)
-				: undefined,
+			creditRefillAmount: Number.parseInt(formData.creditRefillAmount || "0", 10),
+			topoffIntervalHours: Number.parseInt(formData.topoffIntervalHours || "24", 10),
 			monthlyCostLimit: formData.monthlyCostLimit
 				? Number.parseFloat(formData.monthlyCostLimit)
-				: undefined,
-			dailyImageLimit: formData.dailyImageLimit
-				? Number.parseInt(formData.dailyImageLimit, 10)
 				: undefined,
 			bonusCredits: Number.parseInt(formData.bonusCredits || "0", 10),
 			price: Number.parseFloat(formData.price || "0"),
 			priceSol: formData.priceSol ? Number.parseFloat(formData.priceSol) : undefined,
+			stripePriceId: formData.stripePriceId || undefined,
 			availableForUsd: formData.availableForUsd,
 			availableForSol: formData.availableForSol,
 			allowedModels: formData.allowedModels,
@@ -108,12 +107,13 @@ export default function AdminProducts() {
 		setFormData({
 			name: product.name,
 			description: product.description || "",
-			monthlyImageLimit: product.monthlyImageLimit?.toString() || "",
+			creditRefillAmount: (product.creditRefillAmount || 0).toString(),
+			topoffIntervalHours: (product.topoffIntervalHours || 24).toString(),
 			monthlyCostLimit: product.monthlyCostLimit?.toString() || "",
-			dailyImageLimit: product.dailyImageLimit?.toString() || "",
 			bonusCredits: product.bonusCredits.toString(),
 			price: product.price.toString(),
 			priceSol: product.priceSol?.toString() || "",
+			stripePriceId: product.stripePriceId || "",
 			availableForUsd: product.availableForUsd,
 			availableForSol: product.availableForSol,
 			allowedModels: product.allowedModels,
@@ -222,15 +222,15 @@ export default function AdminProducts() {
 
 							<div className="space-y-1 mb-3 text-xs">
 								<div className="flex justify-between">
-									<span className="text-gray-500">Images/day</span>
-									<span className="text-cyan-400">{product.dailyImageLimit ?? "∞"}</span>
+									<span className="text-gray-500">Credit Refill</span>
+									<span className="text-cyan-400">{product.creditRefillAmount || 0}/day</span>
 								</div>
 								<div className="flex justify-between">
-									<span className="text-gray-500">Images/mo</span>
-									<span className="text-cyan-400">{product.monthlyImageLimit ?? "∞"}</span>
+									<span className="text-gray-500">Refill Interval</span>
+									<span className="text-cyan-400">{product.topoffIntervalHours || 24}h</span>
 								</div>
 								<div className="flex justify-between">
-									<span className="text-gray-500">Cost/mo</span>
+									<span className="text-gray-500">Cost Limit/mo</span>
 									<span className="text-cyan-400">{product.monthlyCostLimit ? `$${product.monthlyCostLimit}` : "∞"}</span>
 								</div>
 								<div className="flex justify-between">
@@ -317,29 +317,31 @@ export default function AdminProducts() {
 
 					<div className="grid grid-cols-3 gap-2">
 						<div>
-							<label htmlFor="product-daily-limit" className="block text-xs font-medium text-gray-400 mb-1">Images/day</label>
+							<label htmlFor="product-credit-refill" className="block text-xs font-medium text-gray-400 mb-1">Credit Refill</label>
 							<input
-								id="product-daily-limit"
+								id="product-credit-refill"
 								type="number"
-								value={formData.dailyImageLimit}
-								onChange={(e) => setFormData({ ...formData, dailyImageLimit: e.target.value })}
-								placeholder="∞"
+								value={formData.creditRefillAmount}
+								onChange={(e) => setFormData({ ...formData, creditRefillAmount: e.target.value })}
+								placeholder="0"
 								className="cyber-input w-full px-2 py-1.5 rounded text-sm"
+								title="Credits refilled to this level daily"
 							/>
 						</div>
 						<div>
-							<label htmlFor="product-image-limit" className="block text-xs font-medium text-gray-400 mb-1">Images/mo</label>
+							<label htmlFor="product-refill-interval" className="block text-xs font-medium text-gray-400 mb-1">Refill (hrs)</label>
 							<input
-								id="product-image-limit"
+								id="product-refill-interval"
 								type="number"
-								value={formData.monthlyImageLimit}
-								onChange={(e) => setFormData({ ...formData, monthlyImageLimit: e.target.value })}
-								placeholder="∞"
+								value={formData.topoffIntervalHours}
+								onChange={(e) => setFormData({ ...formData, topoffIntervalHours: e.target.value })}
+								placeholder="24"
 								className="cyber-input w-full px-2 py-1.5 rounded text-sm"
+								title="How often to refill credits (hours)"
 							/>
 						</div>
 						<div>
-							<label htmlFor="product-cost-limit" className="block text-xs font-medium text-gray-400 mb-1">Cost/mo ($)</label>
+							<label htmlFor="product-cost-limit" className="block text-xs font-medium text-gray-400 mb-1">Cost Limit ($)</label>
 							<input
 								id="product-cost-limit"
 								type="number"
@@ -348,6 +350,7 @@ export default function AdminProducts() {
 								onChange={(e) => setFormData({ ...formData, monthlyCostLimit: e.target.value })}
 								placeholder="∞"
 								className="cyber-input w-full px-2 py-1.5 rounded text-sm"
+								title="Monthly cost safety limit"
 							/>
 						</div>
 					</div>
@@ -386,6 +389,20 @@ export default function AdminProducts() {
 								className="cyber-input w-full px-2 py-1.5 rounded text-sm"
 							/>
 						</div>
+					</div>
+
+					{/* Stripe Price ID */}
+					<div>
+						<label htmlFor="product-stripe-price-id" className="block text-xs font-medium text-gray-400 mb-1">Stripe Price ID</label>
+						<input
+							id="product-stripe-price-id"
+							type="text"
+							value={formData.stripePriceId}
+							onChange={(e) => setFormData({ ...formData, stripePriceId: e.target.value })}
+							placeholder="price_..."
+							className="cyber-input w-full px-2 py-1.5 rounded text-sm font-mono"
+						/>
+						<p className="text-[10px] text-gray-500 mt-0.5">Required for Stripe checkout</p>
 					</div>
 
 					{/* Purchase Availability */}

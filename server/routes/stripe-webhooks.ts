@@ -13,6 +13,22 @@ import {
 	updateUserMetrics,
 	updateUserSubscription,
 } from "../services/stripe";
+import { addCredits } from "../services/usage";
+
+function markEventProcessed(eventId: string, eventType: string): void {
+	const db = getDb();
+	db.prepare(
+		"INSERT OR IGNORE INTO processed_webhook_events (stripe_event_id, event_type) VALUES (?, ?)",
+	).run(eventId, eventType);
+}
+
+function isEventAlreadyProcessed(eventId: string): boolean {
+	const db = getDb();
+	const row = db
+		.prepare("SELECT 1 FROM processed_webhook_events WHERE stripe_event_id = ?")
+		.get(eventId);
+	return row !== undefined;
+}
 
 export async function stripeWebhookRoutes(fastify: FastifyInstance): Promise<void> {
 	if (!isStripeConfigured()) {
@@ -53,6 +69,12 @@ export async function stripeWebhookRoutes(fastify: FastifyInstance): Promise<voi
 				return reply.status(400).send({ error: `Webhook Error: ${message}` });
 			}
 
+			// Idempotency check — Stripe delivers webhooks at least once, not exactly once
+			if (isEventAlreadyProcessed(event.id)) {
+				console.log(`Duplicate webhook event skipped: ${event.id} (${event.type})`);
+				return { received: true };
+			}
+
 			// Handle the event
 			try {
 				switch (event.type) {
@@ -64,7 +86,12 @@ export async function stripeWebhookRoutes(fastify: FastifyInstance): Promise<voi
 						await handleInvoicePaymentFailed(event.data.object as Stripe.Invoice);
 						break;
 
+					// New subscription: sync DB row AND grant bonus credits
 					case "customer.subscription.created":
+						await handleSubscriptionCreated(event.data.object as Stripe.Subscription);
+						break;
+
+					// Renewal/update: sync DB row only
 					case "customer.subscription.updated":
 						await handleSubscriptionUpdated(event.data.object as Stripe.Subscription);
 						break;
@@ -80,9 +107,12 @@ export async function stripeWebhookRoutes(fastify: FastifyInstance): Promise<voi
 					default:
 						console.log(`Unhandled event type: ${event.type}`);
 				}
+
+				// Only mark processed after successful handling
+				markEventProcessed(event.id, event.type);
 			} catch (error) {
 				console.error(`Error handling ${event.type}:`, error);
-				// Don't return error - we still received the webhook
+				// Don't mark as processed — Stripe will retry
 			}
 
 			return { received: true };
@@ -103,15 +133,13 @@ async function handleInvoicePaid(invoice: Stripe.Invoice): Promise<void> {
 	const paymentIntentId =
 		typeof invoice.payment_intent === "string" ? invoice.payment_intent : null;
 
-	// Determine payment type
-	let paymentType = "subscription";
-	if (invoice.billing_reason === "subscription_create") {
-		paymentType = "subscription";
-	} else if (invoice.billing_reason === "subscription_cycle") {
-		paymentType = "subscription";
-	} else if (invoice.billing_reason === "manual") {
-		paymentType = "credit_purchase";
-	}
+	// Use billing_reason to classify: subscription_create and subscription_cycle are subscriptions,
+	// everything else is treated as a one-time charge. Avoid relying on 'manual' which is ambiguous.
+	const paymentType =
+		invoice.billing_reason === "subscription_create" ||
+		invoice.billing_reason === "subscription_cycle"
+			? "subscription"
+			: "credit_purchase";
 
 	// Record the payment
 	const paymentId = recordPayment(
@@ -174,6 +202,53 @@ async function handleInvoicePaymentFailed(invoice: Stripe.Invoice): Promise<void
 	console.log(`Payment failed for user ${userId}, invoice ${invoice.id}`);
 }
 
+// Called only for customer.subscription.created — syncs DB and grants bonus credits
+async function handleSubscriptionCreated(subscription: Stripe.Subscription): Promise<void> {
+	if (!subscription.customer || typeof subscription.customer !== "string") return;
+
+	const userId = getUserIdFromStripeCustomer(subscription.customer);
+	if (!userId) {
+		console.error("No user found for Stripe customer:", subscription.customer);
+		return;
+	}
+
+	const priceId = subscription.items.data[0]?.price.id;
+	if (!priceId) return;
+
+	const product = getProductByStripePriceId(priceId);
+	if (!product) {
+		console.error("No product found for Stripe price:", priceId);
+		return;
+	}
+
+	const item = subscription.items.data[0];
+	const periodStart = item?.current_period_start ?? (subscription as unknown as Record<string, number>).current_period_start;
+	const periodEnd = item?.current_period_end ?? (subscription as unknown as Record<string, number>).current_period_end;
+
+	if (!periodStart || !periodEnd) {
+		console.error(`Subscription ${subscription.id} missing period dates — skipping`);
+		return;
+	}
+
+	updateUserSubscription(
+		userId,
+		product.id,
+		subscription.id,
+		subscription.status,
+		new Date(periodStart * 1000),
+		new Date(periodEnd * 1000),
+	);
+
+	// Grant bonus credits for new subscriptions
+	if (product.bonus_credits > 0) {
+		addCredits(userId, product.bonus_credits, "bonus", "Subscription welcome bonus");
+		console.log(`Granted ${product.bonus_credits} bonus credits to user ${userId} for new subscription`);
+	}
+
+	console.log(`Created subscription for user ${userId}: ${subscription.status}`);
+}
+
+// Called only for customer.subscription.updated — syncs DB row, no bonus credits
 async function handleSubscriptionUpdated(subscription: Stripe.Subscription): Promise<void> {
 	if (!subscription.customer || typeof subscription.customer !== "string") return;
 
@@ -183,25 +258,31 @@ async function handleSubscriptionUpdated(subscription: Stripe.Subscription): Pro
 		return;
 	}
 
-	// Get the price ID from the subscription
 	const priceId = subscription.items.data[0]?.price.id;
 	if (!priceId) return;
 
-	// Find our product
 	const product = getProductByStripePriceId(priceId);
 	if (!product) {
 		console.error("No product found for Stripe price:", priceId);
 		return;
 	}
 
-	// Update subscription in our database
+	const item = subscription.items.data[0];
+	const periodStart = item?.current_period_start ?? (subscription as unknown as Record<string, number>).current_period_start;
+	const periodEnd = item?.current_period_end ?? (subscription as unknown as Record<string, number>).current_period_end;
+
+	if (!periodStart || !periodEnd) {
+		console.error(`Subscription ${subscription.id} missing period dates — skipping`);
+		return;
+	}
+
 	updateUserSubscription(
 		userId,
 		product.id,
 		subscription.id,
 		subscription.status,
-		new Date(subscription.current_period_start * 1000),
-		new Date(subscription.current_period_end * 1000),
+		new Date(periodStart * 1000),
+		new Date(periodEnd * 1000),
 	);
 
 	console.log(`Updated subscription for user ${userId}: ${subscription.status}`);
@@ -233,10 +314,58 @@ async function handleSubscriptionDeleted(subscription: Stripe.Subscription): Pro
 }
 
 async function handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
-	// This is mainly for logging - actual subscription creation is handled by subscription.created
-	console.log(`Checkout completed: ${session.id}`);
+	console.log(`Checkout completed: ${session.id}, mode: ${session.mode}`);
 
-	if (session.metadata?.user_id) {
-		console.log(`User ${session.metadata.user_id} completed checkout`);
+	if (session.mode === "payment") {
+		// One-time credit purchase
+		const userId =
+			session.metadata?.user_id ||
+			(typeof session.customer === "string"
+				? getUserIdFromStripeCustomer(session.customer)
+				: null);
+
+		if (!userId) {
+			console.error("No user found for credit purchase checkout:", session.id);
+			return;
+		}
+
+		const credits = Number(session.metadata?.credits);
+		const packageId = session.metadata?.package_id;
+
+		if (!credits || credits <= 0) {
+			console.error("Invalid credits in checkout metadata:", session.metadata);
+			return;
+		}
+
+		// Grant credits
+		addCredits(userId, credits, "purchased", "Stripe credit purchase");
+
+		// Record payment
+		const amountCents = session.amount_total || 0;
+		const paymentIntentId =
+			typeof session.payment_intent === "string" ? session.payment_intent : null;
+
+		const paymentId = recordPayment(
+			userId,
+			paymentIntentId,
+			null,
+			amountCents,
+			"succeeded",
+			"credit_purchase",
+			`Credit purchase: ${credits} credits`,
+			{ package_id: packageId },
+		);
+
+		// Record revenue event
+		recordRevenueEvent(userId, "credit_purchase", amountCents, {
+			paymentId,
+			description: `Stripe credit purchase: ${credits} credits`,
+		});
+
+		// Update user metrics
+		updateUserMetrics(userId, amountCents);
+
+		console.log(`Granted ${credits} credits to user ${userId} via Stripe (${amountCents} cents)`);
 	}
+	// Subscription bonus credits are handled by customer.subscription.created webhook
 }

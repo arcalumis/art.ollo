@@ -3,6 +3,7 @@ import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
 import {
 	createCheckoutSession,
+	createCreditCheckoutSession,
 	createPortalSession,
 	getStripeCustomerId,
 	getUserInvoices,
@@ -19,6 +20,26 @@ interface CheckoutBody {
 
 interface PortalBody {
 	returnUrl: string;
+}
+
+/**
+ * Validates that a redirect URL belongs to the configured app domain.
+ * Prevents open redirect attacks where an attacker supplies an external URL.
+ */
+function isAllowedRedirectUrl(url: string): boolean {
+	const appUrl = process.env.APP_URL;
+	if (!appUrl) {
+		// Can't validate without APP_URL — fail closed
+		console.warn("APP_URL not set; cannot validate redirect URL");
+		return false;
+	}
+	try {
+		const parsed = new URL(url);
+		const allowed = new URL(appUrl);
+		return parsed.hostname === allowed.hostname;
+	} catch {
+		return false;
+	}
 }
 
 export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
@@ -46,10 +67,13 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 						us.status,
 						us.current_period_start,
 						us.current_period_end,
+						us.last_credit_topoff_at,
 						sp.name as plan_name,
 						sp.price,
 						sp.monthly_image_limit,
-						sp.monthly_cost_limit
+						sp.monthly_cost_limit,
+						sp.credit_refill_amount,
+						sp.topoff_interval_hours
 					FROM user_subscriptions us
 					JOIN subscription_products sp ON us.product_id = sp.id
 					WHERE us.user_id = ? AND us.status IN ('active', 'trialing', 'past_due')
@@ -62,10 +86,13 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 					status: string;
 					current_period_start: string | null;
 					current_period_end: string | null;
+					last_credit_topoff_at: string | null;
 					plan_name: string;
 					price: number;
 					monthly_image_limit: number | null;
 					monthly_cost_limit: number | null;
+					credit_refill_amount: number;
+					topoff_interval_hours: number;
 			  }
 			| undefined;
 
@@ -111,6 +138,19 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 		// Get available credits
 		const availableCredits = getAvailableCredits(userId);
 
+		// Compute next refill time
+		let nextRefillAt: string | null = null;
+		if (subscription?.credit_refill_amount && subscription.credit_refill_amount > 0) {
+			if (subscription.last_credit_topoff_at) {
+				const lastTopoff = new Date(subscription.last_credit_topoff_at);
+				const nextTopoff = new Date(lastTopoff.getTime() + (subscription.topoff_interval_hours || 24) * 60 * 60 * 1000);
+				nextRefillAt = nextTopoff.toISOString();
+			} else {
+				// Never refilled -- next cleanup cycle will do it
+				nextRefillAt = new Date().toISOString();
+			}
+		}
+
 		return {
 			availableCredits,
 			subscription: subscription
@@ -121,6 +161,9 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 						price: subscription.price,
 						monthlyImageLimit: subscription.monthly_image_limit,
 						monthlyCostLimit: subscription.monthly_cost_limit,
+						creditRefillAmount: subscription.credit_refill_amount || 0,
+						topoffIntervalHours: subscription.topoff_interval_hours || 24,
+						nextRefillAt,
 						periodStart: subscription.current_period_start,
 						periodEnd: subscription.current_period_end,
 					}
@@ -154,15 +197,19 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 					description,
 					monthly_image_limit,
 					monthly_cost_limit,
+					credit_refill_amount,
+					topoff_interval_hours,
 					bonus_credits,
 					price,
 					price_sol,
 					available_for_usd,
 					available_for_sol,
 					stripe_price_id,
-					overage_price_cents
+					overage_price_cents,
+					allowed_models
 				FROM subscription_products
 				WHERE is_active = 1
+					AND stripe_price_id IS NOT NULL
 				ORDER BY price ASC
 			`)
 			.all() as Array<{
@@ -171,6 +218,8 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			description: string | null;
 			monthly_image_limit: number | null;
 			monthly_cost_limit: number | null;
+			credit_refill_amount: number;
+			topoff_interval_hours: number;
 			bonus_credits: number;
 			price: number;
 			price_sol: number | null;
@@ -178,6 +227,7 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			available_for_sol: number;
 			stripe_price_id: string | null;
 			overage_price_cents: number;
+			allowed_models: string | null;
 		}>;
 
 		return {
@@ -187,6 +237,8 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 				description: p.description,
 				monthlyImageLimit: p.monthly_image_limit,
 				monthlyCostLimit: p.monthly_cost_limit,
+				creditRefillAmount: p.credit_refill_amount || 0,
+				topoffIntervalHours: p.topoff_interval_hours || 24,
 				bonusCredits: p.bonus_credits,
 				price: p.price,
 				priceSol: p.price_sol,
@@ -194,6 +246,7 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 				availableForSol: p.available_for_sol === 1,
 				stripePriceId: p.stripe_price_id,
 				overagePriceCents: p.overage_price_cents,
+				allowedModels: p.allowed_models ? JSON.parse(p.allowed_models) : null,
 			})),
 		};
 	});
@@ -216,6 +269,10 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 
 			if (!priceId || !successUrl || !cancelUrl) {
 				return reply.status(400).send({ error: "Missing required fields" });
+			}
+
+			if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
+				return reply.status(400).send({ error: "Invalid redirect URL" });
 			}
 
 			const url = await createCheckoutSession(userId, priceId, successUrl, cancelUrl);
@@ -246,6 +303,10 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 
 			if (!returnUrl) {
 				return reply.status(400).send({ error: "Missing return URL" });
+			}
+
+			if (!isAllowedRedirectUrl(returnUrl)) {
+				return reply.status(400).send({ error: "Invalid return URL" });
 			}
 
 			const url = await createPortalSession(userId, returnUrl);
@@ -287,6 +348,69 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			})),
 		};
 	});
+
+	// Get credit packages available for USD purchase
+	fastify.get("/api/billing/credit-packages", async () => {
+		const db = getDb();
+		const packages = db
+			.prepare(`
+				SELECT id, name, credits, price_cents, stripe_price_id
+				FROM solana_credit_packages
+				WHERE is_active = 1 AND available_for_usd = 1 AND stripe_price_id IS NOT NULL AND price_cents IS NOT NULL
+				ORDER BY credits ASC
+			`)
+			.all() as Array<{
+			id: string;
+			name: string;
+			credits: number;
+			price_cents: number;
+			stripe_price_id: string;
+		}>;
+
+		return {
+			packages: packages.map((p) => ({
+				id: p.id,
+				name: p.name,
+				credits: p.credits,
+				priceCents: p.price_cents,
+				stripePriceId: p.stripe_price_id,
+			})),
+		};
+	});
+
+	// Create checkout session for one-time credit purchase
+	fastify.post<{ Body: { packageId: string; successUrl: string; cancelUrl: string } }>(
+		"/api/billing/credit-checkout",
+		{ preHandler: authMiddleware },
+		async (request, reply) => {
+			if (!isStripeConfigured()) {
+				return reply.status(400).send({ error: "Billing is not configured" });
+			}
+
+			const userId = request.user?.userId;
+			if (!userId) {
+				return reply.status(401).send({ error: "Unauthorized" });
+			}
+
+			const { packageId, successUrl, cancelUrl } = request.body;
+
+			if (!packageId || !successUrl || !cancelUrl) {
+				return reply.status(400).send({ error: "Missing required fields" });
+			}
+
+			if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
+				return reply.status(400).send({ error: "Invalid redirect URL" });
+			}
+
+			const url = await createCreditCheckoutSession(userId, packageId, successUrl, cancelUrl);
+
+			if (!url) {
+				return reply.status(400).send({ error: "Package not available for USD purchase or missing Stripe price" });
+			}
+
+			return { url };
+		},
+	);
 
 	// Get active Stripe subscription details
 	fastify.get(

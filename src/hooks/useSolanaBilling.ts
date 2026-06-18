@@ -45,6 +45,7 @@ export interface SolanaSubscriptionProduct {
 	priceUsd: number;
 	priceSol: number;
 	allowedModels: string[] | null;
+	creditRefillAmount?: number;
 }
 
 export interface InitiateSubscriptionResponse {
