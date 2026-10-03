@@ -74,7 +74,7 @@ describe("trash purge", () => {
 		getDb()
 			.prepare(
 				`INSERT INTO generations (id, prompt, model, image_path, parameters, user_id, cost, deleted_at)
-				VALUES (?, 'p', 'm', ?, ?, ?, 0.1, datetime('now', '-2 hours'))`,
+				VALUES (?, 'p', 'm', ?, ?, ?, 0.1, datetime('now', '-31 days'))`,
 			)
 			.run(
 				genId,
