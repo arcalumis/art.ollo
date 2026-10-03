@@ -13,10 +13,12 @@
 		"lint": "biome lint .",
 		"format": "biome format . --write",
 		"check": "biome check .",
-		"check:types": "tsc --noEmit",
+		"check:types": "tsc -p tsconfig.app.json && tsc -p tsconfig.server.json",
 		"check:lint": "biome lint .",
 		"check:format": "biome check --formatter-enabled=true .",
-		"preview": "vite preview"
+		"preview": "vite preview",
+		"test": "bun test",
+		"ci": "bun run check:types && bun run check:lint && bun test && bun run build"
 	},
 	"dependencies": {
 		"@base-ui/react": "^1.8.0",
