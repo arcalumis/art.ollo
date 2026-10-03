@@ -23,6 +23,8 @@ interface Thread {
 	archivedAt?: string;
 	generationCount?: number;
 	lastGenerationAt?: string;
+	/** Newest image in the series, for the series list. */
+	coverImageUrl?: string;
 	projectMetadata?: ProjectMetadata;
 }
 
@@ -36,6 +38,7 @@ interface ThreadDbRow {
 	deleted_at: string | null;
 	generation_count?: number;
 	last_generation_at?: string | null;
+	cover_image_path?: string | null;
 	project_metadata?: string | null;
 }
 
@@ -76,7 +79,12 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 					t.archived_at,
 					t.project_metadata,
 					COUNT(g.id) as generation_count,
-					MAX(g.created_at) as last_generation_at
+					MAX(g.created_at) as last_generation_at,
+					(
+						SELECT c.image_path FROM generations c
+						WHERE c.thread_id = t.id AND c.deleted_at IS NULL AND c.purged_at IS NULL
+						ORDER BY c.created_at DESC LIMIT 1
+					) as cover_image_path
 				FROM threads t
 				LEFT JOIN generations g ON g.thread_id = t.id AND g.deleted_at IS NULL AND g.purged_at IS NULL
 				WHERE t.user_id = ? AND t.deleted_at IS NULL
@@ -93,6 +101,7 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 				archivedAt: row.archived_at || undefined,
 				generationCount: row.generation_count || 0,
 				lastGenerationAt: row.last_generation_at || undefined,
+				coverImageUrl: row.cover_image_path ? `/images/${row.cover_image_path}` : undefined,
 				projectMetadata: row.project_metadata ? JSON.parse(row.project_metadata) : undefined,
 			}));
 

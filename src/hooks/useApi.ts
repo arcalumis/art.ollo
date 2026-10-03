@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../config";
-import type { GenerateErrorCode, GenerateRequest, GenerateResponse, HistoryResponse, ModelsResponse, Thread, ThreadsResponse } from "../types";
+import type {
+	GenerateErrorCode,
+	GenerateRequest,
+	GenerateResponse,
+	HistoryResponse,
+	ModelsResponse,
+	Thread,
+	ThreadsResponse,
+} from "../types";
 
 function getAuthHeaders(token: string | null, includeContentType = true): HeadersInit {
 	const headers: HeadersInit = {};
@@ -26,20 +34,22 @@ function fallbackErrorCode(status: number): GenerateErrorCode {
  * POST /api/generate. Never throws: a failure comes back as a `status: "failed"`
  * response carrying a `code`, so callers branch on the code (paywall, retry,
  * settings) instead of showing server text.
+ *
+ * Stateless on purpose: several generations run at once, so loading and errors
+ * live on each queue item (see useGenerationQueue), not in this hook.
  */
 export function useGenerate(token: string | null) {
-	const [loading, setLoading] = useState(false);
-	const [error, setError] = useState<GenerateErrorCode | null>(null);
-
 	const generate = useCallback(
 		async (request: GenerateRequest): Promise<GenerateResponse> => {
-			setLoading(true);
-			setError(null);
-
-			const failed = (code: GenerateErrorCode, extra: Partial<GenerateResponse> = {}): GenerateResponse => {
-				setError(code);
-				return { id: "", status: "failed", code, ...extra };
-			};
+			const failed = (
+				code: GenerateErrorCode,
+				extra: Partial<GenerateResponse> = {},
+			): GenerateResponse => ({
+				id: "",
+				status: "failed",
+				code,
+				...extra,
+			});
 
 			try {
 				const response = await fetch(`${API_BASE}/api/generate`, {
@@ -61,14 +71,12 @@ export function useGenerate(token: string | null) {
 				return data as GenerateResponse;
 			} catch (err) {
 				return failed("NETWORK_ERROR", { error: err instanceof Error ? err.message : String(err) });
-			} finally {
-				setLoading(false);
 			}
 		},
 		[token],
 	);
 
-	return { generate, loading, error };
+	return { generate };
 }
 
 export function useEnhancePrompt(token: string | null) {
@@ -277,7 +285,18 @@ export function useHistory(token: string | null) {
 		[token],
 	);
 
-	return { history, fetchHistory, fetchMoreHistory, resetHistory, trashGeneration, restoreGeneration, archiveGeneration, unarchiveGeneration, deleteGeneration, loading };
+	return {
+		history,
+		fetchHistory,
+		fetchMoreHistory,
+		resetHistory,
+		trashGeneration,
+		restoreGeneration,
+		archiveGeneration,
+		unarchiveGeneration,
+		deleteGeneration,
+		loading,
+	};
 }
 
 export function useUploads(token: string | null) {
@@ -446,9 +465,7 @@ export function useThreads(token: string | null) {
 					body: JSON.stringify({ title }),
 				});
 				if (response.ok) {
-					setThreads((prev) =>
-						prev.map((t) => (t.id === threadId ? { ...t, title } : t)),
-					);
+					setThreads((prev) => prev.map((t) => (t.id === threadId ? { ...t, title } : t)));
 					if (activeThread?.id === threadId) {
 						setActiveThread((prev) => (prev ? { ...prev, title } : null));
 					}
@@ -506,9 +523,7 @@ export function useThreads(token: string | null) {
 						// Thread was archived - update in list
 						setThreads((prev) =>
 							prev.map((t) =>
-								t.id === threadId
-									? { ...t, archivedAt: new Date().toISOString() }
-									: t,
+								t.id === threadId ? { ...t, archivedAt: new Date().toISOString() } : t,
 							),
 						);
 					}
@@ -550,6 +565,29 @@ export function useThreads(token: string | null) {
 		[token],
 	);
 
+	const unarchiveThread = useCallback(
+		async (threadId: string) => {
+			if (!token) return false;
+
+			try {
+				const response = await fetch(`${API_BASE}/api/threads/${threadId}/unarchive`, {
+					method: "POST",
+					headers: getAuthHeaders(token, false),
+				});
+				if (response.ok) {
+					setThreads((prev) =>
+						prev.map((t) => (t.id === threadId ? { ...t, archivedAt: undefined } : t)),
+					);
+				}
+				return response.ok;
+			} catch (err) {
+				console.error("Failed to restore thread:", err);
+				return false;
+			}
+		},
+		[token],
+	);
+
 	const clearActiveThread = useCallback(() => {
 		setActiveThread(null);
 	}, []);
@@ -565,6 +603,7 @@ export function useThreads(token: string | null) {
 		deleteThread,
 		deleteThreadWithOptions,
 		archiveThread,
+		unarchiveThread,
 		clearActiveThread,
 		loading,
 	};
