@@ -14,22 +14,17 @@ import type { Generation, QueuedGeneration } from "@/types";
 import { ImagePlusIcon, MoreHorizontalIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { type ImageActionCosts, type ViewerImage, absoluteUrl, cssAspect } from "../viewer/media";
+import { pendingView } from "./pendingView";
 
-/** Live progress for an in-flight generation, capped at 95% until the server answers. */
-function useProgress(startedAt: string | undefined, estimatedSeconds: number | undefined) {
+/** A clock that ticks twice a second while `running`. */
+function useNow(running: boolean): number {
 	const [now, setNow] = useState(() => Date.now());
 	useEffect(() => {
-		if (!startedAt) return;
+		if (!running) return;
 		const t = setInterval(() => setNow(Date.now()), 500);
 		return () => clearInterval(t);
-	}, [startedAt]);
-	if (!startedAt) return { progress: 0, secondsLeft: undefined };
-	const elapsed = (now - new Date(startedAt).getTime()) / 1000;
-	const total = estimatedSeconds || 30;
-	return {
-		progress: Math.min(0.95, Math.max(0.03, elapsed / total)),
-		secondsLeft: Math.max(0, Math.ceil(total - elapsed)),
-	};
+	}, [running]);
+	return now;
 }
 
 function creditLabel(n: number | undefined): string | null {
@@ -249,17 +244,9 @@ export function PendingStep({
 	number,
 	fallbackAspect,
 }: { item: QueuedGeneration; number: number; fallbackAspect?: string }) {
-	const { progress, secondsLeft } = useProgress(
-		item.status === "generating" ? item.startedAt : undefined,
-		item.estimatedDuration,
-	);
+	const now = useNow(item.status === "generating");
+	const view = pendingView(item, now);
 	const aspect = cssAspect(item.aspectRatio) ?? cssAspect(fallbackAspect) ?? "1 / 1";
-	const generating = item.status === "generating" && !!item.startedAt;
-	const status = generating
-		? secondsLeft && secondsLeft > 0
-			? `Rendering, about ${secondsLeft} s left`
-			: "Rendering, almost there"
-		: "Queued";
 
 	return (
 		<figure className="m-0 flex min-w-0 flex-col gap-2.5" aria-busy="true">
@@ -267,10 +254,18 @@ export function PendingStep({
 				className="relative grid place-items-center overflow-hidden rounded-xl bg-muted"
 				style={{ aspectRatio: aspect }}
 			>
-				<Laurel progress={generating ? progress : 0} className="w-[46%] max-w-40" />
-				<progress className="sr-only" max={100} value={generating ? Math.round(progress * 100) : 0}>
-					Rendering
-				</progress>
+				{view.progress === undefined ? (
+					<Laurel indeterminate className="w-[46%] max-w-40" />
+				) : (
+					<Laurel progress={view.progress} className="w-[46%] max-w-40" />
+				)}
+				{view.progress === undefined ? (
+					<progress className="sr-only">{view.label}</progress>
+				) : (
+					<progress className="sr-only" max={100} value={Math.round(view.progress * 100)}>
+						{view.label}
+					</progress>
+				)}
 			</div>
 			<figcaption className="flex min-w-0 flex-col gap-1">
 				<p className="line-clamp-3 text-sm leading-snug font-medium text-foreground">
@@ -281,7 +276,9 @@ export function PendingStep({
 					<span aria-hidden="true"> · </span>
 					<span>{modelName(item.model)}</span>
 					<span aria-hidden="true"> · </span>
-					<span className={generating ? "text-verdigris" : undefined}>{status}</span>
+					<span className={cn("tabular-nums", view.active && "text-verdigris")}>
+						{view.label}
+					</span>
 				</p>
 			</figcaption>
 		</figure>

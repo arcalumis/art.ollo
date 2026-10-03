@@ -19,16 +19,47 @@ interface LaurelProps {
 	progress?: number;
 	/** Accessible name; the mark is decorative when omitted. */
 	label?: string;
+	/**
+	 * Progress with no known amount (waiting for a GPU): a band of gilt climbs
+	 * the wreath on a loop. With reduced motion it holds still mid-wreath.
+	 */
+	indeterminate?: boolean;
 }
 
+/** Band of the indeterminate sweep, in viewBox units. */
+const SWEEP_HEIGHT = 260;
+
 /** The ollo laurel. Takes its colour from `currentColor` (bronze by default). */
-export function Laurel({ className, progress, label }: LaurelProps) {
+export function Laurel({ className, progress, label, indeterminate }: LaurelProps) {
 	const clipId = useId();
 	const shape = (
 		<g transform={LAUREL_TRANSFORM} fill="currentColor" fillRule="evenodd">
 			<path d={LAUREL_PATH} />
 		</g>
 	);
+	if (indeterminate) {
+		return (
+			<svg
+				viewBox="0 0 1024 1024"
+				className={cn("text-bronze", className)}
+				role={label ? "img" : undefined}
+				aria-label={label}
+				aria-hidden={label ? undefined : true}
+			>
+				<g opacity={0.2}>{shape}</g>
+				<clipPath id={clipId}>
+					<rect
+						className="laurel-sweep"
+						x={0}
+						width={1024}
+						y={(TOP + BOTTOM - SWEEP_HEIGHT) / 2}
+						height={SWEEP_HEIGHT}
+					/>
+				</clipPath>
+				<g clipPath={`url(#${clipId})`}>{shape}</g>
+			</svg>
+		);
+	}
 	const lit = progress === undefined ? 1 : Math.min(1, Math.max(0, progress));
 	const litHeight = (BOTTOM - TOP) * lit;
 

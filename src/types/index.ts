@@ -99,6 +99,7 @@ export type GenerateErrorCode =
 	| "GENERATION_CANCELED"
 	| "GENERATION_NO_OUTPUT"
 	| "GENERATION_FAILED"
+	| "GPU_BUSY"
 	| "API_KEY_UNREADABLE"
 	| "THREAD_NOT_FOUND"
 	| "RATE_LIMITED"
@@ -355,6 +356,20 @@ export interface QueuedGeneration {
 	aspectRatio?: string;
 	/** Outputs requested (4 for variation sets). */
 	numOutputs?: number;
+	/** What the server says is happening right now (GET /api/generate/status/:id). */
+	live?: LiveGenerationStatus;
+}
+
+/** Server phase of an in-flight generation. */
+export type GenerationPhase = "queued" | "waiting_gpu" | "rendering" | "saving" | "done" | "failed";
+
+/** Live status, with server durations turned into local clock times (no clock skew). */
+export interface LiveGenerationStatus {
+	phase: GenerationPhase;
+	/** Local ms timestamp when the wait for a GPU began. */
+	waitingSince?: number;
+	/** Local ms timestamp when rendering began. */
+	renderingSince?: number;
 }
 
 // Thread types
