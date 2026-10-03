@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import Stripe from "stripe";
 import { getDb } from "../db";
+import { addCredits, assignSubscription } from "./usage";
 
 // Initialize Stripe client
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
@@ -8,8 +9,10 @@ if (!stripeSecretKey) {
 	console.warn("STRIPE_SECRET_KEY not set - billing features will be disabled");
 }
 
+// Pinned to the API version the account and webhook payloads were built against. The SDK's
+// types track a newer version, hence the cast; runtime behaviour is unchanged.
 export const stripe = stripeSecretKey
-	? new Stripe(stripeSecretKey, { apiVersion: "2024-12-18.acacia" })
+	? new Stripe(stripeSecretKey, { apiVersion: "2024-12-18.acacia" as Stripe.StripeConfig["apiVersion"] })
 	: null;
 
 export const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
@@ -258,7 +261,7 @@ export function recordPayment(
 		amountCents,
 		status,
 		paymentType,
-		description,
+		description ?? null,
 		metadata ? JSON.stringify(metadata) : null,
 	);
 
@@ -299,51 +302,101 @@ export function recordRevenueEvent(
 	return id;
 }
 
-// Update user subscription in database
-export function updateUserSubscription(
+/** Stripe statuses that grant the subscribed tier. Everything else falls back to Free. */
+export const ENTITLED_STRIPE_STATUSES = new Set(["active", "trialing"]);
+
+/**
+ * Sync a Stripe subscription into user_subscriptions. Must be called inside a DB transaction
+ * by the webhook handler.
+ *
+ * - Becoming entitled (active/trialing) retires the user's other active rows via
+ *   assignSubscription (one active row per user).
+ * - Non-entitled statuses (incomplete, past_due, canceled, unpaid...) are recorded but never
+ *   retire the user's existing subscription and never grant credits.
+ * - The product's welcome bonus is granted exactly once per row, the first time it is entitled
+ *   (so a subscription that starts 'incomplete' gets its bonus when the payment succeeds).
+ */
+export function syncStripeSubscription(
 	userId: string,
 	productId: string,
 	stripeSubscriptionId: string,
 	status: string,
 	periodStart: Date,
 	periodEnd: Date,
-): void {
+): { subscriptionId: string; bonusGranted: number } {
 	const db = getDb();
+	const ps = periodStart.toISOString().split("T")[0];
+	const pe = periodEnd.toISOString().split("T")[0];
+	const entitled = ENTITLED_STRIPE_STATUSES.has(status);
 
-	// Check for existing subscription
 	const existing = db
-		.prepare("SELECT id FROM user_subscriptions WHERE user_id = ? AND stripe_subscription_id = ?")
-		.get(userId, stripeSubscriptionId) as { id: string } | undefined;
+		.prepare("SELECT id, status, bonus_granted FROM user_subscriptions WHERE stripe_subscription_id = ?")
+		.get(stripeSubscriptionId) as { id: string; status: string | null; bonus_granted: number } | undefined;
+
+	let subscriptionId: string;
+	let bonusAlreadyGranted: boolean;
 
 	if (existing) {
-		// Update existing
+		if (entitled && !ENTITLED_STRIPE_STATUSES.has(existing.status ?? "")) {
+			// Newly entitled: retire whatever else is active for this user first
+			db.prepare(
+				`UPDATE user_subscriptions SET status = 'superseded', ends_at = COALESCE(ends_at, datetime('now'))
+				WHERE user_id = ? AND id != ? AND status IN ('active', 'trialing')`,
+			).run(userId, existing.id);
+		}
 		db.prepare(`
 			UPDATE user_subscriptions
-			SET product_id = ?, status = ?, current_period_start = ?, current_period_end = ?
+			SET product_id = ?, status = ?, current_period_start = ?, current_period_end = ?,
+				ends_at = CASE WHEN ? THEN NULL ELSE ends_at END
 			WHERE id = ?
-		`).run(
-			productId,
-			status,
-			periodStart.toISOString().split("T")[0],
-			periodEnd.toISOString().split("T")[0],
-			existing.id,
-		);
-	} else {
-		// Create new
-		const id = crypto.randomUUID();
-		db.prepare(`
-			INSERT INTO user_subscriptions (id, user_id, product_id, stripe_subscription_id, status, current_period_start, current_period_end)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`).run(
-			id,
-			userId,
-			productId,
+		`).run(productId, status, ps, pe, entitled ? 1 : 0, existing.id);
+		subscriptionId = existing.id;
+		bonusAlreadyGranted = existing.bonus_granted === 1;
+	} else if (entitled) {
+		subscriptionId = assignSubscription(userId, productId, {
 			stripeSubscriptionId,
-			status,
-			periodStart.toISOString().split("T")[0],
-			periodEnd.toISOString().split("T")[0],
-		);
+			status: status as "active" | "trialing",
+			periodStart: ps,
+			periodEnd: pe,
+			grantBonus: false,
+		});
+		bonusAlreadyGranted = false;
+	} else {
+		subscriptionId = crypto.randomUUID();
+		db.prepare(`
+			INSERT INTO user_subscriptions
+				(id, user_id, product_id, stripe_subscription_id, status, current_period_start, current_period_end, bonus_granted)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+		`).run(subscriptionId, userId, productId, stripeSubscriptionId, status, ps, pe);
+		bonusAlreadyGranted = false;
 	}
+
+	let bonusGranted = 0;
+	if (entitled && !bonusAlreadyGranted) {
+		const product = db.prepare("SELECT bonus_credits FROM subscription_products WHERE id = ?").get(productId) as
+			| { bonus_credits: number }
+			| undefined;
+		if (product && product.bonus_credits > 0) {
+			addCredits(userId, product.bonus_credits, "bonus", "Subscription welcome bonus");
+			bonusGranted = product.bonus_credits;
+		}
+		db.prepare("UPDATE user_subscriptions SET bonus_granted = 1 WHERE id = ?").run(subscriptionId);
+	}
+
+	return { subscriptionId, bonusGranted };
+}
+
+/** Does the user already have a live Stripe subscription (should manage it in the portal)? */
+export function hasLiveStripeSubscription(userId: string): boolean {
+	const row = getDb()
+		.prepare(`
+			SELECT 1 FROM user_subscriptions
+			WHERE user_id = ? AND stripe_subscription_id IS NOT NULL
+			AND status IN ('active', 'trialing', 'past_due', 'unpaid')
+			LIMIT 1
+		`)
+		.get(userId);
+	return !!row;
 }
 
 // Update user metrics after payment
