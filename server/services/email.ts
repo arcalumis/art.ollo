@@ -395,6 +395,50 @@ export async function sendEmailChangeEmail(to: string, username: string, token: 
 	});
 }
 
+/**
+ * "Confirm it's you" link for a sensitive account change (email or password). Sent to the
+ * account's CURRENT address. The caller reserves the send first.
+ */
+export async function sendReauthEmail(to: string, username: string, token: string): Promise<SendResult> {
+	const url = `${APP_URL}/settings?reauth=${token}`;
+	return sendEmail({
+		to,
+		subject: "Confirm it's you on ollo.art",
+		devLink: url,
+		html: plainLayout({
+			heading: "Confirm it's you",
+			paragraphs: [
+				`Hi ${escapeHtml(username)}, someone signed in to your ollo.art account asked to change its email or password.`,
+				"If that was you, open the link below on the same device to continue. The link expires in 15 minutes.",
+			],
+			buttonUrl: url,
+			buttonLabel: "Confirm it's me",
+			footer:
+				"If this wasn't you, don't open the link. Your account is unchanged. Sign out everywhere from Settings, or reply to this email or write to support@matahari.dev for help.",
+		}),
+	});
+}
+
+/** Sent to the OLD address after the sign-in email changed, so a takeover can't go unnoticed. */
+export async function sendEmailChangedNotice(to: string, username: string, newEmail: string): Promise<SendResult> {
+	if (!reserveEmailSend(to, "email_changed")) return { success: false, error: "Send cap reached" };
+	return sendEmail({
+		to,
+		subject: "Your ollo.art email was changed",
+		html: plainLayout({
+			heading: "Your sign-in email was changed",
+			paragraphs: [
+				`Hi ${escapeHtml(username)}, the email on your ollo.art account was changed to <strong>${escapeHtml(newEmail)}</strong>. Sign-in links, receipts and notices now go there, and this address no longer works for signing in.`,
+				"If you made this change, there's nothing else to do.",
+				"If you didn't, reply to this email or write to <a href=\"mailto:support@matahari.dev\" style=\"color: #2d6f61;\">support@matahari.dev</a> from this address and we'll help you get the account back.",
+			],
+			buttonUrl: "mailto:support@matahari.dev",
+			buttonLabel: "Contact support",
+			footer: "We send this notice to your previous address every time the account email changes.",
+		}),
+	});
+}
+
 function userEmail(userId: string): string | null {
 	const row = getDb().prepare("SELECT email FROM users WHERE id = ?").get(userId) as
 		| { email: string | null }

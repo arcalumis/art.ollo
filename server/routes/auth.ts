@@ -223,6 +223,25 @@ function isValidWalletAddress(address: string): boolean {
 	}
 }
 
+/**
+ * Check a signed wallet challenge (from /api/auth/wallet/challenge) and consume it atomically,
+ * so each challenge proves control of the wallet exactly once.
+ */
+export function verifyAndConsumeWalletChallenge(walletAddress: string, challenge: unknown, signature: unknown): boolean {
+	if (typeof challenge !== "string" || typeof signature !== "string" || !isValidWalletAddress(walletAddress)) return false;
+	const [nonce, timestamp] = challenge.split(":");
+	if (!nonce || !timestamp || !verifyWalletSignature(walletAddress, walletMessage(nonce, timestamp), signature)) {
+		return false;
+	}
+	const consumed = getDb()
+		.prepare(`
+			UPDATE wallet_challenges SET used_at = datetime('now')
+			WHERE challenge = ? AND wallet_address = ? AND used_at IS NULL AND expires_at > ?
+		`)
+		.run(challenge, walletAddress, new Date().toISOString());
+	return consumed.changes === 1;
+}
+
 function isActive(user: Pick<UserRow, "is_active">): boolean {
 	return user.is_active !== 0;
 }

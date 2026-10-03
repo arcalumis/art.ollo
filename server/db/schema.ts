@@ -1129,4 +1129,19 @@ function runPhase1BMigrations(db: Database): void {
 		}
 		db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_reference ON ${table}(reference) WHERE reference IS NOT NULL`);
 	}
+	// Recent re-authentication for sensitive account changes. 'link' rows are emailed to the
+	// current address; confirming one (or the current password, or a wallet signature) issues a
+	// short-lived 'sudo' row that the email/password endpoints require.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS account_reauth_tokens (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			kind TEXT NOT NULL CHECK (kind IN ('link', 'sudo')),
+			token_hash TEXT UNIQUE NOT NULL,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME DEFAULT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_account_reauth_tokens_user ON account_reauth_tokens(user_id);
+	`);
 }

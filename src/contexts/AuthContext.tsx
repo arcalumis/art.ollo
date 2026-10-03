@@ -51,6 +51,8 @@ interface AuthContextType {
 	requestWalletChallenge: (walletAddress: string) => Promise<WalletChallengeResponse | null>;
 	verifyWalletSignature: (data: WalletVerifyRequest) => Promise<WalletVerifyResponse | null>;
 	updateUser: (updates: Partial<User>) => void;
+	/** Switch to a token the server just issued (e.g. after the email changed and sessions reset). */
+	adoptToken: (token: string) => void;
 	logout: () => void;
 }
 
@@ -263,6 +265,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		setUser((prev) => (prev ? { ...prev, ...updates } : null));
 	}, []);
 
+	const adoptToken = useCallback((next: string) => {
+		try {
+			localStorage.setItem("token", next);
+		} catch {
+			// storage blocked: the session lasts for this page only
+		}
+		setToken(next);
+	}, []);
+
 	const logout = useCallback(() => {
 		localStorage.removeItem("token");
 		setToken(null);
@@ -285,6 +296,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 				requestWalletChallenge,
 				verifyWalletSignature,
 				updateUser,
+				adoptToken,
 				logout,
 			}}
 		>

@@ -9,16 +9,27 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { SolanaBoundary } from "@/components/solana/SolanaBoundary";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAuth } from "@/contexts/AuthContext";
 import { type Finish, useTheme } from "@/contexts/ThemeContext";
 import { useUserSubscription, useUserUsage } from "@/hooks/useUserSettings";
 import { cn } from "@/lib/utils";
 import { ArrowLeftIcon, DownloadIcon } from "lucide-react";
-import { type FormEvent, type ReactNode, useCallback, useEffect, useState } from "react";
+import {
+	type FormEvent,
+	type ReactNode,
+	lazy,
+	useCallback,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { API_BASE } from "../config";
+
+const WalletReauth = lazy(() => import("@/components/solana/WalletReauth"));
 
 interface Account {
 	username: string;
@@ -113,6 +124,187 @@ const FINISHES: { value: Finish; label: string; hint: string }[] = [
 
 const PASSWORD_SAVED_FLAG = "ollo:password-saved";
 
+// ---- "Confirm it's you" (recent re-authentication) ----
+//
+// Changing the email or password needs a short-lived sudo token from the server. It lives in
+// localStorage so a link opened in another tab (from the email) finishes the step here too.
+
+type ReauthMethod = "password" | "email" | "wallet";
+const SUDO_KEY = "ollo:sudo";
+
+function readSudo(): string | null {
+	try {
+		const raw = localStorage.getItem(SUDO_KEY);
+		if (!raw) return null;
+		const { token, expiresAt } = JSON.parse(raw) as { token: string; expiresAt: number };
+		if (typeof token !== "string" || !(expiresAt > Date.now())) {
+			localStorage.removeItem(SUDO_KEY);
+			return null;
+		}
+		return token;
+	} catch {
+		return null;
+	}
+}
+
+function saveSudo(token: string, expiresInSeconds: number): void {
+	try {
+		// A little early, so we never send one the server is about to reject.
+		const expiresAt = Date.now() + Math.max(0, expiresInSeconds - 30) * 1000;
+		localStorage.setItem(SUDO_KEY, JSON.stringify({ token, expiresAt }));
+	} catch {
+		// storage blocked: the caller still has the token in memory
+	}
+}
+
+export function clearSudo(): void {
+	try {
+		localStorage.removeItem(SUDO_KEY);
+	} catch {
+		// nothing stored
+	}
+}
+
+interface SudoGrant {
+	sudoToken: string;
+	expiresInSeconds: number;
+}
+
+function ReauthDialog({
+	open,
+	onOpenChange,
+	methods,
+	email,
+	token,
+	onConfirmed,
+}: {
+	open: boolean;
+	onOpenChange: (open: boolean) => void;
+	methods: ReauthMethod[];
+	email: string | null;
+	token: string | null;
+	onConfirmed: (sudoToken: string) => void;
+}) {
+	const [password, setPassword] = useState("");
+	const [error, setError] = useState<string | null>(null);
+	const [busy, setBusy] = useState(false);
+	const [linkSentTo, setLinkSentTo] = useState<string | null>(null);
+
+	useEffect(() => {
+		if (open) {
+			setPassword("");
+			setError(null);
+			setLinkSentTo(null);
+		}
+	}, [open]);
+
+	const finish = (grant: SudoGrant) => {
+		saveSudo(grant.sudoToken, grant.expiresInSeconds);
+		onConfirmed(grant.sudoToken);
+	};
+
+	const confirmPassword = async (e: FormEvent) => {
+		e.preventDefault();
+		setError(null);
+		setBusy(true);
+		const r = await call<SudoGrant>(token, "POST", "/api/account/reauth", { method: "password", password });
+		setBusy(false);
+		if (!r.ok) return setError(errorText(r, "Couldn't check your password."));
+		finish(r.data);
+	};
+
+	const sendLink = async () => {
+		setError(null);
+		setBusy(true);
+		const r = await call<{ email: string }>(token, "POST", "/api/account/reauth", { method: "email" });
+		setBusy(false);
+		if (!r.ok) return setError(errorText(r, "Couldn't send the link."));
+		setLinkSentTo(r.data.email);
+	};
+
+	const confirmWallet = async (proof: { challenge: string; signature: string }) => {
+		const r = await call<SudoGrant>(token, "POST", "/api/account/reauth", { method: "wallet", ...proof });
+		if (!r.ok) return errorText(r, "Couldn't check the signature.");
+		finish(r.data);
+		return null;
+	};
+
+	return (
+		<Dialog open={open} onOpenChange={onOpenChange}>
+			<DialogContent className="sm:max-w-md">
+				<DialogHeader>
+					<DialogTitle className="font-sans text-lg font-semibold">Confirm it's you</DialogTitle>
+					<DialogDescription>
+						Changing your email or password needs a fresh check, so nobody using a lost or shared
+						device can take over your account.
+					</DialogDescription>
+				</DialogHeader>
+				<div className="flex flex-col gap-5">
+					{methods.includes("password") && (
+						<form onSubmit={confirmPassword} className="flex flex-col gap-3">
+							<Field label="Current password">
+								<Input
+									type="password"
+									autoComplete="current-password"
+									value={password}
+									onChange={(e) => setPassword(e.target.value)}
+									className="h-10"
+									required
+								/>
+							</Field>
+							<div>
+								<Button type="submit" disabled={busy || !password}>
+									{busy ? "Checking…" : "Confirm"}
+								</Button>
+							</div>
+						</form>
+					)}
+					{methods.includes("email") &&
+						(linkSentTo ? (
+							<p aria-live="polite" className="rounded-lg border border-border bg-muted px-3 py-2 text-sm">
+								We sent a link to <span className="font-medium">{linkSentTo}</span>. Open it on this
+								device and this step finishes on its own. The link expires in 15 minutes.
+							</p>
+						) : (
+							<div className="flex flex-col gap-2">
+								<p className="text-sm text-muted-foreground">
+									{methods.includes("password") ? "Or get" : "Get"} a link at{" "}
+									<span className="font-medium text-foreground">{email}</span>.
+								</p>
+								<div>
+									<Button type="button" variant="outline" onClick={sendLink} disabled={busy}>
+										{busy ? "Sending…" : "Email me a link"}
+									</Button>
+								</div>
+							</div>
+						))}
+					{methods.includes("wallet") && (
+						<SolanaBoundary fallback={<Skeleton className="h-10 max-w-xs" />}>
+							<WalletReauth onSigned={confirmWallet} />
+						</SolanaBoundary>
+					)}
+					{methods.length === 0 && (
+						<p className="text-sm text-muted-foreground">
+							This account has no password, email or wallet to confirm with. Write to
+							support@matahari.dev and we'll help.
+						</p>
+					)}
+					{error && (
+						<p role="alert" className="text-sm text-destructive">
+							{error}
+						</p>
+					)}
+				</div>
+				<DialogFooter>
+					<Button variant="outline" onClick={() => onOpenChange(false)}>
+						Cancel
+					</Button>
+				</DialogFooter>
+			</DialogContent>
+		</Dialog>
+	);
+}
+
 /**
  * Account settings: profile, email, password, appearance, plan, export and delete.
  * Used by the /settings page and by the settings sheet (UserSettings).
@@ -137,6 +329,9 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 	const [deleteOpen, setDeleteOpen] = useState(false);
 	const [deleteConfirm, setDeleteConfirm] = useState("");
 	const [deleteError, setDeleteError] = useState<string | null>(null);
+	const [reauthMethods, setReauthMethods] = useState<ReauthMethod[] | null>(null);
+	// The change to retry once the user has confirmed it's them.
+	const pendingChange = useRef<((sudoToken: string) => void) | null>(null);
 
 	const loadAccount = useCallback(async () => {
 		if (!token) return;
@@ -182,14 +377,49 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 		toast.success("Username saved");
 	};
 
-	const sendEmailLink = async (e: FormEvent) => {
-		e.preventDefault();
+	/** True (and opens "Confirm it's you") when the server wants a fresh check first. */
+	const needsReauth = (
+		r: ApiResult<{ methods?: ReauthMethod[] }>,
+		retry: (sudoToken: string) => void,
+	): boolean => {
+		if (r.status !== 403 || r.data.code !== "REAUTH_REQUIRED") return false;
+		clearSudo();
+		pendingChange.current = retry;
+		setReauthMethods(r.data.methods ?? []);
+		return true;
+	};
+
+	const onReauthConfirmed = useCallback((sudoToken: string) => {
+		setReauthMethods(null);
+		const retry = pendingChange.current;
+		pendingChange.current = null;
+		retry?.(sudoToken);
+	}, []);
+
+	// The link from the email may be opened in another tab; pick up its confirmation here.
+	useEffect(() => {
+		if (!reauthMethods) return;
+		const onStorage = (e: StorageEvent) => {
+			if (e.key !== SUDO_KEY) return;
+			const sudo = readSudo();
+			if (sudo) onReauthConfirmed(sudo);
+		};
+		window.addEventListener("storage", onStorage);
+		return () => window.removeEventListener("storage", onStorage);
+	}, [reauthMethods, onReauthConfirmed]);
+
+	const sendEmailLink = async (e?: FormEvent, sudoToken = readSudo()) => {
+		e?.preventDefault();
 		setEmailError(null);
 		setBusy("email");
-		const r = await call<{ pendingEmail: string }>(token, "POST", "/api/account/email", {
-			email: newEmail,
-		});
+		const r = await call<{ pendingEmail: string; methods?: ReauthMethod[] }>(
+			token,
+			"POST",
+			"/api/account/email",
+			{ email: newEmail, sudoToken: sudoToken ?? undefined },
+		);
 		setBusy(null);
+		if (needsReauth(r, (sudo) => void sendEmailLink(undefined, sudo))) return;
 		if (!r.ok) return setEmailError(errorText(r, "Couldn't send the link."));
 		setAccount((a) => (a ? { ...a, pendingEmail: r.data.pendingEmail } : a));
 		setNewEmail("");
@@ -198,16 +428,24 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 		});
 	};
 
-	const savePassword = async (e: FormEvent) => {
-		e.preventDefault();
+	const savePassword = async (e?: FormEvent, sudoToken = readSudo()) => {
+		e?.preventDefault();
 		setPasswordError(null);
 		setBusy("password");
-		const r = await call<{ token: string }>(token, "PUT", "/api/account/password", {
-			currentPassword: account?.hasPassword ? currentPassword : undefined,
-			newPassword,
-		});
+		const r = await call<{ token: string; methods?: ReauthMethod[] }>(
+			token,
+			"PUT",
+			"/api/account/password",
+			{
+				currentPassword: account?.hasPassword ? currentPassword : undefined,
+				sudoToken: sudoToken ?? undefined,
+				newPassword,
+			},
+		);
 		setBusy(null);
+		if (needsReauth(r, (sudo) => void savePassword(undefined, sudo))) return;
 		if (!r.ok) return setPasswordError(errorText(r, "Couldn't save your password."));
+		clearSudo();
 		// Every session was revoked, this one included: continue with the fresh token.
 		try {
 			localStorage.setItem("token", r.data.token);
@@ -370,7 +608,7 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 			<Section
 				id="email-title"
 				title="Email"
-				hint="Sign-in links, receipts and account notices go here."
+				hint="Sign-in links, receipts and account notices go here. Changing it asks you to confirm it's you, and signs you out on other devices."
 			>
 				<p className="text-sm text-foreground">
 					{account.email ? (
@@ -419,7 +657,7 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 				hint={
 					account.hasPassword
 						? "Changing it signs you out everywhere else."
-						: "You sign in with an email link. A password is optional, for when email is slow."
+						: "You sign in with an email link. A password is optional, for when email is slow. Adding one asks you to confirm it's you first."
 				}
 			>
 				{passwordForm}
@@ -530,6 +768,20 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 				</div>
 			</Section>
 
+			<ReauthDialog
+				open={reauthMethods !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setReauthMethods(null);
+						pendingChange.current = null;
+					}
+				}}
+				methods={reauthMethods ?? []}
+				email={account.email}
+				token={token}
+				onConfirmed={onReauthConfirmed}
+			/>
+
 			<Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
 				<DialogContent className="sm:max-w-md">
 					<DialogHeader>
@@ -586,10 +838,12 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 
 /** Opens from the link in the "confirm your new email" message: /settings?confirmEmail=… */
 function useEmailConfirmation(onConfirmed: () => void) {
+	const { token: session, adoptToken, loading } = useAuth();
 	const [state, setState] = useState<"idle" | "working" | "done" | "failed">("idle");
 	const [message, setMessage] = useState<string | null>(null);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: runs once for the link in the URL
+	// biome-ignore lint/correctness/useExhaustiveDependencies: runs once for the link in the URL, after the session loads
 	useEffect(() => {
+		if (loading) return;
 		const params = new URLSearchParams(window.location.search);
 		const token = params.get("confirmEmail");
 		if (!token) return;
@@ -597,17 +851,63 @@ function useEmailConfirmation(onConfirmed: () => void) {
 		const rest = params.toString();
 		window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}`);
 		setState("working");
-		call<{ email: string }>(null, "POST", "/api/account/email/confirm", { token }).then((r) => {
+		// Sent with this browser's session (if any) so it gets a new token: the change signs
+		// every session out.
+		call<{ email: string; token?: string }>(session, "POST", "/api/account/email/confirm", {
+			token,
+		}).then((r) => {
 			if (r.ok) {
 				setState("done");
-				setMessage(`Your email is now ${r.data.email}.`);
+				setMessage(`Your email is now ${r.data.email}. Other devices were signed out.`);
+				clearSudo();
+				if (r.data.token) adoptToken(r.data.token);
 				onConfirmed();
 			} else {
 				setState("failed");
 				setMessage(r.data.error ?? "This link is invalid or has expired.");
 			}
 		});
-	}, []);
+	}, [loading]);
+	return { state, message };
+}
+
+/** Opens from the "confirm it's you" email: /settings?reauth=… (needs this browser's session). */
+function useReauthLink() {
+	const { token: session, loading } = useAuth();
+	const [state, setState] = useState<"idle" | "working" | "done" | "failed">("idle");
+	const [message, setMessage] = useState<string | null>(null);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: runs once for the link in the URL, after the session loads
+	useEffect(() => {
+		if (loading) return;
+		const params = new URLSearchParams(window.location.search);
+		const link = params.get("reauth");
+		if (!link) return;
+		params.delete("reauth");
+		const rest = params.toString();
+		window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}`);
+		if (!session) {
+			setState("failed");
+			setMessage("Sign in on this device first, then open the link again.");
+			return;
+		}
+		setState("working");
+		call<SudoGrant>(session, "POST", "/api/account/reauth/confirm", { token: link }).then((r) => {
+			if (r.ok) {
+				saveSudo(r.data.sudoToken, r.data.expiresInSeconds);
+				setState("done");
+				setMessage(
+					"Confirmed. If you started in another tab, it continues there. Otherwise, make the change below in the next few minutes.",
+				);
+			} else {
+				setState("failed");
+				setMessage(
+					r.status === 400
+						? "This link is invalid or has expired, or it was opened on a different device or account."
+						: errorText(r, "Couldn't confirm it's you."),
+				);
+			}
+		});
+	}, [loading]);
 	return { state, message };
 }
 
@@ -616,6 +916,7 @@ export function Settings() {
 	const { user } = useAuth();
 	const [version, setVersion] = useState(0);
 	const confirmation = useEmailConfirmation(() => setVersion((v) => v + 1));
+	const reauth = useReauthLink();
 
 	return (
 		<div className="min-h-dvh bg-background text-foreground">
@@ -642,6 +943,18 @@ export function Settings() {
 					>
 						{confirmation.state === "working" ? "Confirming your new email…" : confirmation.message}
 						{confirmation.state === "done" && !user && " Sign in with it from now on."}
+					</div>
+				)}
+
+				{reauth.state !== "idle" && (
+					<div
+						aria-live="polite"
+						className={cn(
+							"rounded-2xl border p-4 text-sm",
+							reauth.state === "failed" ? "border-destructive/50 text-destructive" : "border-border bg-card",
+						)}
+					>
+						{reauth.state === "working" ? "Confirming it's you…" : reauth.message}
 					</div>
 				)}
 

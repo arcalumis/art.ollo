@@ -2,28 +2,41 @@ import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { getDb } from "../db";
-import { authMiddleware, signToken } from "../middleware/auth";
+import { authMiddleware, optionalAuthMiddleware, signToken } from "../middleware/auth";
 import { TRASH_RETENTION_DAYS } from "../services/cleanup";
-import { reserveEmailSend, sendEmailChangeEmail } from "../services/email";
+import {
+	reserveEmailSend,
+	sendEmailChangeEmail,
+	sendEmailChangedNotice,
+	sendReauthEmail,
+} from "../services/email";
 import { requireUserId } from "../services/request-user";
 import * as stripeService from "../services/stripe";
 import { generateSecureToken, hashToken, invalidateUserTokens } from "../services/tokens";
-import { hashPassword, normalizeEmail, unusablePasswordHash } from "./auth";
+import { hashPassword, normalizeEmail, unusablePasswordHash, verifyAndConsumeWalletChallenge } from "./auth";
 
 /**
  * Account settings for the signed-in user.
  *
  *   GET    /api/account                 profile: username, email, pending email, has password
  *   PATCH  /api/account/profile         { username }
- *   POST   /api/account/email           { email }  sends a confirmation link to the NEW address
+ *   POST   /api/account/reauth          { method: password|email|wallet, ... } -> sudoToken (or a link)
+ *   POST   /api/account/reauth/confirm  { token }  link from the CURRENT inbox -> sudoToken
+ *   POST   /api/account/email           { email, currentPassword? | sudoToken? }  link to the NEW address
  *   POST   /api/account/email/confirm   { token }  (no session needed: the link proves the inbox)
- *   PUT    /api/account/password        { currentPassword?, newPassword } -> fresh token
+ *   PUT    /api/account/password        { currentPassword? | sudoToken?, newPassword } -> fresh token
+ *
+ * Changing the email or password needs recent re-authentication, so a stolen session token alone
+ * can't lock the owner out: the current password, a wallet signature, or a link sent to the
+ * current address.
  *   GET    /api/account/export          JSON download of prompts + image URLs
  *   POST   /api/account/delete          { confirm: <username> }
  */
 
 const APP_URL = (process.env.APP_URL || "http://localhost:5173").replace(/\/$/, "");
 const EMAIL_CHANGE_EXPIRY_MINUTES = 60;
+const REAUTH_LINK_EXPIRY_MINUTES = 15;
+const SUDO_EXPIRY_MINUTES = 10;
 
 const strict = (max: number) => ({ config: { rateLimit: { max, timeWindow: "1 minute" } } });
 
@@ -103,6 +116,74 @@ function pendingEmail(userId: string): string | null {
 	return row?.new_email ?? null;
 }
 
+type ReauthMethod = "password" | "email" | "wallet";
+
+/** How this account can prove it's the owner. */
+function reauthMethods(user: AccountRow): ReauthMethod[] {
+	const methods: ReauthMethod[] = [];
+	if (hasUsablePassword(user.password_hash)) methods.push("password");
+	if (user.email) methods.push("email");
+	if (user.wallet_address) methods.push("wallet");
+	return methods;
+}
+
+function createReauthToken(userId: string, kind: "link" | "sudo", minutes: number): string {
+	const token = generateSecureToken();
+	getDb()
+		.prepare(
+			"INSERT INTO account_reauth_tokens (id, user_id, kind, token_hash, expires_at) VALUES (?, ?, ?, ?, ?)",
+		)
+		.run(crypto.randomUUID(), userId, kind, hashToken(token), new Date(Date.now() + minutes * 60 * 1000).toISOString());
+	return token;
+}
+
+function issueSudo(userId: string) {
+	return {
+		sudoToken: createReauthToken(userId, "sudo", SUDO_EXPIRY_MINUTES),
+		expiresInSeconds: SUDO_EXPIRY_MINUTES * 60,
+	};
+}
+
+/** A sudo token stays valid for a few minutes so one confirmation covers email + password. */
+function hasValidSudo(userId: string, token: unknown): boolean {
+	if (typeof token !== "string" || token.length < 16 || token.length > 200) return false;
+	return !!getDb()
+		.prepare(
+			`SELECT 1 FROM account_reauth_tokens
+			WHERE token_hash = ? AND user_id = ? AND kind = 'sudo' AND used_at IS NULL AND expires_at > ?`,
+		)
+		.get(hashToken(token), userId, new Date().toISOString());
+}
+
+/** Signs out other sudo grants and pending links, e.g. after the email or password changed. */
+function revokeReauthTokens(userId: string): void {
+	getDb()
+		.prepare("UPDATE account_reauth_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL")
+		.run(userId);
+}
+
+/**
+ * Gate for sensitive changes. Returns null when the caller re-authenticated recently (a valid
+ * sudo token or the correct current password), otherwise the reply to send.
+ */
+function requireRecentAuth(
+	reply: FastifyReply,
+	user: AccountRow,
+	body: { currentPassword?: unknown; sudoToken?: unknown } | undefined,
+) {
+	if (hasValidSudo(user.id, body?.sudoToken)) return null;
+	const currentPassword = body?.currentPassword;
+	if (typeof currentPassword === "string" && currentPassword.length > 0) {
+		if (checkPassword(currentPassword, user.password_hash)) return null;
+		return fail(reply, 403, "WRONG_PASSWORD", "Your current password doesn't match.");
+	}
+	return reply.status(403).send({
+		error: "Confirm it's you before changing this.",
+		code: "REAUTH_REQUIRED",
+		methods: reauthMethods(user),
+	});
+}
+
 function imageUrlsFor(imagePath: string, parameters: string | null): string[] {
 	const urls = new Set<string>([`${APP_URL}/images/${imagePath}`]);
 	try {
@@ -152,9 +233,81 @@ export async function accountRoutes(fastify: FastifyInstance): Promise<void> {
 		},
 	);
 
+	// Re-authenticate for a sensitive change. Password and wallet answer with a sudo token right
+	// away; email sends a link to the CURRENT address, which /reauth/confirm exchanges.
+	fastify.post<{
+		Body: { method?: unknown; password?: unknown; challenge?: unknown; signature?: unknown };
+	}>("/api/account/reauth", { preHandler: authMiddleware, ...strict(5) }, async (request, reply) => {
+		const user = loadAccount(requireUserId(request));
+		if (!user) return fail(reply, 404, "NOT_FOUND", "Account not found");
+		const method = request.body?.method;
+		const methods = reauthMethods(user);
+		if (typeof method !== "string" || !methods.includes(method as ReauthMethod)) {
+			return reply.status(400).send({
+				error: "That way of confirming isn't available for this account.",
+				code: "METHOD_UNAVAILABLE",
+				methods,
+			});
+		}
+
+		if (method === "password") {
+			const password = request.body?.password;
+			if (typeof password !== "string" || !checkPassword(password, user.password_hash)) {
+				return fail(reply, 403, "WRONG_PASSWORD", "Your current password doesn't match.");
+			}
+			return issueSudo(user.id);
+		}
+
+		if (method === "wallet") {
+			if (
+				!user.wallet_address ||
+				!verifyAndConsumeWalletChallenge(user.wallet_address, request.body?.challenge, request.body?.signature)
+			) {
+				return fail(reply, 401, "WALLET_NOT_VERIFIED", "The wallet signature didn't match this account.");
+			}
+			return issueSudo(user.id);
+		}
+
+		// method === "email"
+		const to = user.email as string;
+		if (!reserveEmailSend(to, "reauth", request.ip)) {
+			return fail(reply, 429, "EMAIL_CAP", "Too many emails to your address. Try again in an hour.");
+		}
+		const token = createReauthToken(user.id, "link", REAUTH_LINK_EXPIRY_MINUTES);
+		const result = await sendReauthEmail(to, user.username, token);
+		if (!result.success) {
+			request.log.error({ err: result.error }, "Re-auth link send failed");
+			return fail(reply, 503, "EMAIL_UNAVAILABLE", "We couldn't send email right now. Try again later.");
+		}
+		return { sent: true, email: to };
+	});
+
+	// The link from the current inbox. Needs the same account's session: the link alone grants
+	// nothing, and a stolen session alone can't produce it.
+	fastify.post<{ Body: { token?: unknown } }>(
+		"/api/account/reauth/confirm",
+		{ preHandler: authMiddleware, ...strict(10) },
+		async (request, reply) => {
+			const userId = requireUserId(request);
+			const token = request.body?.token;
+			if (typeof token !== "string" || token.length < 16 || token.length > 200) {
+				return fail(reply, 400, "INVALID_TOKEN", "This link is invalid or has expired.");
+			}
+			const row = db
+				.prepare(
+					`UPDATE account_reauth_tokens SET used_at = datetime('now')
+					WHERE token_hash = ? AND user_id = ? AND kind = 'link' AND used_at IS NULL AND expires_at > ?
+					RETURNING id`,
+				)
+				.get(hashToken(token), userId, new Date().toISOString());
+			if (!row) return fail(reply, 400, "INVALID_TOKEN", "This link is invalid or has expired.");
+			return issueSudo(userId);
+		},
+	);
+
 	// Change email, step 1: send a link to the new address. The response is the same whether or
 	// not another account already uses that address, so this can't be used to probe for accounts.
-	fastify.post<{ Body: { email?: unknown } }>(
+	fastify.post<{ Body: { email?: unknown; currentPassword?: unknown; sudoToken?: unknown } }>(
 		"/api/account/email",
 		{ preHandler: authMiddleware, ...strict(5) },
 		async (request, reply) => {
@@ -163,6 +316,8 @@ export async function accountRoutes(fastify: FastifyInstance): Promise<void> {
 			const email = normalizeEmail(request.body?.email);
 			if (!email) return fail(reply, 400, "INVALID_EMAIL", "Enter a valid email address.");
 			if (email === user.email) return fail(reply, 400, "SAME_EMAIL", "That's already your email.");
+			const denied = requireRecentAuth(reply, user, request.body);
+			if (denied) return denied;
 
 			const sent = { success: true, pendingEmail: email };
 			const taken = db
@@ -212,7 +367,7 @@ export async function accountRoutes(fastify: FastifyInstance): Promise<void> {
 	// Change email, step 2: the link from the new inbox. No session needed.
 	fastify.post<{ Body: { token?: unknown } }>(
 		"/api/account/email/confirm",
-		strict(10),
+		{ preHandler: optionalAuthMiddleware, ...strict(10) },
 		async (request, reply) => {
 			const token = request.body?.token;
 			if (typeof token !== "string" || token.length < 16 || token.length > 200) {
@@ -232,18 +387,27 @@ export async function accountRoutes(fastify: FastifyInstance): Promise<void> {
 				if (!row) return "invalid" as const;
 				const owner = db
 					.prepare(
-						"SELECT id FROM users WHERE id = ? AND deleted_at IS NULL AND COALESCE(is_active, 1) = 1",
+						"SELECT id, username, email, is_admin, token_version FROM users WHERE id = ? AND deleted_at IS NULL AND COALESCE(is_active, 1) = 1",
 					)
-					.get(row.user_id);
+					.get(row.user_id) as
+					| { id: string; username: string; email: string | null; is_admin: number; token_version: number | null }
+					| undefined;
 				if (!owner) return "invalid" as const;
 				const taken = db
 					.prepare("SELECT 1 FROM users WHERE email = ? AND id <> ?")
 					.get(row.new_email, row.user_id);
 				if (taken) return "taken" as const;
-				db.prepare("UPDATE users SET email = ? WHERE id = ?").run(row.new_email, row.user_id);
-				// Outstanding sign-in links went to the old address.
+				// Every session ends (the email is a sign-in credential); the acting one gets a new token.
+				const version = (owner.token_version ?? 0) + 1;
+				db.prepare("UPDATE users SET email = ?, token_version = ? WHERE id = ?").run(
+					row.new_email,
+					version,
+					row.user_id,
+				);
+				// Outstanding sign-in links and re-auth grants went to / came from the old address.
 				invalidateUserTokens(row.user_id);
-				return { email: row.new_email };
+				revokeReauthTokens(row.user_id);
+				return { email: row.new_email, owner, version };
 			})();
 			if (outcome === "invalid")
 				return fail(reply, 400, "INVALID_TOKEN", "This link is invalid or has expired.");
@@ -255,27 +419,39 @@ export async function accountRoutes(fastify: FastifyInstance): Promise<void> {
 					"Another account uses that email, so it can't be added here.",
 				);
 			}
-			return { success: true, email: outcome.email };
+			const { owner, version } = outcome;
+			if (owner.email) {
+				const previous = owner.email;
+				// After commit; never blocks or fails the confirmation.
+				void sendEmailChangedNotice(previous, owner.username, outcome.email).catch((err) =>
+					request.log.error({ err: err instanceof Error ? err.message : err }, "Email-changed notice failed"),
+				);
+			}
+			// Only the owner's own session gets a replacement token (the link alone is not a sign-in).
+			const freshToken =
+				request.user?.userId === owner.id
+					? signToken(
+							{ userId: owner.id, username: owner.username, isAdmin: owner.is_admin === 1, tv: version },
+							true,
+						)
+					: undefined;
+			return { success: true, email: outcome.email, ...(freshToken ? { token: freshToken } : {}) };
 		},
 	);
 
 	// Set (magic-link accounts) or change a password. Every other session is signed out; this one
 	// gets a fresh token.
-	fastify.put<{ Body: { currentPassword?: unknown; newPassword?: unknown } }>(
+	fastify.put<{ Body: { currentPassword?: unknown; newPassword?: unknown; sudoToken?: unknown } }>(
 		"/api/account/password",
 		{ preHandler: authMiddleware, ...strict(5) },
 		async (request, reply) => {
 			const user = loadAccount(requireUserId(request));
 			if (!user) return fail(reply, 404, "NOT_FOUND", "Account not found");
-			const { currentPassword, newPassword } = request.body ?? {};
-			if (hasUsablePassword(user.password_hash)) {
-				if (
-					typeof currentPassword !== "string" ||
-					!checkPassword(currentPassword, user.password_hash)
-				) {
-					return fail(reply, 403, "WRONG_PASSWORD", "Your current password doesn't match.");
-				}
-			}
+			const { newPassword } = request.body ?? {};
+			// Changing a password needs the current one (or a recent confirmation); SETTING one on a
+			// magic-link or wallet account needs a recent confirmation from the email or wallet.
+			const denied = requireRecentAuth(reply, user, request.body);
+			if (denied) return denied;
 			const problem = passwordProblem(newPassword);
 			if (problem) return fail(reply, 400, "WEAK_PASSWORD", problem);
 
@@ -287,6 +463,7 @@ export async function accountRoutes(fastify: FastifyInstance): Promise<void> {
 					user.id,
 				);
 				invalidateUserTokens(user.id, "password_reset");
+				revokeReauthTokens(user.id);
 			})();
 			const token = signToken(
 				{ userId: user.id, username: user.username, isAdmin: user.is_admin === 1, tv: version },
