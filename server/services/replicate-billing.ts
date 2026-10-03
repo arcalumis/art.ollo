@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import Replicate from "replicate";
 import { getDb } from "../db";
+import { isPerOutputPriced } from "./replicate";
 
 // Replicate cost rates (per second of compute time)
 // These are approximate - actual costs vary by model and hardware
@@ -126,7 +127,11 @@ export async function reconcileGenerationCost(generationId: string): Promise<boo
 
 	// Get generation with replicate ID
 	const generation = db
-		.prepare("SELECT id, replicate_id, model, cost FROM generations WHERE id = ?")
+		.prepare(
+			`SELECT g.id, g.replicate_id, g.model, COALESCE(pc.estimated_cost, g.cost) as cost
+			FROM generations g LEFT JOIN platform_costs pc ON pc.generation_id = g.id
+			WHERE g.id = ?`,
+		)
 		.get(generationId) as
 		| {
 				id: string;
@@ -147,8 +152,13 @@ export async function reconcileGenerationCost(generationId: string): Promise<boo
 		return false;
 	}
 
-	// Calculate actual cost
-	const actualCost = estimateCost(generation.model, prediction.metrics.predict_time);
+	// Official models are billed per output/megapixel, not per second: their
+	// estimate is the billed price, and a predict_time-based figure would
+	// understate it by an order of magnitude.
+	const actualCost =
+		isPerOutputPriced(generation.model) && generation.cost !== null
+			? generation.cost
+			: estimateCost(generation.model, prediction.metrics.predict_time);
 
 	// Update the cost
 	updatePlatformCostActual(generationId, actualCost, prediction.metrics.predict_time);
@@ -164,14 +174,17 @@ export async function reconcileAllCosts(limit = 100): Promise<{
 }> {
 	const db = getDb();
 
-	// Get generations that haven't been reconciled
+	// Only platform-key generations have a platform_costs row; own-key
+	// predictions belong to another Replicate account and can't be fetched.
+	// The 7-day window stops permanently-unfetchable rows from being retried forever.
 	const unreconciled = db
 		.prepare(`
 			SELECT g.id, g.replicate_id, g.model
 			FROM generations g
-			LEFT JOIN platform_costs pc ON g.id = pc.generation_id
+			JOIN platform_costs pc ON g.id = pc.generation_id
 			WHERE g.replicate_id IS NOT NULL
-			AND (pc.actual_cost IS NULL OR pc.id IS NULL)
+			AND pc.actual_cost IS NULL
+			AND pc.created_at >= datetime('now', '-7 days')
 			ORDER BY g.created_at DESC
 			LIMIT ?
 		`)
@@ -231,7 +244,7 @@ export function getCostSummary(
 		WHERE pc.created_at >= ? AND pc.created_at < ?
 	`;
 
-	const params: (string | undefined)[] = [startDate.toISOString(), endDate.toISOString()];
+	const params: string[] = [startDate.toISOString(), endDate.toISOString()];
 
 	if (userId) {
 		query += " AND g.user_id = ?";
