@@ -1,86 +1,100 @@
-import { useEffect, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { CheckIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { Laurel } from "@/components/brand/Laurel";
+import { Button } from "@/components/ui/button";
 import { useAuth } from "../contexts/AuthContext";
+import { AuthBackdrop } from "./auth/AuthBackdrop";
 
+type Status = "verifying" | "signed-in" | "created" | "error";
+
+/**
+ * Landing spot for the emailed sign-in link. Verifies the token, then opens
+ * the app; a prompt typed on the landing page before sign-up is picked up
+ * there (see lib/pendingPrompt).
+ */
 export function MagicLinkVerify() {
 	const [searchParams] = useSearchParams();
 	const navigate = useNavigate();
 	const { verifyMagicLink } = useAuth();
-	const [status, setStatus] = useState<"verifying" | "success" | "error">("verifying");
+	const [status, setStatus] = useState<Status>("verifying");
 	const [error, setError] = useState("");
+	// Links work once; StrictMode's double effect must not spend it twice.
+	const started = useRef(false);
 
 	useEffect(() => {
+		if (started.current) return;
+		started.current = true;
 		const token = searchParams.get("token");
-
 		if (!token) {
 			setStatus("error");
-			setError("Invalid magic link - no token provided");
+			setError("This link is missing its sign-in code. Request a new link.");
 			return;
 		}
 
-		async function verify() {
-			const success = await verifyMagicLink(token as string);
-
-			if (success) {
-				setStatus("success");
-				// Redirect to home after short delay
-				setTimeout(() => {
-					navigate("/", { replace: true });
-				}, 1500);
-			} else {
+		verifyMagicLink(token).then((result) => {
+			if (!result.success) {
 				setStatus("error");
-				setError("This link is invalid or has expired. Please request a new one.");
+				setError("This link has expired or was already used. Request a new one.");
+				return;
 			}
-		}
-
-		verify();
+			setStatus(result.isNewUser ? "created" : "signed-in");
+			setTimeout(
+				() => navigate("/", { replace: true, state: { isNewUser: result.isNewUser } }),
+				900,
+			);
+		});
 	}, [searchParams, verifyMagicLink, navigate]);
 
 	return (
-		<div className="min-h-screen flex items-center justify-center p-4">
-			<div className="w-full max-w-sm">
-				<div className="cyber-card rounded-lg p-6 shadow-2xl text-center">
-					<h1 className="text-3xl font-bold mb-2 gradient-text">ollo.art</h1>
-
-					{status === "verifying" && (
-						<div className="mt-8">
-							<div className="w-12 h-12 mx-auto mb-4 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin" />
-							<p className="text-gray-400">Verifying your magic link...</p>
+		<AuthBackdrop>
+			<div aria-live="polite" className="space-y-5">
+				{status === "verifying" && (
+					<>
+						<Laurel progress={0.5} className="size-12" />
+						<div className="space-y-1.5">
+							<h1 className="text-xl font-semibold">Signing you in</h1>
+							<p className="text-sm text-muted-foreground">Checking your link.</p>
 						</div>
-					)}
+					</>
+				)}
 
-					{status === "success" && (
-						<div className="mt-8">
-							<div className="w-16 h-16 mx-auto mb-4 rounded-full bg-green-500/20 flex items-center justify-center">
-								<svg className="w-8 h-8 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-									<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-								</svg>
-							</div>
-							<h2 className="text-lg font-medium text-white mb-2">You're in!</h2>
-							<p className="text-gray-400 text-sm">Redirecting to the app...</p>
+				{(status === "signed-in" || status === "created") && (
+					<>
+						<span
+							className="flex size-11 items-center justify-center rounded-full bg-muted text-verdigris"
+							aria-hidden
+						>
+							<CheckIcon className="size-5" />
+						</span>
+						<div className="space-y-1.5">
+							<h1 className="text-xl font-semibold">
+								{status === "created" ? "Your account is ready" : "You're signed in"}
+							</h1>
+							<p className="text-sm text-muted-foreground">
+								{status === "created" ? "You have 10 free credits. Opening ollo…" : "Opening ollo…"}
+							</p>
 						</div>
-					)}
+					</>
+				)}
 
-					{status === "error" && (
-						<div className="mt-8">
-							<div className="w-16 h-16 mx-auto mb-4 rounded-full bg-red-500/20 flex items-center justify-center">
-								<svg className="w-8 h-8 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-									<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-								</svg>
-							</div>
-							<h2 className="text-lg font-medium text-white mb-2">Link expired</h2>
-							<p className="text-gray-400 text-sm mb-6">{error}</p>
-							<button
-								type="button"
-								onClick={() => navigate("/", { replace: true })}
-								className="cyber-button px-6 py-2 rounded font-medium text-white text-sm"
-							>
-								Back to login
-							</button>
+				{status === "error" && (
+					<>
+						<div className="space-y-1.5">
+							<h1 className="text-xl font-semibold">This link didn't work</h1>
+							<p className="text-sm text-muted-foreground">{error}</p>
 						</div>
-					)}
-				</div>
+						<Button
+							render={<Link to="/login" />}
+							nativeButton={false}
+							variant="outline"
+							className="w-full"
+						>
+							Get a new link
+						</Button>
+					</>
+				)}
 			</div>
-		</div>
+		</AuthBackdrop>
 	);
 }

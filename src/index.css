@@ -61,7 +61,29 @@
 	color-scheme: light;
 }
 
-:root {
+/*
+ * Night pinned to a subtree, whatever the page finish: for UI that sits on a
+ * dark photograph (the landing hero, the sign-in backdrop). The semantic
+ * tokens below are re-declared on it so they resolve against these values.
+ */
+.finish-night {
+	--ollo-ground: #111a1c;
+	--ollo-stone: #1a2427;
+	--ollo-stone-2: #243134;
+	--ollo-fg: #e4e2da;
+	--ollo-mute: #93a09f;
+	--ollo-bronze: #c79c58;
+	--ollo-bronze-ink: #1b1408;
+	--ollo-verdigris: #67ab9a;
+	--ollo-danger: #e07a6a;
+	--ollo-line: rgba(228, 226, 218, 0.12);
+	--ollo-scrim: rgba(10, 16, 18, 0.72);
+	color-scheme: dark;
+	color: var(--foreground);
+}
+
+:root,
+.finish-night {
 	/* shadcn/ui semantic tokens, all derived from the ollo palette */
 	--background: var(--ollo-ground);
 	--foreground: var(--ollo-fg);

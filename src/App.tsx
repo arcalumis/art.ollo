@@ -1,10 +1,9 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
-import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ChatFeed } from "./components/ChatFeed";
 import { CreationPanel, type CreationOptions } from "./components/CreationPanel";
 import { GenerationStatus } from "./components/GenerationStatus";
 import { ImageGallery } from "./components/ImageGallery";
-import { LoginForm } from "./components/LoginForm";
 import { MagicLinkVerify } from "./components/MagicLinkVerify";
 import { ResetPasswordPage } from "./components/ResetPasswordPage";
 import { Sidebar } from "./components/Sidebar";
@@ -12,16 +11,20 @@ import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { ThreadDeleteDialog } from "./components/ThreadDeleteDialog";
 import { UserSettings } from "./components/UserSettings";
 import { ModelsHelpButton, ModelsReferenceModal } from "./components/ModelsReferenceModal";
-import { OlloWelcomeFlow } from "./components/OlloWelcomeFlow";
-import { TutorialFlow } from "./components/TutorialFlow";
-import { isVariationModel } from "./config/models";
-import { WelcomeScreen } from "./components/WelcomeScreen";
-import type { ProjectMetadata } from "./types/ollo";
+import { LoginPage } from "./components/auth/LoginPage";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { getModelConfig, isVariationModel } from "./config/models";
+import { STARTER_PROMPTS, WelcomeScreen } from "./components/WelcomeScreen";
+import { fillPromptBar, type PendingPrompt, takePendingPrompt } from "./lib/pendingPrompt";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { useEnhancePrompt, useGenerate, useHistory, useModels, useThreads, useUploads } from "./hooks/useApi";
 import { useTutorial, useUserSubscription, useUserUsage } from "./hooks/useUserSettings";
 import { AdminLayout } from "./pages/AdminLayout";
 import { Billing } from "./pages/Billing";
+import { Landing } from "./pages/Landing";
+import { NotFound } from "./pages/NotFound";
+import { Privacy } from "./pages/Privacy";
+import { Terms } from "./pages/Terms";
 
 // Lazy load admin pages - these are only loaded when admin navigates to them
 const AdminCosts = lazy(() => import("./pages/AdminCosts"));
@@ -54,7 +57,8 @@ const Styleguide = import.meta.env.DEV
 
 function MainApp() {
 	const { user, token, loading: authLoading, updateUser, logout } = useAuth();
-	const { completeTutorial, resetTutorial } = useTutorial(token);
+	const { completeTutorial } = useTutorial(token);
+	const location = useLocation();
 	const [selectedModel, setSelectedModel] = useState("black-forest-labs/flux-2-dev");
 	const [imageInputs, setImageInputs] = useState<string[]>([]);
 	const [showTrash] = useState(false);
@@ -83,7 +87,6 @@ function MainApp() {
 		activeThread,
 		fetchThreads,
 		fetchThread,
-		createThread,
 		renameThread,
 		deleteThreadWithOptions,
 		clearActiveThread,
@@ -93,12 +96,6 @@ function MainApp() {
 	// Thread delete dialog state
 	const [threadToDelete, setThreadToDelete] = useState<Thread | null>(null);
 	const [showDeleteDialog, setShowDeleteDialog] = useState(false);
-
-	// Ollo welcome flow state
-	const [showOlloFlow, setShowOlloFlow] = useState(false);
-
-	// Tutorial state
-	const [showTutorial, setShowTutorial] = useState(false);
 
 	// Models reference modal state
 	const [showModelsRef, setShowModelsRef] = useState(false);
@@ -222,13 +219,66 @@ function MainApp() {
 		localStorage.setItem("viewMode", viewMode);
 	}, [viewMode]);
 
-	// Auto-show tutorial for new users
+	// --- First run: the prompt typed on the landing page, or a starter prompt ---
+	// handleGenerate is defined below the early returns; effects reach it through this ref.
+	const handleGenerateRef = useRef<((prompt: string) => void) | null>(null);
+	// undefined = not read yet; null = read, nothing pending (or already used).
+	const pendingRef = useRef<PendingPrompt | null | undefined>(undefined);
+	const [pendingReady, setPendingReady] = useState(false);
+	const [pendingWaitedOut, setPendingWaitedOut] = useState(false);
+
+	// Once signed in, take the pending prompt (clearing it) and apply its settings.
 	useEffect(() => {
-		if (user && user.tutorialCompleted === false) {
-			const timer = setTimeout(() => setShowTutorial(true), 1000);
-			return () => clearTimeout(timer);
+		if (!user || pendingRef.current !== undefined) return;
+		const pending = takePendingPrompt();
+		pendingRef.current = pending;
+		if (pending) {
+			setSelectedModel(pending.model);
+			setCreationOptions((prev) => ({ ...prev, aspectRatio: pending.aspectRatio }));
+			setViewMode("chat");
+			setPendingReady(true);
+			return;
 		}
-	}, [user]);
+		// New accounts land with a sensible prompt in the bar instead of an empty one.
+		const isNewUser = (location.state as { isNewUser?: boolean } | null)?.isNewUser;
+		if (isNewUser || user.tutorialCompleted === false) {
+			requestAnimationFrame(() => fillPromptBar(STARTER_PROMPTS[0]));
+		}
+	}, [user, location.state]);
+
+	// Don't wait forever on balance and plan: after a few seconds, fall back to prefilling.
+	useEffect(() => {
+		if (!pendingReady) return;
+		const t = setTimeout(() => setPendingWaitedOut(true), 6000);
+		return () => clearTimeout(t);
+	}, [pendingReady]);
+
+	// Start the pending prompt once, but only if the balance covers it and the
+	// plan allows the model; otherwise just put it in the prompt bar.
+	useEffect(() => {
+		const pending = pendingRef.current;
+		if (!pendingReady || !pending || selectedModel !== pending.model) return;
+		if (!(userUsage && userSubscription) && !pendingWaitedOut) return;
+		pendingRef.current = null;
+		setPendingReady(false);
+		const cost = getModelConfig(pending.model)?.pricing.creditCost ?? 2;
+		const allowed = userSubscription?.subscription?.allowedModels;
+		const canUseModel = allowed == null || allowed.includes(pending.model);
+		const balance = userUsage?.availableCredits;
+		if (canUseModel && balance != null && balance >= cost && handleGenerateRef.current) {
+			handleGenerateRef.current(pending.prompt);
+		} else {
+			requestAnimationFrame(() => fillPromptBar(pending.prompt));
+		}
+	}, [pendingReady, pendingWaitedOut, selectedModel, userUsage, userSubscription]);
+
+	// The tutorial is gone; the first generation marks it complete so the flag stays meaningful.
+	useEffect(() => {
+		if (user?.tutorialCompleted === false && generationQueue.length > 0) {
+			completeTutorial();
+			updateUser({ tutorialCompleted: true });
+		}
+	}, [user?.tutorialCompleted, generationQueue.length, completeTutorial, updateUser]);
 
 	// Infinite scroll handler - must be before conditional returns
 	const handleLoadMore = useCallback(() => {
@@ -245,7 +295,7 @@ function MainApp() {
 	}
 
 	if (!user || !token) {
-		return <LoginForm />;
+		return <Landing />;
 	}
 
 	const handleGenerate = async (prompt: string) => {
@@ -280,6 +330,7 @@ function MainApp() {
 
 		processGeneration(queueItem, request);
 	};
+	handleGenerateRef.current = handleGenerate;
 
 	const dismissQueueItem = (id: string) => {
 		setGenerationQueue((prev) => prev.filter((item) => item.id !== id));
@@ -464,63 +515,6 @@ function MainApp() {
 		setViewMode("chat");
 	};
 
-	const handleStartWithOllo = () => {
-		setShowOlloFlow(true);
-	};
-
-	const handleOlloComplete = async (metadata: ProjectMetadata) => {
-		setShowOlloFlow(false);
-
-		// Build thread title from purpose
-		const purposeLabels: Record<string, string> = {
-			personal: "Personal Project",
-			social: "Social Media",
-			print: "Print / Poster",
-			concept: "Concept Art",
-			reference: "Design Reference",
-		};
-		const title = purposeLabels[metadata.purpose || ""] || "New Project";
-
-		// Create a new thread with project metadata
-		const thread = await createThread(`${title}`, metadata as Record<string, unknown>);
-
-		// Update creation options with Ollo's selections
-		if (metadata.aspectRatio) {
-			setCreationOptions((prev) => ({ ...prev, aspectRatio: metadata.aspectRatio as string }));
-		}
-
-		if (thread) {
-			await fetchThread(thread.id);
-		}
-		setViewMode("chat");
-	};
-
-	const handleOlloSkip = () => {
-		setShowOlloFlow(false);
-		clearActiveThread();
-		setViewMode("chat");
-	};
-
-	const handleTutorialComplete = async () => {
-		await completeTutorial();
-		updateUser({ tutorialCompleted: true });
-		setShowTutorial(false);
-	};
-
-	const handleTutorialTryGeneration = (prompt: string, model: string, aspectRatio: string) => {
-		setSelectedModel(model);
-		setCreationOptions((prev) => ({ ...prev, aspectRatio }));
-		setShowTutorial(false);
-		handleGenerate(prompt);
-	};
-
-	const handleRelaunchTutorial = async () => {
-		await resetTutorial();
-		updateUser({ tutorialCompleted: false });
-		setShowSettings(false);
-		setShowTutorial(true);
-	};
-
 	const handleSelectThread = async (thread: Thread) => {
 		await fetchThread(thread.id);
 		setViewMode("chat");
@@ -546,19 +540,9 @@ function MainApp() {
 		setThreadToDelete(null);
 	};
 
-	const handleCategoryClick = (category: string) => {
-		const categoryPrompts: Record<string, string> = {
-			portrait: "A professional portrait photograph",
-			landscape: "A breathtaking landscape photograph",
-			abstract: "An abstract digital artwork",
-			photo: "A high-quality photograph",
-		};
-		// Generate with the category as a starting prompt
-		handleGenerate(categoryPrompts[category] || "");
-	};
-
-	const handlePromptClick = (prompt: string) => {
-		handleGenerate(prompt);
+	// Examples on the empty state fill the prompt bar; nothing is spent until Generate.
+	const handlePromptPick = (prompt: string) => {
+		fillPromptBar(prompt);
 	};
 
 	return (
@@ -615,36 +599,16 @@ function MainApp() {
 						<div className="max-w-2xl mx-auto px-4 py-6">
 							{showWelcome ? (
 								<WelcomeScreen
-									onPromptClick={handlePromptClick}
-									onCategoryClick={handleCategoryClick}
-									onStartWithOllo={handleStartWithOllo}
+									onPromptPick={handlePromptPick}
 									onOpenModelGuide={() => setShowModelsRef(true)}
 								/>
 							) : !activeThread && threads.length > 0 && !generationQueue.some((q) => !q.threadId) ? (
 								// No thread selected but threads exist and no pending new generations - show prompt to select or create
 								<div className="flex flex-col items-center justify-center min-h-[60vh]">
-									<h2 className="welcome-heading text-2xl text-[var(--text-primary)] mb-2">
-										Ready to create?
-									</h2>
-									<p className="text-sm text-[var(--text-secondary)] mb-6">
-										Start a new project or continue an existing thread
+									<h2 className="text-xl font-semibold text-foreground">Pick up a series or start a new one</h2>
+									<p className="mt-2 max-w-sm text-center text-sm text-muted-foreground">
+										Choose a series from the sidebar, or describe a new image below to start one.
 									</p>
-									<div className="flex flex-col items-center gap-4">
-										<button
-											type="button"
-											onClick={handleStartWithOllo}
-											className="divine-gradient rounded-xl py-3 px-6 flex items-center gap-3 sacred-glow hover:scale-[1.02] transition-transform"
-										>
-											<span className="text-base font-semibold">Start building with Ollo</span>
-										</button>
-										<button
-											type="button"
-											onClick={handleNewThread}
-											className="text-sm text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors"
-										>
-											or dive right in →
-										</button>
-									</div>
 								</div>
 							) : (
 								<>
@@ -729,7 +693,6 @@ function MainApp() {
 				isOpen={showSettings}
 				onClose={() => setShowSettings(false)}
 				onOpenBilling={() => setViewMode("billing")}
-				onRelaunchTutorial={handleRelaunchTutorial}
 			/>
 
 			{/* Thread Delete Dialog */}
@@ -741,20 +704,6 @@ function MainApp() {
 				}}
 				thread={threadToDelete}
 				onConfirm={handleConfirmDeleteThread}
-			/>
-
-			<OlloWelcomeFlow
-				isOpen={showOlloFlow}
-				onClose={() => setShowOlloFlow(false)}
-				onComplete={handleOlloComplete}
-				onSkip={handleOlloSkip}
-			/>
-
-			<TutorialFlow
-				isOpen={showTutorial}
-				onClose={() => setShowTutorial(false)}
-				onComplete={handleTutorialComplete}
-				onTryGeneration={handleTutorialTryGeneration}
 			/>
 
 			<ModelsReferenceModal
@@ -819,6 +768,9 @@ function AppRoutes() {
 	return (
 		<Routes>
 			<Route path="/" element={<MainApp />} />
+			<Route path="/login" element={<LoginPage />} />
+			<Route path="/terms" element={<Terms />} />
+			<Route path="/privacy" element={<Privacy />} />
 			<Route path="/auth/magic-link" element={<MagicLinkVerify />} />
 			{Styleguide && (
 				<Route
@@ -859,17 +811,20 @@ function AppRoutes() {
 				<Route path="financials/metrics" element={<Suspense fallback={<AdminLoading />}><AdminMetrics /></Suspense>} />
 				<Route path="financials/pnl" element={<Suspense fallback={<AdminLoading />}><AdminPnL /></Suspense>} />
 			</Route>
+			<Route path="*" element={<NotFound />} />
 		</Routes>
 	);
 }
 
 function App() {
 	return (
-		<BrowserRouter>
-			<AuthProvider>
-				<AppRoutes />
-			</AuthProvider>
-		</BrowserRouter>
+		<ErrorBoundary>
+			<BrowserRouter>
+				<AuthProvider>
+					<AppRoutes />
+				</AuthProvider>
+			</BrowserRouter>
+		</ErrorBoundary>
 	);
 }
 
