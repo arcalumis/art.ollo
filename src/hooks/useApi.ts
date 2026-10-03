@@ -40,7 +40,7 @@ function fallbackErrorCode(status: number): GenerateErrorCode {
  */
 export function useGenerate(token: string | null) {
 	const generate = useCallback(
-		async (request: GenerateRequest): Promise<GenerateResponse> => {
+		async (request: GenerateRequest & { tool?: string; image?: string; threadId?: string }): Promise<GenerateResponse> => {
 			const failed = (
 				code: GenerateErrorCode,
 				extra: Partial<GenerateResponse> = {},
@@ -52,11 +52,18 @@ export function useGenerate(token: string | null) {
 			});
 
 			try {
-				const response = await fetch(`${API_BASE}/api/generate`, {
-					method: "POST",
-					headers: getAuthHeaders(token),
-					body: JSON.stringify(request),
-				});
+				// Tools (upscale, remove background) run on one image through their own endpoint.
+				const response = request.tool
+					? await fetch(`${API_BASE}/api/tools/${request.tool}`, {
+							method: "POST",
+							headers: getAuthHeaders(token),
+							body: JSON.stringify({ image: request.image, threadId: request.threadId }),
+						})
+					: await fetch(`${API_BASE}/api/generate`, {
+							method: "POST",
+							headers: getAuthHeaders(token),
+							body: JSON.stringify(request),
+						});
 
 				const data = (await response.json().catch(() => null)) as Partial<GenerateResponse> | null;
 

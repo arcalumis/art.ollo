@@ -13,7 +13,7 @@ import type { PendingPrompt } from "../../lib/pendingPrompt";
 
 /** Text-to-image models offered before sign-up: all affordable with the free credits. */
 const LANDING_MODELS = [
-	{ id: "black-forest-labs/flux-schnell", label: "Fast draft" },
+	{ id: "black-forest-labs/flux-2-klein-4b", label: "Fast draft" },
 	{ id: "black-forest-labs/flux-2-dev", label: "FLUX 2 Dev" },
 	{ id: "black-forest-labs/flux-2-pro", label: "FLUX 2 Pro" },
 ].map((m) => ({ ...m, credits: getModelConfig(m.id)?.pricing.creditCost ?? 2 }));

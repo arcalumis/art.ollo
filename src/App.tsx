@@ -17,7 +17,9 @@ import { Laurel } from "./components/brand/Laurel";
 import { AppShell } from "./components/shell/AppShell";
 import { RenameSeriesDialog } from "./components/shell/RenameSeriesDialog";
 import { ArchivedSeries, NewSeriesIntro, SeriesHeader } from "./components/shell/SeriesParts";
-import { SettingsPage } from "./components/shell/SettingsPage";
+import type { ImageActionCosts, ImageTool, ViewerImage } from "./components/viewer/media";
+import { Settings } from "./pages/Settings";
+import { SharedImage } from "./pages/SharedImage";
 import {
 	type AppView,
 	CREATE_PATH,
@@ -36,7 +38,7 @@ import { fallbackCreditCost, isVariationModel } from "./config/models";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { usePaywall } from "./contexts/PaywallContext";
 import { useEnhancePrompt, useHistory, useModels, useThreads, useUploads } from "./hooks/useApi";
-import { type QueueRequest, useGenerationQueue } from "./hooks/useGenerationQueue";
+import { type QueueRequest, toImagePath, useGenerationQueue } from "./hooks/useGenerationQueue";
 import {
 	useTutorial,
 	useUserApiKey,
@@ -81,7 +83,8 @@ const Styleguide = import.meta.env.DEV
 	: null;
 
 const DEFAULT_MODEL = "black-forest-labs/flux-2-dev";
-const VARIATION_MODEL = "black-forest-labs/flux-redux-dev";
+// Vary sends `variation: true`; the server picks the tier-allowed model (FLUX 2 Dev, then Klein).
+const VARIATION_MODEL = "black-forest-labs/flux-2-dev";
 
 function FullPageLoading() {
 	return (
@@ -144,7 +147,7 @@ function MainApp() {
 
 	const paywall = usePaywall();
 	const { enhance: enhancePrompt } = useEnhancePrompt(token);
-	const { models, fetchModels } = useModels();
+	const { models, tools, fetchModels } = useModels(token);
 	const {
 		threads,
 		activeThread,
@@ -402,7 +405,7 @@ function MainApp() {
 			outputFormat: creationOptions.outputFormat,
 			threadId: routeThreadId,
 			// Variation models always generate 4 outputs
-			numOutputs: isVariation ? 4 : undefined,
+			numOutputs: isVariation ? 4 : creationOptions.numOutputs,
 		};
 		queue.enqueue({
 			label: isVariation ? "Generating 4 variations" : prompt,
@@ -437,8 +440,32 @@ function MainApp() {
 	};
 
 	const handleUpscale = (gen: Generation) => {
-		// No source image to work from: make the prompt again instead.
-		if (!queue.runTool(gen.id, "upscale")) handleGenerate(gen.prompt);
+		if (!queue.runTool(gen.id, "upscale")) toast.error("This image can't be upscaled.");
+	};
+
+	// Viewer and gallery tools work on any image (grid images and uploads included).
+	const handleTool = (image: ViewerImage, tool: ImageTool) => {
+		queue.enqueue({
+			label: tool === "upscale" ? "Upscaling" : "Removing the background",
+			model: `tool:${tool}`,
+			threadId: routeThreadId,
+			request: {
+				prompt: image.generation?.prompt ?? "",
+				tool,
+				image: toImagePath(image.url),
+				threadId: routeThreadId,
+			},
+		});
+	};
+
+	const handleReusePrompt = (prompt: string) => setPromptRequest({ text: prompt, nonce: Date.now() });
+
+	const toolCost = (needle: string) => tools.find((t) => t.id.includes(needle))?.creditCost;
+	const varyCost = models.find((m) => m.id === VARIATION_MODEL)?.creditCost;
+	const actionCosts: ImageActionCosts = {
+		vary: varyCost != null ? varyCost * 4 : undefined,
+		upscale: toolCost("upscale"),
+		"remove-background": toolCost("remove-background"),
 	};
 
 	const handleRemix = (gen: Generation) => {
@@ -540,9 +567,18 @@ function MainApp() {
 		onUpscale: handleUpscale,
 		onRemix: handleRemix,
 		onTrash: handleTrash,
+		// "Use as reference" on the selected step; clicking an image opens the viewer.
 		onImageClick: handleImageClick,
 		onLoadMore: () => {},
 		hasMore: false,
+		onRestore: handleRestore,
+		onTool: handleTool,
+		onReusePrompt: handleReusePrompt,
+		onRetry: (item: { id: string }) => queue.retry(item.id),
+		onDismiss: queue.dismiss,
+		selectedInputUrls: imageInputs,
+		actionCosts,
+		pendingAspectRatio: creationOptions.aspectRatio,
 	};
 
 	let content: React.ReactNode;
@@ -592,6 +628,7 @@ function MainApp() {
 					<ArchivedSeries threads={archivedSeries} onRestore={handleRestoreThread} />
 				)}
 				<ImageGallery
+					key={view.library}
 					generations={history?.generations || []}
 					uploads={!showTrash ? uploads : []}
 					queuedItems={queue.items}
@@ -611,6 +648,13 @@ function MainApp() {
 					loading={historyLoading}
 					showTrash={showTrash}
 					showArchived={showArchived}
+					onVariations={handleVariations}
+					onVaryImage={varyImage}
+					onUpscale={handleUpscale}
+					onTool={handleTool}
+					onUseAsReference={(image) => handleAddToInputs(image.url)}
+					onReusePrompt={handleReusePrompt}
+					actionCosts={actionCosts}
 				/>
 			</div>
 		);
@@ -621,7 +665,7 @@ function MainApp() {
 			</SolanaBoundary>
 		);
 	} else {
-		content = <SettingsPage />;
+		content = <Settings />;
 	}
 
 	return (
@@ -671,6 +715,7 @@ function MainApp() {
 						maxImages={selectedModelInfo?.maxImages || 14}
 						options={creationOptions}
 						onOptionsChange={setCreationOptions}
+						outputCountEnabled
 						onGenerate={handleGenerate}
 						onEnhance={enhancePrompt}
 						loading={queue.busy}
@@ -756,6 +801,10 @@ function SignedInApp() {
 	const location = useLocation();
 	if (loading) return <FullPageLoading />;
 	if (!user || !token) {
+		// The "confirm your new email" link works without a session.
+		if (location.pathname === "/settings" && new URLSearchParams(location.search).has("confirmEmail")) {
+			return <Settings />;
+		}
 		rememberReturnPath(location.pathname + location.search);
 		return <Navigate to="/" replace />;
 	}
@@ -805,6 +854,7 @@ function AppRoutes() {
 			)}
 			<Route path="/auth/reset-password" element={<ResetPasswordPage />} />
 			<Route path="/pricing" element={<Pricing />} />
+			<Route path="/s/:slug" element={<SharedImage />} />
 			<Route
 				path="/admin"
 				element={

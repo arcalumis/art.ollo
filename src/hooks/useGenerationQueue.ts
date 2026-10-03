@@ -15,6 +15,9 @@ export type QueueRequest = GenerateRequest & {
 	threadId?: string;
 	variation?: boolean;
 	parameters?: Record<string, unknown>;
+	/** Set for tool runs: POST /api/tools/:tool with `image` instead of /api/generate. */
+	tool?: ImageTool;
+	image?: string;
 };
 
 /** One queue row: what the user sees plus the request needed to retry it. */
@@ -99,16 +102,21 @@ export function buildToolRequest(
 	ctx: ToolContext,
 ): QueueRequest | null {
 	if (!source.imageUrl) return null;
-	if (tool !== "upscale") return null;
 	return {
 		prompt: source.prompt,
-		model: "black-forest-labs/flux-2-dev",
-		imageInputs: [source.imageUrl],
-		aspectRatio: ctx.aspectRatio,
-		resolution: "4K",
-		outputFormat: ctx.outputFormat,
+		tool,
+		image: toImagePath(source.imageUrl),
 		threadId: ctx.threadId,
 	};
+}
+
+/** The tools endpoint takes the server path (/images/x.png), not an absolute URL. */
+export function toImagePath(url: string): string {
+	try {
+		return /^https?:/.test(url) ? new URL(url).pathname : url;
+	} catch {
+		return url;
+	}
 }
 
 export interface EnqueueSpec {
@@ -272,7 +280,7 @@ export function useGenerationQueue({
 			if (!request) return false;
 			enqueue({
 				label: found.source.prompt,
-				model: request.model ?? "black-forest-labs/flux-2-dev",
+				model: request.model ?? `tool:${tool}`,
 				threadId: found.ctx.threadId,
 				request,
 			});

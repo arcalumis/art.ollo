@@ -60,20 +60,18 @@ describe("generation queue", () => {
 		expect(queueReducer(q, { type: "remove", id: "zzz" })).toEqual(q);
 	});
 
-	test("upscale tool request re-renders the image at 4K in the same series", () => {
+	test("tool requests go to the tools endpoint with the image's server path", () => {
 		const req = buildToolRequest(
-			{ id: "g1", imageUrl: "/images/a.png", prompt: "a crow" },
+			{ id: "g1", imageUrl: "https://ollo.art/images/a.png", prompt: "a crow" },
 			"upscale",
 			{ threadId: "t1", aspectRatio: "1:1", outputFormat: "png" },
 		);
-		expect(req).toEqual({
+		expect(req).toEqual({ prompt: "a crow", tool: "upscale", image: "/images/a.png", threadId: "t1" });
+		expect(buildToolRequest({ id: "g1", imageUrl: "/images/a.png", prompt: "a crow" }, "remove-background", {})).toEqual({
 			prompt: "a crow",
-			model: "black-forest-labs/flux-2-dev",
-			imageInputs: ["/images/a.png"],
-			aspectRatio: "1:1",
-			resolution: "4K",
-			outputFormat: "png",
-			threadId: "t1",
+			tool: "remove-background",
+			image: "/images/a.png",
+			threadId: undefined,
 		});
 		expect(buildToolRequest({ id: "g2", prompt: "no image" }, "upscale", {})).toBeNull();
 	});
