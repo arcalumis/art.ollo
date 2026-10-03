@@ -1,14 +1,27 @@
+import { Button } from "@/components/ui/button";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 import { useState } from "react";
 import type { Thread } from "../types";
-import { Modal } from "./Modal";
 
 interface ThreadDeleteDialogProps {
 	isOpen: boolean;
 	onClose: () => void;
 	thread: Thread | null;
-	onConfirm: (deletePhotos: boolean) => void;
+	/** true: delete the series and its images for good; false: move the series to Archive. */
+	onConfirm: (deletePhotos: boolean) => void | Promise<void>;
 }
 
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/** Remove a series from the list: archive it (images kept) or delete it with its images. */
 export function ThreadDeleteDialog({
 	isOpen,
 	onClose,
@@ -16,110 +29,103 @@ export function ThreadDeleteDialog({
 	onConfirm,
 }: ThreadDeleteDialogProps) {
 	const [deletePhotos, setDeletePhotos] = useState(false);
-	const [isConfirming, setIsConfirming] = useState(false);
+	const [confirming, setConfirming] = useState(false);
 
-	if (!thread) return null;
-
-	const handleConfirm = async () => {
-		setIsConfirming(true);
-		try {
-			await onConfirm(deletePhotos);
-			onClose();
-		} finally {
-			setIsConfirming(false);
-			setDeletePhotos(false);
-		}
-	};
-
-	const handleClose = () => {
+	const close = () => {
+		if (confirming) return;
 		setDeletePhotos(false);
 		onClose();
 	};
 
-	const photoCount = thread.generationCount || 0;
+	const confirm = async () => {
+		setConfirming(true);
+		try {
+			await onConfirm(deletePhotos);
+		} finally {
+			setConfirming(false);
+			setDeletePhotos(false);
+		}
+	};
+
+	const count = thread?.generationCount ?? 0;
+	const options = [
+		{
+			value: false,
+			title: "Archive the series",
+			detail:
+				count > 0
+					? `Keeps its ${plural(count, "image")}. You can open or restore it from Archive.`
+					: "You can open or restore it from Archive.",
+		},
+		{
+			value: true,
+			title: "Delete the series and its images",
+			detail: "This can't be undone.",
+		},
+	];
 
 	return (
-		<Modal
-			isOpen={isOpen}
-			onClose={handleClose}
-			title="Delete Thread"
-			size="sm"
-			footer={
-				<div className="flex gap-2 justify-end">
-					<button
-						type="button"
-						onClick={handleClose}
-						className="px-3 py-1.5 text-xs rounded border border-cyan-500/30 hover:bg-cyan-500/10 transition-colors"
-						disabled={isConfirming}
-					>
+		<Dialog open={isOpen && !!thread} onOpenChange={(open) => !open && close()}>
+			<DialogContent className="sm:max-w-md">
+				<DialogHeader>
+					<DialogTitle className="font-sans text-lg font-semibold">Remove this series?</DialogTitle>
+					<DialogDescription className="truncate">{thread?.title}</DialogDescription>
+				</DialogHeader>
+
+				<fieldset className="flex flex-col gap-2">
+					<legend className="sr-only">What to do with the series</legend>
+					{options.map((option) => {
+						const checked = deletePhotos === option.value;
+						return (
+							<label
+								key={String(option.value)}
+								className={cn(
+									"flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors has-focus-visible:ring-3 has-focus-visible:ring-ring/50",
+									checked
+										? option.value
+											? "border-destructive/60"
+											: "border-verdigris/60"
+										: "border-border hover:border-foreground/30",
+								)}
+							>
+								<input
+									type="radio"
+									name="series-remove"
+									checked={checked}
+									onChange={() => setDeletePhotos(option.value)}
+									className={cn(
+										"mt-1 size-4",
+										option.value ? "accent-destructive" : "accent-verdigris",
+									)}
+								/>
+								<span className="min-w-0">
+									<span
+										className={cn("block text-sm font-medium", option.value && "text-destructive")}
+									>
+										{option.title}
+									</span>
+									<span className="mt-0.5 block text-sm text-muted-foreground">
+										{option.detail}
+									</span>
+								</span>
+							</label>
+						);
+					})}
+				</fieldset>
+
+				<DialogFooter>
+					<Button variant="outline" onClick={close} disabled={confirming}>
 						Cancel
-					</button>
-					<button
-						type="button"
-						onClick={handleConfirm}
-						disabled={isConfirming}
-						className={`px-3 py-1.5 text-xs rounded font-medium transition-colors ${
-							deletePhotos
-								? "bg-red-500/80 hover:bg-red-500 text-white"
-								: "bg-cyan-500/80 hover:bg-cyan-500 text-black"
-						}`}
+					</Button>
+					<Button
+						variant={deletePhotos ? "destructive" : "secondary"}
+						onClick={confirm}
+						disabled={confirming}
 					>
-						{isConfirming
-							? "Processing..."
-							: deletePhotos
-								? "Delete Permanently"
-								: "Archive Thread"}
-					</button>
-				</div>
-			}
-		>
-			<div className="space-y-4">
-				<div>
-					<p className="text-sm text-[var(--text-secondary)] mb-1">Thread:</p>
-					<p className="text-sm font-medium truncate">{thread.title}</p>
-					{photoCount > 0 && (
-						<p className="text-xs text-[var(--text-secondary)] mt-1">
-							{photoCount} generation{photoCount !== 1 ? "s" : ""}
-						</p>
-					)}
-				</div>
-
-				<div className="space-y-2">
-					<label className="flex items-start gap-3 p-3 rounded border border-cyan-500/20 hover:border-cyan-500/40 cursor-pointer transition-colors">
-						<input
-							type="radio"
-							name="deleteOption"
-							checked={!deletePhotos}
-							onChange={() => setDeletePhotos(false)}
-							className="mt-0.5 accent-cyan-500"
-						/>
-						<div>
-							<p className="text-sm font-medium">Archive this thread</p>
-							<p className="text-xs text-[var(--text-secondary)] mt-0.5">
-								Keep your {photoCount} image{photoCount !== 1 ? "s" : ""}, thread moves to archived
-							</p>
-						</div>
-					</label>
-
-					<label className="flex items-start gap-3 p-3 rounded border border-red-500/20 hover:border-red-500/40 cursor-pointer transition-colors">
-						<input
-							type="radio"
-							name="deleteOption"
-							checked={deletePhotos}
-							onChange={() => setDeletePhotos(true)}
-							className="mt-0.5 accent-red-500"
-						/>
-						<div>
-							<p className="text-sm font-medium text-red-400">
-								Delete thread and all images
-							</p>
-							<p className="text-xs text-red-400/70 mt-0.5">
-								Cannot be undone
-							</p>
-						</div>
-					</label>
-				</div>
-			</div>
-		</Modal>
+						{deletePhotos ? "Delete series and images" : "Archive series"}
+					</Button>
+				</DialogFooter>
+			</DialogContent>
+		</Dialog>
 	);
 }

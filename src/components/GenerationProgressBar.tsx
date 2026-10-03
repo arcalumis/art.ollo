@@ -48,16 +48,14 @@ export function GenerationProgressBar({
 
 	return (
 		<div className="w-full space-y-1">
-			{/* Progress bar container */}
-			<div className="h-1 bg-gray-800 rounded-full overflow-hidden">
+			<div className="h-1 overflow-hidden rounded-full bg-stone-2" aria-hidden>
 				<div
-					className="h-full bg-gradient-to-r from-cyan-500 to-pink-500 transition-all duration-100 ease-linear"
+					className="h-full bg-verdigris transition-[width] duration-100 ease-linear"
 					style={{ width: `${progress}%` }}
 				/>
 			</div>
-			{/* Time estimate */}
-			<div className="text-[9px] text-cyan-400/70 text-center">
-				{remaining > 0 ? `~${formatTime(remaining)}` : "Almost done..."}
+			<div className="text-center text-xs text-muted-foreground tabular-nums">
+				{remaining > 0 ? `About ${formatTime(remaining)} left` : "Almost done"}
 			</div>
 		</div>
 	);

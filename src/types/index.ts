@@ -316,6 +316,8 @@ export interface Thread {
 	archivedAt?: string;
 	generationCount?: number;
 	lastGenerationAt?: string;
+	/** Newest image in the series (list endpoint only). */
+	coverImageUrl?: string;
 	generations?: Generation[];
 	projectMetadata?: {
 		aspectRatio?: string;
