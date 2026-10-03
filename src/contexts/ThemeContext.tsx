@@ -1,160 +1,70 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 
-export type ThemeName = "divine" | "terminal" | "anime-night" | "phosphor" | "clean";
-
-export interface ThemeColors {
-	bgPrimary: string;
-	bgSecondary: string;
-	bgTertiary: string;
-	accent: string;
-	accentAlt: string;
-	textPrimary: string;
-	textSecondary: string;
-	border: string;
-	cardBg: string;
-	cardBorder: string;
-}
-
-export interface Theme {
-	name: ThemeName;
-	label: string;
-	colors: ThemeColors;
-	scanlines?: boolean;
-}
-
-export const themes: Record<ThemeName, Theme> = {
-	divine: {
-		name: "divine",
-		label: "Divine",
-		colors: {
-			bgPrimary: "#0a0908",        // Deep void with warm undertone
-			bgSecondary: "#141210",      // Slightly lighter void
-			bgTertiary: "#1c1915",       // Tertiary with golden hint
-			accent: "#d4a846",           // Sacred gold/amber
-			accentAlt: "#e87c3e",        // Sacred fire orange
-			textPrimary: "#f5efe6",      // Warm off-white (parchment)
-			textSecondary: "#8a8078",    // Muted warm gray
-			border: "#2a2520",           // Dark warm border
-			cardBg: "rgba(20, 18, 16, 0.95)",
-			cardBorder: "rgba(212, 168, 70, 0.25)",
-		},
-	},
-	terminal: {
-		name: "terminal",
-		label: "Terminal",
-		colors: {
-			bgPrimary: "#1c1c1c",
-			bgSecondary: "#252525",
-			bgTertiary: "#2f2f2f",
-			accent: "#00ff41",
-			accentAlt: "#ff6b35",
-			textPrimary: "#e0e0e0",
-			textSecondary: "#888888",
-			border: "#3a3a3a",
-			cardBg: "rgba(28, 28, 28, 0.9)",
-			cardBorder: "rgba(0, 255, 65, 0.2)",
-		},
-	},
-	"anime-night": {
-		name: "anime-night",
-		label: "Anime Night",
-		colors: {
-			bgPrimary: "#0f0f1a",
-			bgSecondary: "#161625",
-			bgTertiary: "#1d1d30",
-			accent: "#ff4d6d",
-			accentAlt: "#00d4ff",
-			textPrimary: "#f0f0f0",
-			textSecondary: "#8888aa",
-			border: "#2a2a4a",
-			cardBg: "rgba(15, 15, 26, 0.9)",
-			cardBorder: "rgba(255, 77, 109, 0.2)",
-		},
-	},
-	phosphor: {
-		name: "phosphor",
-		label: "Phosphor",
-		colors: {
-			bgPrimary: "#0a0a0a",
-			bgSecondary: "#0f0f0f",
-			bgTertiary: "#141414",
-			accent: "#33ff33",
-			accentAlt: "#33ff33",
-			textPrimary: "#33ff33",
-			textSecondary: "#228822",
-			border: "#1a3a1a",
-			cardBg: "rgba(10, 10, 10, 0.95)",
-			cardBorder: "rgba(51, 255, 51, 0.3)",
-		},
-		scanlines: true,
-	},
-	clean: {
-		name: "clean",
-		label: "Clean",
-		colors: {
-			bgPrimary: "#18181b",
-			bgSecondary: "#1f1f23",
-			bgTertiary: "#27272a",
-			accent: "#a855f7",
-			accentAlt: "#06b6d4",
-			textPrimary: "#fafafa",
-			textSecondary: "#a1a1aa",
-			border: "#3f3f46",
-			cardBg: "rgba(24, 24, 27, 0.9)",
-			cardBorder: "rgba(168, 85, 247, 0.2)",
-		},
-	},
-};
+/**
+ * ollo has one identity in two finishes: Night (dark, the default) and
+ * Plaster (light). "system" follows the OS setting. The palette itself lives
+ * in src/index.css; this only records an explicit choice as data-theme on
+ * <html>, which the CSS tokens key off.
+ */
+export type Finish = "system" | "night" | "plaster";
 
 interface ThemeContextValue {
-	theme: Theme;
-	themeName: ThemeName;
-	setTheme: (name: ThemeName) => void;
+	finish: Finish;
+	/** The finish actually on screen once "system" is resolved. */
+	resolved: "night" | "plaster";
+	setFinish: (finish: Finish) => void;
 }
 
+const STORAGE_KEY = "ollo-finish";
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
+function readStoredFinish(): Finish {
+	try {
+		const stored = localStorage.getItem(STORAGE_KEY);
+		if (stored === "night" || stored === "plaster" || stored === "system") return stored;
+	} catch {
+		// Storage can be unavailable (private mode); fall back to the default.
+	}
+	return "system";
+}
+
+const lightQuery = () => window.matchMedia("(prefers-color-scheme: light)");
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
-	const [themeName, setThemeName] = useState<ThemeName>(() => {
-		const stored = localStorage.getItem("theme");
-		if (stored && stored in themes) {
-			return stored as ThemeName;
-		}
-		return "divine";
-	});
+	const [finish, setFinishState] = useState<Finish>(readStoredFinish);
+	const [systemIsLight, setSystemIsLight] = useState(() => lightQuery().matches);
 
-	const theme = themes[themeName];
-
-	const setTheme = useCallback((name: ThemeName) => {
-		setThemeName(name);
-		localStorage.setItem("theme", name);
+	useEffect(() => {
+		const query = lightQuery();
+		const onChange = () => setSystemIsLight(query.matches);
+		query.addEventListener("change", onChange);
+		return () => query.removeEventListener("change", onChange);
 	}, []);
 
-	// Apply theme CSS variables to document root
 	useEffect(() => {
 		const root = document.documentElement;
-		const { colors, scanlines } = theme;
-
-		root.style.setProperty("--bg-primary", colors.bgPrimary);
-		root.style.setProperty("--bg-secondary", colors.bgSecondary);
-		root.style.setProperty("--bg-tertiary", colors.bgTertiary);
-		root.style.setProperty("--accent", colors.accent);
-		root.style.setProperty("--accent-alt", colors.accentAlt);
-		root.style.setProperty("--text-primary", colors.textPrimary);
-		root.style.setProperty("--text-secondary", colors.textSecondary);
-		root.style.setProperty("--border", colors.border);
-		root.style.setProperty("--card-bg", colors.cardBg);
-		root.style.setProperty("--card-border", colors.cardBorder);
-
-		// Toggle scanlines class
-		if (scanlines) {
-			root.classList.add("scanlines");
-		} else {
-			root.classList.remove("scanlines");
+		if (finish === "system") root.removeAttribute("data-theme");
+		else root.setAttribute("data-theme", finish === "plaster" ? "light" : "dark");
+		// Earlier versions wrote theme colours as inline styles and a CRT class.
+		for (const name of ["--bg-primary", "--bg-secondary", "--bg-tertiary", "--accent", "--accent-alt", "--text-primary", "--text-secondary", "--border", "--card-bg", "--card-border"]) {
+			root.style.removeProperty(name);
 		}
-	}, [theme]);
+		root.classList.remove("scanlines");
+	}, [finish]);
 
-	return <ThemeContext.Provider value={{ theme, themeName, setTheme }}>{children}</ThemeContext.Provider>;
+	const setFinish = useCallback((next: Finish) => {
+		setFinishState(next);
+		try {
+			localStorage.setItem(STORAGE_KEY, next);
+			localStorage.removeItem("theme");
+		} catch {
+			// Not persisted; the choice still applies for this visit.
+		}
+	}, []);
+
+	const resolved = finish === "system" ? (systemIsLight ? "plaster" : "night") : finish;
+
+	return <ThemeContext.Provider value={{ finish, resolved, setFinish }}>{children}</ThemeContext.Provider>;
 }
 
 export function useTheme() {

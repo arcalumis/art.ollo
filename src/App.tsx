@@ -47,6 +47,11 @@ function AdminLoading() {
 import type { Generation, QueuedGeneration, Thread } from "./types";
 import "./App.css";
 
+// Design-system reference, compiled out of production builds.
+const Styleguide = import.meta.env.DEV
+	? lazy(() => import("./pages/Styleguide").then((m) => ({ default: m.Styleguide })))
+	: null;
+
 function MainApp() {
 	const { user, token, loading: authLoading, updateUser, logout } = useAuth();
 	const { completeTutorial, resetTutorial } = useTutorial(token);
@@ -815,6 +820,16 @@ function AppRoutes() {
 		<Routes>
 			<Route path="/" element={<MainApp />} />
 			<Route path="/auth/magic-link" element={<MagicLinkVerify />} />
+			{Styleguide && (
+				<Route
+					path="/styleguide"
+					element={
+						<Suspense fallback={null}>
+							<Styleguide />
+						</Suspense>
+					}
+				/>
+			)}
 			<Route path="/auth/reset-password" element={<ResetPasswordPage />} />
 			<Route
 				path="/billing"
