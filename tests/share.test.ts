@@ -183,8 +183,6 @@ describe("share page meta", () => {
 				imageUrl: "/images/x.png",
 				prompt,
 				model: "m",
-				width: null,
-				height: null,
 				createdAt: "2026-10-01 10:00:00",
 			},
 			"abc",
