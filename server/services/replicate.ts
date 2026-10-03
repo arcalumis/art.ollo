@@ -4,19 +4,71 @@ import path from "node:path";
 import Replicate from "replicate";
 import sharp from "sharp";
 import type { Model } from "../../src/types";
+import { getImagesDir, getUploadsDir, resolveInside } from "./storage";
 
 // Maximum file size for Replicate inputs (5MB)
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 // Maximum dimension for resized images
 const MAX_DIMENSION = 2048;
+// Maximum size of a single downloaded output image (guards memory)
+const MAX_OUTPUT_BYTES = 50 * 1024 * 1024;
 
 // Default Replicate client uses REPLICATE_API_TOKEN from env
 const defaultReplicate = new Replicate();
+
+/** Thrown when a prediction does not finish within the overall deadline. */
+export class GenerationTimeoutError extends Error {
+	constructor(message = "Generation timed out") {
+		super(message);
+		this.name = "GenerationTimeoutError";
+	}
+}
+
+/** Thrown when Replicate reports the prediction as canceled/aborted. */
+export class GenerationCanceledError extends Error {
+	constructor(message = "Generation was canceled") {
+		super(message);
+		this.name = "GenerationCanceledError";
+	}
+}
+
+/** Thrown when an image input is not a safe, existing file in uploads/ or generated-images/. */
+export class InvalidImageInputError extends Error {
+	constructor(message = "Invalid image input") {
+		super(message);
+		this.name = "InvalidImageInputError";
+	}
+}
+
+// ---- Test seams -------------------------------------------------------------
+// Tests replace the Replicate client and the output-download fetch so no test
+// ever reaches the network. Production never calls these.
+type ClientFactory = (apiKey?: string) => Replicate;
+const settings = {
+	clientFactory: null as ClientFactory | null,
+	fetchImpl: null as typeof fetch | null,
+	pollIntervalMs: 1000,
+	timeoutMs: Number(process.env.GENERATION_TIMEOUT_MS) || 180_000,
+};
+
+export const __testing = {
+	setClientFactory(factory: ClientFactory | null): void {
+		settings.clientFactory = factory;
+	},
+	setFetch(fetchImpl: typeof fetch | null): void {
+		settings.fetchImpl = fetchImpl;
+	},
+	setTiming(opts: { pollIntervalMs?: number; timeoutMs?: number }): void {
+		if (opts.pollIntervalMs !== undefined) settings.pollIntervalMs = opts.pollIntervalMs;
+		if (opts.timeoutMs !== undefined) settings.timeoutMs = opts.timeoutMs;
+	},
+};
 
 /**
  * Create a Replicate client with a custom API key or use default
  */
 function getReplicateClient(apiKey?: string): Replicate {
+	if (settings.clientFactory) return settings.clientFactory(apiKey);
 	if (apiKey) {
 		return new Replicate({ auth: apiKey });
 	}
@@ -388,40 +440,42 @@ async function fileToDataUri(filePath: string): Promise<string> {
 	return `data:${mimeType};base64,${buffer.toString("base64")}`;
 }
 
-// Helper to convert image input paths to data URIs (with resize if needed)
+/**
+ * Map an image input reference ("/uploads/<file>" or "/images/<file>", optionally
+ * as an absolute URL) to a file path inside the corresponding directory.
+ *
+ * Defense in depth: the route already restricts inputs to rows the user owns,
+ * but this function must never be able to read outside those two directories.
+ */
+export function resolveImageInputPath(input: string): string {
+	let pathname = input;
+	if (/^https?:\/\//i.test(input)) {
+		try {
+			pathname = new URL(input).pathname;
+		} catch {
+			throw new InvalidImageInputError();
+		}
+	}
+	const match = /^\/(uploads|images)\/([^/\\]+)$/.exec(pathname);
+	if (!match) throw new InvalidImageInputError();
+	const dir = match[1] === "uploads" ? getUploadsDir() : getImagesDir();
+	const full = resolveInside(dir, match[2]);
+	if (!full) throw new InvalidImageInputError();
+	return full;
+}
+
+// Helper to convert image input paths to data URIs (with resize if needed).
+// Any invalid or missing input aborts the generation rather than silently
+// generating without the reference image the user paid for.
 async function convertImageInputsToDataUris(imageInputs: string[]): Promise<string[]> {
 	const results: string[] = [];
 
 	for (const inputPath of imageInputs) {
-		let fullPath: string;
-
-		// Handle /uploads/xxx.png paths
-		if (inputPath.includes("/uploads/")) {
-			const filename = inputPath.split("/uploads/").pop();
-			if (!filename) continue;
-			fullPath = path.join(process.cwd(), "uploads", filename);
-		}
-		// Handle /images/xxx.png paths (generated images)
-		else if (inputPath.includes("/images/")) {
-			const filename = inputPath.split("/images/").pop();
-			if (!filename) continue;
-			fullPath = path.join(process.cwd(), "generated-images", filename);
-		} else {
-			console.log("Unknown image path format:", inputPath);
-			continue;
-		}
-
+		const fullPath = resolveImageInputPath(inputPath);
 		if (!fs.existsSync(fullPath)) {
-			console.log("File not found:", fullPath);
-			continue;
+			throw new InvalidImageInputError("Input image not found");
 		}
-
-		try {
-			const dataUri = await fileToDataUri(fullPath);
-			results.push(dataUri);
-		} catch (err) {
-			console.error("Error processing image:", fullPath, err);
-		}
+		results.push(await fileToDataUri(fullPath));
 	}
 
 	return results;
@@ -591,26 +645,44 @@ async function buildModelInput(
 	return input;
 }
 
-// Run a single prediction and return results
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Run a single prediction and return results.
+// Exits on every terminal status and enforces an overall deadline; on timeout
+// the prediction is canceled (best effort) so we stop paying for it.
 async function runSinglePrediction(
 	replicate: Replicate,
 	model: string,
 	input: Record<string, unknown>,
 ): Promise<{ output: unknown; predictTime: number; replicateId: string }> {
+	const deadline = Date.now() + settings.timeoutMs;
 	const prediction = await replicate.predictions.create({
 		model: model as `${string}/${string}`,
 		input,
 	});
 
-	// Poll for completion
+	const isTerminal = (status: string) =>
+		status === "succeeded" || status === "failed" || status === "canceled" || status === "aborted";
+
 	let finalPrediction = prediction;
-	while (finalPrediction.status !== "succeeded" && finalPrediction.status !== "failed") {
-		await new Promise((resolve) => setTimeout(resolve, 1000));
+	while (!isTerminal(finalPrediction.status)) {
+		if (Date.now() >= deadline) {
+			try {
+				await replicate.predictions.cancel(prediction.id);
+			} catch (err) {
+				console.error(`Failed to cancel timed-out prediction ${prediction.id}:`, err);
+			}
+			throw new GenerationTimeoutError();
+		}
+		await sleep(Math.min(settings.pollIntervalMs, Math.max(0, deadline - Date.now())));
 		finalPrediction = await replicate.predictions.get(prediction.id);
 	}
 
 	if (finalPrediction.status === "failed") {
-		throw new Error(finalPrediction.error || "Generation failed");
+		throw new Error(finalPrediction.error ? String(finalPrediction.error) : "Generation failed");
+	}
+	if (finalPrediction.status !== "succeeded") {
+		throw new GenerationCanceledError();
 	}
 
 	return {
@@ -620,26 +692,64 @@ async function runSinglePrediction(
 	};
 }
 
+const CONTENT_TYPE_EXT: Record<string, string> = {
+	"image/png": "png",
+	"image/jpeg": "jpg",
+	"image/jpg": "jpg",
+	"image/webp": "webp",
+	"image/gif": "gif",
+	"image/avif": "avif",
+};
+
+/** Pick the file extension from the response content type, then the URL, then the requested format. */
+function pickExtension(contentType: string | null, imageUrl: string, requestedFormat?: string): string {
+	const ct = (contentType || "").split(";")[0].trim().toLowerCase();
+	if (CONTENT_TYPE_EXT[ct]) return CONTENT_TYPE_EXT[ct];
+	try {
+		const urlExt = path.extname(new URL(imageUrl).pathname).slice(1).toLowerCase();
+		if (urlExt === "jpeg") return "jpg";
+		if (["png", "jpg", "webp", "gif", "avif"].includes(urlExt)) return urlExt;
+	} catch {
+		// fall through to the requested format
+	}
+	const fmt = (requestedFormat || "").toLowerCase();
+	if (fmt === "jpeg" || fmt === "jpg") return "jpg";
+	if (fmt === "png" || fmt === "webp") return fmt;
+	return "png";
+}
+
 // Download image and save locally
 async function downloadAndSaveImage(
 	imageUrl: string,
 	replicateId: string,
 	cost: number,
 	predictTime: number,
+	requestedFormat?: string,
 ): Promise<GenerationResult | null> {
-	if (!imageUrl || !imageUrl.startsWith("http")) {
+	if (!imageUrl || !/^https?:\/\//i.test(imageUrl)) {
 		console.log("Skipping invalid URL:", imageUrl);
 		return null;
 	}
 
-	const id = crypto.randomUUID();
-	const ext = imageUrl.includes(".png") ? "png" : "webp";
-	const filename = `${id}.${ext}`;
-	const filePath = path.join(process.cwd(), "generated-images", filename);
-
-	const response = await fetch(imageUrl);
+	const doFetch = settings.fetchImpl ?? fetch;
+	const response = await doFetch(imageUrl);
+	if (!response.ok) {
+		throw new Error(`Failed to download generated image (HTTP ${response.status})`);
+	}
 	const buffer = Buffer.from(await response.arrayBuffer());
-	fs.writeFileSync(filePath, buffer);
+	if (buffer.length === 0) {
+		throw new Error("Downloaded generated image is empty");
+	}
+	if (buffer.length > MAX_OUTPUT_BYTES) {
+		throw new Error("Downloaded generated image is too large");
+	}
+
+	const id = crypto.randomUUID();
+	const ext = pickExtension(response.headers.get("content-type"), imageUrl, requestedFormat);
+	const filename = `${id}.${ext}`;
+	const dir = getImagesDir();
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(path.join(dir, filename), buffer);
 
 	return {
 		id,
@@ -651,6 +761,20 @@ async function downloadAndSaveImage(
 	};
 }
 
+/** Normalize a prediction's output (string, array, null, FileOutput) to a list of URL strings. */
+function outputToUrls(output: unknown): string[] {
+	if (output === null || output === undefined) return [];
+	const items = Array.isArray(output) ? output : [output];
+	return items.filter((item) => item !== null && item !== undefined).map((item) => String(item));
+}
+
+/**
+ * Run a generation and download its outputs.
+ *
+ * May return fewer images than requested (including zero) when Replicate
+ * returns fewer outputs or some parallel calls fail; the caller refunds the
+ * difference. Throws only when nothing could be produced because of an error.
+ */
 export async function generateImage(
 	prompt: string,
 	model = "black-forest-labs/flux-schnell",
@@ -664,37 +788,7 @@ export async function generateImage(
 	const supportsNumOutputs = modelInfo?.supportsNumOutputs ?? false;
 	const supportsSeed = modelInfo?.supportsSeed ?? false;
 
-	// For models that support num_outputs, make a single call
-	if (supportsNumOutputs || numOutputs === 1) {
-		const input = await buildModelInput(model, prompt, options, options.seed);
-		const { output, predictTime, replicateId } = await runSinglePrediction(replicate, model, input);
-
-		console.log("Replicate output:", output);
-
-		const outputArray = Array.isArray(output) ? output : [output];
-		// Calculate cost per image using actual model pricing
-		const costPerImage = calculateGenerationCost(model, {
-			numOutputs: 1,
-			resolution: options.resolution,
-			width: options.width,
-			height: options.height,
-			hasImageInput: (options.imageInputs?.length || 0) > 0,
-			inputImageCount: options.imageInputs?.length,
-		});
-		const results: GenerationResult[] = [];
-
-		for (const item of outputArray) {
-			const result = await downloadAndSaveImage(String(item), replicateId, costPerImage, predictTime);
-			if (result) results.push(result);
-		}
-
-		return results;
-	}
-
-	// For models that don't support num_outputs, make parallel API calls
-	console.log(`Model ${model} doesn't support num_outputs, making ${numOutputs} parallel calls`);
-
-	// Pre-calculate cost per image for this model
+	// Calculate cost per image using actual model pricing
 	const costPerImage = calculateGenerationCost(model, {
 		numOutputs: 1,
 		resolution: options.resolution,
@@ -704,32 +798,52 @@ export async function generateImage(
 		inputImageCount: options.imageInputs?.length,
 	});
 
-	const predictions = await Promise.all(
+	const runAndDownload = async (input: Record<string, unknown>): Promise<GenerationResult[]> => {
+		const { output, predictTime, replicateId } = await runSinglePrediction(replicate, model, input);
+		const out: GenerationResult[] = [];
+		for (const url of outputToUrls(output)) {
+			const result = await downloadAndSaveImage(url, replicateId, costPerImage, predictTime, options.outputFormat);
+			if (result) out.push(result);
+		}
+		return out;
+	};
+
+	// For models that support num_outputs, make a single call
+	if (supportsNumOutputs || numOutputs === 1) {
+		const input = await buildModelInput(model, prompt, options, options.seed);
+		return runAndDownload(input);
+	}
+
+	// For models that don't support num_outputs, make parallel API calls.
+	// Partial success is kept; the caller refunds credits for missing outputs.
+	const settled = await Promise.allSettled(
 		Array.from({ length: numOutputs }, async (_, i) => {
 			// Generate different seeds for each call if model supports seeds
 			const seed = supportsSeed ? (options.seed ?? Math.floor(Math.random() * 2147483647)) + i : undefined;
 			const input = await buildModelInput(model, prompt, { ...options, numOutputs: 1 }, seed);
-			return runSinglePrediction(replicate, model, input);
+			return runAndDownload(input);
 		}),
 	);
 
-	const results: GenerationResult[] = [];
-
-	for (const { output, predictTime, replicateId } of predictions) {
-		console.log("Replicate output:", output);
-
-		const outputArray = Array.isArray(output) ? output : [output];
-		for (const item of outputArray) {
-			const result = await downloadAndSaveImage(String(item), replicateId, costPerImage, predictTime);
-			if (result) results.push(result);
-		}
+	const results = settled.flatMap((s) => (s.status === "fulfilled" ? s.value : []));
+	if (results.length === 0) {
+		const firstError = settled.find((s): s is PromiseRejectedResult => s.status === "rejected");
+		if (firstError) throw firstError.reason;
 	}
-
 	return results;
 }
 
 export function getModels(): ExtendedModel[] {
 	return MODELS;
+}
+
+/**
+ * True when Replicate bills this model per output / per megapixel (official
+ * models), so our estimate IS the actual cost and predict_time-based
+ * reconciliation would understate it.
+ */
+export function isPerOutputPriced(model: string): boolean {
+	return model in MODEL_PRICING;
 }
 
 export interface EnhancePromptResult {
@@ -750,8 +864,6 @@ export async function enhancePrompt(
 	hasImages?: boolean,
 ): Promise<EnhancePromptResult> {
 	const replicate = getReplicateClient(apiKey);
-
-	console.log("Enhancing prompt:", prompt, "hasImages:", hasImages);
 
 	const systemPrompt = hasImages
 		? `You are an expert image prompt engineer. Your job is to take a basic image description and transform it into a rich, detailed prompt for AI image generation.
@@ -780,7 +892,6 @@ Output ONLY the enhanced prompt - no explanations, no quotes, no prefixes. Keep 
 	}
 
 	const result = chunks.join("");
-	console.log("Llama streamed result:", result);
 	return {
 		enhanced: result.trim(),
 		cost: PROMPT_ENHANCEMENT_COST,

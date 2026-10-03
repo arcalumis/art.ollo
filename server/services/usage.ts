@@ -107,9 +107,13 @@ interface CreditRow {
 	total: number;
 }
 
+/** Machine-readable reasons a generation was refused (sent as `code` in 402/403 JSON). */
+export type GenerationBlockCode = "INSUFFICIENT_CREDITS" | "MONTHLY_COST_LIMIT";
+
 export interface UsageLimitResult {
 	allowed: boolean;
 	reason?: string;
+	code?: GenerationBlockCode;
 	subscription?: SubscriptionProduct;
 	usage?: {
 		imageCount: number;
@@ -370,12 +374,16 @@ export function canUserUseModel(userId: string, modelId: string): boolean {
 /**
  * Check if user can generate an image based on credit balance and safety limits
  * Credits are the primary gate. Monthly cost limit is a safety backstop.
+ *
+ * `creditCostOverride` is the total cost of the request (per-image cost x
+ * outputs); defaults to the single-image model cost. This is a pre-check for a
+ * friendly message only: the authoritative, race-free check is reserveCredits().
  */
-export function canUserGenerate(userId: string, modelId: string): UsageLimitResult {
+export function canUserGenerate(userId: string, modelId: string, creditCostOverride?: number): UsageLimitResult {
 	const { product } = getUserSubscription(userId);
 	const usage = getMonthlyUsage(userId);
 	const availableCredits = getAvailableCredits(userId);
-	const creditCost = getModelCreditCost(modelId);
+	const creditCost = creditCostOverride ?? getModelCreditCost(modelId);
 
 	// If no subscription, check for credits only
 	if (!product) {
@@ -388,7 +396,8 @@ export function canUserGenerate(userId: string, modelId: string): UsageLimitResu
 		}
 		return {
 			allowed: false,
-			reason: `No active subscription. This model costs ${creditCost} credits but you have ${availableCredits}. Please subscribe to continue generating images.`,
+			code: "INSUFFICIENT_CREDITS",
+			reason: `No active subscription. This generation costs ${creditCost} credits but you have ${availableCredits}. Please subscribe to continue generating images.`,
 			availableCredits,
 			creditCost,
 		};
@@ -410,7 +419,8 @@ export function canUserGenerate(userId: string, modelId: string): UsageLimitResu
 	if (availableCredits < creditCost) {
 		return {
 			allowed: false,
-			reason: `Not enough credits. This model costs ${creditCost} credits but you have ${availableCredits}.`,
+			code: "INSUFFICIENT_CREDITS",
+			reason: `Not enough credits. This generation costs ${creditCost} credits but you have ${availableCredits}.`,
 			subscription: product,
 			usage: currentUsage,
 			limits,
@@ -424,6 +434,7 @@ export function canUserGenerate(userId: string, modelId: string): UsageLimitResu
 	if (product.monthly_cost_limit !== null && currentUsage.totalCost >= product.monthly_cost_limit) {
 		return {
 			allowed: false,
+			code: "MONTHLY_COST_LIMIT",
 			reason: "Platform safety limit reached. Please contact support or wait for next month.",
 			subscription: product,
 			usage: currentUsage,
@@ -446,11 +457,16 @@ export function canUserGenerate(userId: string, modelId: string): UsageLimitResu
 }
 
 /**
- * Record usage after a generation
+ * Record usage after a generation.
+ *
+ * Generations on the user's own Replicate key still count toward image
+ * counters, but their cost is NOT added to total_cost: total_cost is what the
+ * platform monthly_cost_limit backstop measures, and the platform did not pay.
  */
 export function recordUsage(userId: string, cost: number, usedOwnKey: boolean): void {
 	const db = getDb();
 	const yearMonth = getCurrentYearMonth();
+	const platformCost = usedOwnKey ? 0 : cost;
 
 	// Record monthly usage
 	const existing = db
@@ -464,13 +480,13 @@ export function recordUsage(userId: string, cost: number, usedOwnKey: boolean): 
 				total_cost = total_cost + ?,
 				used_own_key = used_own_key + ?
 			WHERE id = ?`,
-		).run(cost, usedOwnKey ? 1 : 0, existing.id);
+		).run(platformCost, usedOwnKey ? 1 : 0, existing.id);
 	} else {
 		const id = crypto.randomUUID();
 		db.prepare(
 			`INSERT INTO usage_monthly (id, user_id, year_month, image_count, total_cost, used_own_key)
 			VALUES (?, ?, ?, 1, ?, ?)`,
-		).run(id, userId, yearMonth, cost, usedOwnKey ? 1 : 0);
+		).run(id, userId, yearMonth, platformCost, usedOwnKey ? 1 : 0);
 	}
 
 	// Record daily usage
@@ -478,23 +494,48 @@ export function recordUsage(userId: string, cost: number, usedOwnKey: boolean): 
 }
 
 /**
- * Deduct credits from user for a generation
+ * Atomically check the balance and insert the negative `used` ledger row.
+ *
+ * bun:sqlite is synchronous and the check + insert run inside one IMMEDIATE
+ * transaction, so concurrent requests cannot both spend the same credits.
+ * Returns the ledger row id, or null if the balance is insufficient.
+ * Call BEFORE doing the paid work; on failure call refundReservation().
+ */
+export function reserveCredits(userId: string, amount: number, reason: string): string | null {
+	if (!Number.isInteger(amount) || amount <= 0) {
+		throw new Error(`reserveCredits: invalid amount ${amount}`);
+	}
+	const db = getDb();
+	const reserve = db.transaction((): string | null => {
+		const { total } = db
+			.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM user_credits WHERE user_id = ?")
+			.get(userId) as CreditRow;
+		if (total < amount) return null;
+		const id = crypto.randomUUID();
+		db.prepare(
+			`INSERT INTO user_credits (id, user_id, credit_type, amount, reason)
+			VALUES (?, ?, 'used', ?, ?)`,
+		).run(id, userId, -amount, reason);
+		return id;
+	});
+	return reserve.immediate();
+}
+
+/**
+ * Give back (part of) a reservation as a positive `refund` ledger row.
+ * The original `used` row is left intact so the ledger stays append-only.
+ */
+export function refundReservation(userId: string, reservationId: string, amount: number, reason: string): void {
+	if (amount <= 0) return;
+	addCredits(userId, amount, "refund", `${reason} (reservation ${reservationId})`);
+}
+
+/**
+ * Deduct credits from user (non-generation callers). Atomic; returns false if
+ * the balance is insufficient.
  */
 export function deductCredit(userId: string, amount: number, reason: string): boolean {
-	const db = getDb();
-	const credits = getAvailableCredits(userId);
-
-	if (credits < amount) {
-		return false;
-	}
-
-	const id = crypto.randomUUID();
-	db.prepare(
-		`INSERT INTO user_credits (id, user_id, credit_type, amount, reason)
-		VALUES (?, ?, 'used', ?, ?)`,
-	).run(id, userId, -amount, reason);
-
-	return true;
+	return reserveCredits(userId, amount, reason) !== null;
 }
 
 /**
@@ -567,6 +608,25 @@ export function assignDefaultSubscription(userId: string): void {
 	addCredits(userId, initialCredits, "initial", "Welcome credits for new account");
 }
 
+/** Ledger credit_type values that represent credits the user paid for. */
+const PURCHASED_CREDIT_TYPES = ["purchase", "purchased"];
+
+/**
+ * The part of a user's balance that is NOT purchased credits, assuming free
+ * credits are spent before purchased ones: max(0, balance - total purchased).
+ * Refills top up only this part, so buying credits never forfeits a refill.
+ */
+export function getNonPurchasedBalance(userId: string, balance = getAvailableCredits(userId)): number {
+	const placeholders = PURCHASED_CREDIT_TYPES.map(() => "?").join(", ");
+	const row = getDb()
+		.prepare(
+			`SELECT COALESCE(SUM(amount), 0) as total FROM user_credits
+			WHERE user_id = ? AND credit_type IN (${placeholders})`,
+		)
+		.get(userId, ...PURCHASED_CREDIT_TYPES) as CreditRow;
+	return Math.max(0, balance - Math.max(0, row.total));
+}
+
 /**
  * Process subscription credit refills for all eligible users.
  * Refills credits to the target level (not additive -- "top off" model).
@@ -604,23 +664,25 @@ export function processSubscriptionRefills(): number {
 
 	let refillCount = 0;
 
-	for (const sub of eligibleSubscriptions) {
+	// One transaction per user: balance read, refill row, audit log and
+	// timestamp either all land or none do. A failure for one user is logged
+	// and does not stop the others.
+	const refillOne = db.transaction((sub: (typeof eligibleSubscriptions)[number]): boolean => {
 		const currentBalance = getAvailableCredits(sub.user_id);
+		const nonPurchased = getNonPurchasedBalance(sub.user_id, currentBalance);
 		let creditsAdded = 0;
 
-		if (currentBalance < sub.credit_refill_amount) {
-			creditsAdded = sub.credit_refill_amount - currentBalance;
+		if (nonPurchased < sub.credit_refill_amount) {
+			creditsAdded = sub.credit_refill_amount - nonPurchased;
 			addCredits(sub.user_id, creditsAdded, "refill", "Subscription credit refill");
-			refillCount++;
 		}
 
 		// Log the refill event (even if no credits were added -- for breakage analysis)
-		const logId = crypto.randomUUID();
 		db.prepare(`
 			INSERT INTO credit_topoff_log (id, user_id, subscription_id, credits_added, balance_before, balance_after, refill_target)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
 		`).run(
-			logId,
+			crypto.randomUUID(),
 			sub.user_id,
 			sub.subscription_id,
 			creditsAdded,
@@ -629,10 +691,19 @@ export function processSubscriptionRefills(): number {
 			sub.credit_refill_amount,
 		);
 
-		// Update timestamp
 		db.prepare(
 			"UPDATE user_subscriptions SET last_credit_topoff_at = datetime('now') WHERE id = ?",
 		).run(sub.subscription_id);
+
+		return creditsAdded > 0;
+	});
+
+	for (const sub of eligibleSubscriptions) {
+		try {
+			if (refillOne(sub)) refillCount++;
+		} catch (err) {
+			console.error(`Credit refill failed for user ${sub.user_id}:`, err);
+		}
 	}
 
 	if (eligibleSubscriptions.length > 0) {

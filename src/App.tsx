@@ -291,6 +291,8 @@ function MainApp() {
 		const request = {
 			prompt: gen.prompt,
 			model: "black-forest-labs/flux-redux-dev",
+			// Server substitutes the best variation model the user's tier allows
+			variation: true,
 			imageInputs: [sourceImage],
 			numOutputs: 4,
 			seed: randomSeed,
@@ -318,6 +320,8 @@ function MainApp() {
 		const request = {
 			prompt,
 			model: "black-forest-labs/flux-redux-dev",
+			// Server substitutes the best variation model the user's tier allows
+			variation: true,
 			imageInputs: [imageUrl],
 			numOutputs: 4,
 			seed: randomSeed,

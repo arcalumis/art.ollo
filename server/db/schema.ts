@@ -768,4 +768,43 @@ export function initializeSchema(db: Database): void {
 		CREATE INDEX IF NOT EXISTS idx_solana_sub_tx_signature ON solana_subscription_transactions(transaction_signature);
 		CREATE INDEX IF NOT EXISTS idx_solana_sub_tx_status ON solana_subscription_transactions(status);
 	`);
+
+	// ---- Phase 1A migrations ----
+	// One-shot data migrations are recorded in schema_migrations so they run
+	// exactly once per database (an admin's later edits are never clobbered at boot).
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			name TEXT PRIMARY KEY,
+			applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`);
+	const runOnce = (name: string, fn: () => void) => {
+		const done = db.prepare("SELECT 1 FROM schema_migrations WHERE name = ?").get(name);
+		if (done) return;
+		db.transaction(() => {
+			fn();
+			db.prepare("INSERT INTO schema_migrations (name) VALUES (?)").run(name);
+		})();
+	};
+
+	// Free tier: monthly top-off to 5 credits. Existing Free subscribers who were
+	// never topped off start their 30-day clock at their subscription start, so the
+	// first refill lands one interval after signup rather than all at once.
+	runOnce("1a_free_tier_monthly_refill", () => {
+		db.prepare(
+			"UPDATE subscription_products SET credit_refill_amount = 5, topoff_interval_hours = 720 WHERE name = 'Free'",
+		).run();
+		db.prepare(`
+			UPDATE user_subscriptions SET last_credit_topoff_at = starts_at
+			WHERE last_credit_topoff_at IS NULL
+			AND product_id IN (SELECT id FROM subscription_products WHERE name = 'Free')
+		`).run();
+	});
+
+	// Indexes for the generation path: input-ownership lookups and reconciliation.
+	db.exec(`
+		CREATE INDEX IF NOT EXISTS idx_uploads_user_filename ON uploads(user_id, filename);
+		CREATE INDEX IF NOT EXISTS idx_generations_user_image_path ON generations(user_id, image_path);
+		CREATE INDEX IF NOT EXISTS idx_user_credits_user_type ON user_credits(user_id, credit_type);
+	`);
 }
