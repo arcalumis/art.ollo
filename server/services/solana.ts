@@ -245,7 +245,8 @@ export function initiatePayment(
 	}
 
 	const pkg = getCreditPackage(packageId);
-	if (!pkg || !pkg.isActive) {
+	// USD-only packs (Stripe) carry price_sol = 0; selling them for SOL would give credits away.
+	if (!pkg || !pkg.isActive || !pkg.availableForSol || !(pkg.priceSol > 0)) {
 		return null;
 	}
 
@@ -385,6 +386,9 @@ function validatePaymentTransaction(tx: FinalizedTx, pending: PendingRow): strin
 
 	const received = (tx.meta?.postBalances[treasuryIndex] ?? 0) - (tx.meta?.preBalances[treasuryIndex] ?? 0);
 	const expectedAmount = pending.amount_lamports;
+	if (!(expectedAmount > 0)) {
+		return "This payment request has no amount";
+	}
 	const tolerance = Math.max(expectedAmount * 0.01, 1000); // 1% or 1000 lamports minimum
 	if (received < expectedAmount - tolerance) {
 		return `Insufficient amount received. Expected ${expectedAmount} lamports, got ${received}`;
