@@ -1,7 +1,10 @@
 import { useWallet } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useAuth } from "../../contexts/AuthContext";
+import { useNavigate } from "react-router-dom";
+import { type LoginRequestPoll, useAuth } from "../../contexts/AuthContext";
+import { useLoginRequestPoll } from "../../hooks/useLoginRequestPoll";
+import { type LoginRequest, clearLoginRequest, saveLoginRequest } from "../../lib/loginRequest";
 import { CheckInboxStep } from "./CheckInboxStep";
 import { EmailStep } from "./EmailStep";
 import { PasswordStep } from "./PasswordStep";
@@ -38,7 +41,10 @@ export function SignIn({
 		requestPasswordReset,
 		requestWalletChallenge,
 		verifyWalletSignature,
+		adoptSession,
+		adoptToken,
 	} = useAuth();
+	const navigate = useNavigate();
 	const { publicKey, signMessage, connected, connecting, disconnect } = useWallet();
 	const { setVisible: openWalletPicker } = useWalletModal();
 
@@ -52,6 +58,32 @@ export function SignIn({
 	const [resendIn, setResendIn] = useState(0);
 	const [walletMode, setWalletMode] = useState<WalletMode>("connect");
 	const [walletUsername, setWalletUsername] = useState("");
+	// The login request behind the link just sent; this device polls it (cross-device sign-in).
+	const [loginRequest, setLoginRequest] = useState<LoginRequest | null>(null);
+
+	const onApproved = useCallback(
+		(session: Extract<LoginRequestPoll, { status: "approved" }>) => {
+			clearLoginRequest();
+			// Same hand-off as the verify page: isNewUser rides in router state, and the pending
+			// prompt (lib/pendingPrompt) saved on this device is picked up by the app.
+			navigate("/", { replace: true, state: { isNewUser: session.isNewUser } });
+			adoptSession(session.token, session.user);
+		},
+		[navigate, adoptSession],
+	);
+	// The link was opened in another tab of this browser and signed in there.
+	const onSignedInOtherTab = useCallback(
+		(token: string) => {
+			clearLoginRequest();
+			adoptToken(token);
+		},
+		[adoptToken],
+	);
+	const wait = useLoginRequestPoll(
+		step === "inbox" ? loginRequest : null,
+		onApproved,
+		onSignedInOtherTab,
+	);
 
 	// Only auto-sign after the user connected a wallet from this screen, not on
 	// the adapter's silent reconnect from an earlier session.
@@ -71,9 +103,11 @@ export function SignIn({
 	const sendLink = async () => {
 		setError("");
 		setLoading(true);
-		const result = await requestMagicLink(email.trim(), rememberMe);
+		const result = await requestMagicLink(email.trim(), rememberMe, loginRequest ?? undefined);
 		setLoading(false);
 		if (result.success) {
+			setLoginRequest(result.request ?? null);
+			if (result.request) saveLoginRequest(result.request);
 			setStep("inbox");
 			setResendIn(RESEND_COOLDOWN_SECONDS);
 		} else {
@@ -171,6 +205,8 @@ export function SignIn({
 			return (
 				<CheckInboxStep
 					email={email.trim()}
+					code={loginRequest?.code ?? ""}
+					wait={wait}
 					resendIn={resendIn}
 					loading={loading}
 					error={error}

@@ -1,5 +1,6 @@
 import { getDb } from "../db";
 import { runAdminMaintenance } from "./admin-maintenance";
+import { cleanupLoginRequests } from "./login-requests";
 import { startReconciliationJob, stopReconciliationJob } from "./replicate-billing";
 import { captureAndGetSolPrice } from "./solana";
 import { deleteGenerationFiles, getUploadsDir, unlinkInside } from "./storage";
@@ -88,6 +89,11 @@ export function cleanupTrashedItems(): void {
 	if (totalCleaned > 0) {
 		console.log(`Cleanup: Permanently purged ${totalCleaned} trashed items`);
 	}
+
+	// Drop cross-device sign-in requests a day past expiry
+	runStep("login requests", () => {
+		cleanupLoginRequests();
+	});
 
 	// Process expired subscription boosts
 	runStep("expire boosts", () => processExpiredBoosts());

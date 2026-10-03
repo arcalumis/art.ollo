@@ -73,6 +73,18 @@ beforeEach(() => {
 	failSends = false;
 });
 
+/**
+ * The magic-link response with its per-request random values (requestId, pollSecret, code)
+ * replaced by their types, so two responses can be compared for shape.
+ */
+function linkResponseShape(body: string): string {
+	const data = JSON.parse(body) as Record<string, unknown>;
+	for (const k of ["requestId", "pollSecret", "code"]) {
+		if (k in data) data[k] = `<${typeof data[k]}:${String(data[k]).length}>`;
+	}
+	return JSON.stringify(data, Object.keys(data).sort());
+}
+
 function hashSha256(s: string): string {
 	return crypto.createHash("sha256").update(s).digest("hex");
 }
@@ -136,12 +148,13 @@ describe("magic-link sign-up", () => {
 		expect(count.n).toBe(1);
 	});
 
-	test("responses for known and unknown emails are byte-identical", async () => {
+	test("responses for known and unknown emails match in shape", async () => {
 		const known = createUser({ email: uniqueEmail("known") });
 		const a = await requestLink(known.email);
 		const b = await requestLink(uniqueEmail("unknown"));
 		expect(a.statusCode).toBe(b.statusCode);
-		expect(a.body).toBe(b.body);
+		expect(linkResponseShape(a.body)).toBe(linkResponseShape(b.body));
+		expect(a.json().requestId).not.toBe(b.json().requestId);
 		expect(a.headers["content-type"]).toBe(b.headers["content-type"]);
 		expect(sent).toHaveLength(2);
 		expect(sent[0].subject).toContain("sign-in");
@@ -170,14 +183,14 @@ describe("magic-link sign-up", () => {
 });
 
 describe("email flood protection", () => {
-	test("per-recipient cap stops the 4th send in an hour, with an identical response", async () => {
+	test("per-recipient cap stops the 4th send in an hour, with a same-shaped response", async () => {
 		const email = uniqueEmail("flood");
 		const responses = [];
 		for (let i = 0; i < 4; i++) responses.push(await requestLink(email));
 		expect(sent).toHaveLength(3);
 		for (const r of responses) {
 			expect(r.statusCode).toBe(200);
-			expect(r.body).toBe(responses[0].body);
+			expect(linkResponseShape(r.body)).toBe(linkResponseShape(responses[0].body));
 		}
 	});
 

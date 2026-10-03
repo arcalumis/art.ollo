@@ -1205,4 +1205,35 @@ function runPhase1BMigrations(db: Database): void {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`);
+
+	// ---- Cross-device sign-in migrations ----
+	// One row per magic-link request. The device that asked (A) polls with a secret only it
+	// holds (stored as a SHA-256 hash); the emailed link (opened on B) can approve the row, and A
+	// then receives a session exactly once (approved -> consumed). token_hash links the row to its
+	// email_tokens / signup_tokens row (token_kind says which); NULL when no link was sent
+	// (unknown-to-us cases like deactivated or over the email cap), so it can never be approved.
+	// No JWT is stored: it is signed at delivery from user_id + remember_me.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS login_requests (
+			id TEXT PRIMARY KEY,
+			email TEXT NOT NULL,
+			code TEXT NOT NULL,
+			poll_secret_hash TEXT NOT NULL,
+			token_hash TEXT DEFAULT NULL,
+			token_kind TEXT DEFAULT NULL CHECK (token_kind IS NULL OR token_kind IN ('magic_link', 'signup')),
+			status TEXT NOT NULL DEFAULT 'pending'
+				CHECK (status IN ('pending', 'approved', 'consumed', 'expired', 'denied')),
+			denied_reason TEXT DEFAULT NULL,
+			user_agent_summary TEXT NOT NULL DEFAULT 'Unknown browser',
+			user_id TEXT DEFAULT NULL,
+			remember_me INTEGER NOT NULL DEFAULT 0,
+			is_new_user INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			approved_at DATETIME DEFAULT NULL,
+			consumed_at DATETIME DEFAULT NULL,
+			expires_at DATETIME NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_login_requests_token_hash ON login_requests(token_hash);
+		CREATE INDEX IF NOT EXISTS idx_login_requests_expires ON login_requests(expires_at);
+	`);
 }

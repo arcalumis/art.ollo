@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { API_BASE } from "../config";
+import type { LoginRequest } from "../lib/loginRequest";
 import type { User } from "../types";
 
 interface WalletChallengeResponse {
@@ -11,7 +12,15 @@ interface WalletChallengeResponse {
 export interface MagicLinkResult {
 	success: boolean;
 	error?: string;
+	/** The login request this device polls for a cross-device sign-in. */
+	request?: LoginRequest;
 }
+
+/** One poll of a login request. "approved" carries the session, exactly once. */
+export type LoginRequestPoll =
+	| { status: "pending" | "consumed" | "expired" | "retry" }
+	| { status: "denied"; reason: "denied" | "elsewhere" }
+	| { status: "approved"; token: string; user: User; isNewUser: boolean };
 
 export interface MagicLinkVerifyResult {
 	success: boolean;
@@ -43,8 +52,15 @@ interface AuthContextType {
 	loading: boolean;
 	login: (username: string, password: string) => Promise<boolean>;
 	loginWithEmail: (email: string, password: string, rememberMe: boolean) => Promise<boolean>;
-	requestMagicLink: (email: string, rememberMe: boolean) => Promise<MagicLinkResult>;
+	/** `replaces`: the request a "Send another link" supersedes. */
+	requestMagicLink: (email: string, rememberMe: boolean, replaces?: LoginRequest) => Promise<MagicLinkResult>;
 	verifyMagicLink: (token: string) => Promise<MagicLinkVerifyResult>;
+	/** Ask whether the emailed link approved this device's request. Doesn't sign in by itself. */
+	pollLoginRequest: (request: LoginRequest) => Promise<LoginRequestPoll>;
+	/** On the device where the link was opened: spend it and sign in here instead. */
+	signInHereFromRequest: (requestId: string, token: string) => Promise<MagicLinkVerifyResult>;
+	/** Store a session the server just issued (e.g. collected by pollLoginRequest). */
+	adoptSession: (token: string, user: User) => void;
 	requestPasswordReset: (email: string) => Promise<boolean>;
 	resetPassword: (token: string, newPassword: string) => Promise<boolean>;
 	verifyResetToken: (token: string) => Promise<{ valid: boolean; email?: string }>;
@@ -142,24 +158,94 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 	}, []);
 
 	// Request a magic link. Also the sign-up path: new emails get a "create your account" link.
-	const requestMagicLink = useCallback(async (email: string, rememberMe: boolean): Promise<MagicLinkResult> => {
+	const requestMagicLink = useCallback(
+		async (email: string, rememberMe: boolean, replaces?: LoginRequest): Promise<MagicLinkResult> => {
+			try {
+				const response = await fetch(`${API_BASE}/api/auth/magic-link`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						email,
+						rememberMe,
+						replaces: replaces ? { requestId: replaces.requestId, pollSecret: replaces.pollSecret } : undefined,
+					}),
+				});
+
+				const data = await response.json().catch(() => ({}));
+				if (response.ok) {
+					const request =
+						typeof data.requestId === "string" && typeof data.pollSecret === "string"
+							? { requestId: data.requestId, pollSecret: data.pollSecret, code: String(data.code ?? "") }
+							: undefined;
+					return { success: true, request };
+				}
+				if (response.status === 429) {
+					return { success: false, error: "Too many requests. Wait a minute, then try again." };
+				}
+				return { success: false, error: data.error || "The sign-in link wasn't sent. Try again in a moment." };
+			} catch {
+				return { success: false, error: "Couldn't reach ollo. Check your connection and try again." };
+			}
+		},
+		[],
+	);
+
+	const adoptSession = useCallback((next: string, nextUser: User) => {
 		try {
-			const response = await fetch(`${API_BASE}/api/auth/magic-link`, {
+			localStorage.setItem("token", next);
+		} catch {
+			// storage blocked: the session lasts for this page only
+		}
+		setToken(next);
+		setUser(nextUser);
+	}, []);
+
+	const pollLoginRequest = useCallback(async (request: LoginRequest): Promise<LoginRequestPoll> => {
+		try {
+			const response = await fetch(`${API_BASE}/api/auth/login-request/status`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ email, rememberMe }),
+				body: JSON.stringify({ requestId: request.requestId, pollSecret: request.pollSecret }),
 			});
-
-			if (response.ok) return { success: true };
-			const data = await response.json().catch(() => ({}));
-			if (response.status === 429) {
-				return { success: false, error: "Too many requests. Wait a minute, then try again." };
+			// Unknown request (or cleaned up): treat it as over.
+			if (response.status === 404) return { status: "expired" };
+			if (!response.ok) return { status: "retry" };
+			const data = await response.json();
+			if (data.status === "approved" && typeof data.token === "string" && data.user) {
+				return { status: "approved", token: data.token, user: data.user, isNewUser: data.isNewUser === true };
 			}
-			return { success: false, error: data.error || "The sign-in link wasn't sent. Try again in a moment." };
+			if (data.status === "denied") {
+				return { status: "denied", reason: data.reason === "elsewhere" ? "elsewhere" : "denied" };
+			}
+			if (data.status === "pending" || data.status === "consumed" || data.status === "expired") {
+				return { status: data.status };
+			}
+			return { status: "retry" };
 		} catch {
-			return { success: false, error: "Couldn't reach ollo. Check your connection and try again." };
+			return { status: "retry" };
 		}
 	}, []);
+
+	const signInHereFromRequest = useCallback(
+		async (requestId: string, magicToken: string): Promise<MagicLinkVerifyResult> => {
+			try {
+				const response = await fetch(`${API_BASE}/api/auth/login-request/here`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ requestId, token: magicToken }),
+				});
+				if (!response.ok) return { success: false, isNewUser: false };
+				const data = await response.json();
+				localStorage.setItem("token", data.token);
+				setToken(data.token);
+				setUser(data.user);
+				return { success: true, isNewUser: data.isNewUser === true };
+			} catch {
+				return { success: false, isNewUser: false };
+			}
+		},
+		[],
+	);
 
 	// Verify magic link token and log in
 	const verifyMagicLink = useCallback(async (magicToken: string): Promise<MagicLinkVerifyResult> => {
@@ -306,6 +392,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 				loginWithEmail,
 				requestMagicLink,
 				verifyMagicLink,
+				pollLoginRequest,
+				signInHereFromRequest,
+				adoptSession,
 				requestPasswordReset,
 				resetPassword,
 				verifyResetToken,
