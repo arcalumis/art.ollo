@@ -5,6 +5,8 @@ import App from "./App.tsx";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { SolanaWalletProvider } from "./contexts/SolanaWalletContext";
 import { API_BASE } from "./config";
+import { Toaster } from "@/components/ui/sonner";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Root element not found");
@@ -24,7 +26,10 @@ createRoot(root).render(
 	<StrictMode>
 		<ThemeProvider>
 			<SolanaWalletProvider network={solanaNetwork} rpcUrl={solanaRpcUrl}>
-				<App />
+				<TooltipProvider>
+					<App />
+					<Toaster position="bottom-center" />
+				</TooltipProvider>
 			</SolanaWalletProvider>
 		</ThemeProvider>
 	</StrictMode>,

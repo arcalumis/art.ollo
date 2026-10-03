@@ -1,127 +1,205 @@
-/* Theme CSS Variables - defaults (overridden by ThemeContext) */
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource/marcellus";
+@import "@fontsource-variable/hanken-grotesk";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * ollo design tokens — "bronze and verdigris".
+ *
+ * Night is the default finish; Plaster follows the system light setting, and
+ * an explicit choice is stored as data-theme on <html>. Bronze is reserved for
+ * the action that spends credits; verdigris marks progress, success and
+ * selection. See .claude/skills/ollo-design/SKILL.md before adding colour.
+ */
 :root {
-	--bg-primary: #1c1c1c;
-	--bg-secondary: #252525;
-	--bg-tertiary: #2f2f2f;
-	--accent: #00ff41;
-	--accent-alt: #ff6b35;
-	--text-primary: #e0e0e0;
-	--text-secondary: #888888;
-	--border: #3a3a3a;
-	--card-bg: rgba(28, 28, 28, 0.9);
-	--card-border: rgba(0, 255, 65, 0.2);
-
-	font-family: "Inter", "SF Pro Display", -apple-system, BlinkMacSystemFont, sans-serif;
-	line-height: 1.5;
-	font-weight: 400;
-
+	--ollo-ground: #111a1c; /* sea slate: page background */
+	--ollo-stone: #1a2427; /* raised surfaces: cards, bars, sheets */
+	--ollo-stone-2: #243134; /* inputs, hovered rows, pills */
+	--ollo-fg: #e4e2da; /* marble: primary text */
+	--ollo-mute: #93a09f; /* weathered: secondary text */
+	--ollo-bronze: #c79c58; /* primary action */
+	--ollo-bronze-ink: #1b1408; /* text on bronze */
+	--ollo-verdigris: #67ab9a; /* progress, success, selection */
+	--ollo-danger: #e07a6a;
+	--ollo-line: rgba(228, 226, 218, 0.12);
+	--ollo-scrim: rgba(10, 16, 18, 0.72);
 	color-scheme: dark;
-	color: var(--text-primary);
+}
 
+@media (prefers-color-scheme: light) {
+	:root:not([data-theme="dark"]) {
+		--ollo-ground: #eceae4;
+		--ollo-stone: #f8f7f3;
+		--ollo-stone-2: #e1ded5;
+		--ollo-fg: #152126;
+		--ollo-mute: #59696a;
+		--ollo-bronze: #8b5f20;
+		--ollo-bronze-ink: #fbf6ec;
+		--ollo-verdigris: #2d6f61;
+		--ollo-danger: #b2402f;
+		--ollo-line: rgba(21, 33, 38, 0.14);
+		--ollo-scrim: rgba(21, 33, 38, 0.55);
+		color-scheme: light;
+	}
+}
+
+:root[data-theme="light"] {
+	--ollo-ground: #eceae4;
+	--ollo-stone: #f8f7f3;
+	--ollo-stone-2: #e1ded5;
+	--ollo-fg: #152126;
+	--ollo-mute: #59696a;
+	--ollo-bronze: #8b5f20;
+	--ollo-bronze-ink: #fbf6ec;
+	--ollo-verdigris: #2d6f61;
+	--ollo-danger: #b2402f;
+	--ollo-line: rgba(21, 33, 38, 0.14);
+	--ollo-scrim: rgba(21, 33, 38, 0.55);
+	color-scheme: light;
+}
+
+:root {
+	/* shadcn/ui semantic tokens, all derived from the ollo palette */
+	--background: var(--ollo-ground);
+	--foreground: var(--ollo-fg);
+	--card: var(--ollo-stone);
+	--card-foreground: var(--ollo-fg);
+	--popover: var(--ollo-stone);
+	--popover-foreground: var(--ollo-fg);
+	--primary: var(--ollo-bronze);
+	--primary-foreground: var(--ollo-bronze-ink);
+	--secondary: var(--ollo-stone-2);
+	--secondary-foreground: var(--ollo-fg);
+	--muted: var(--ollo-stone-2);
+	--muted-foreground: var(--ollo-mute);
+	--ui-accent: var(--ollo-stone-2); /* shadcn's "accent" is a hover fill */
+	--accent-foreground: var(--ollo-fg);
+	--destructive: var(--ollo-danger);
+	--border: var(--ollo-line);
+	--input: var(--ollo-line);
+	--ring: var(--ollo-verdigris);
+	--radius: 0.625rem; /* 10px controls; surfaces use rounded-2xl (16px) */
+
+	/*
+	 * Legacy names used by components written before the design system.
+	 * They map onto the new palette so old screens match until rebuilt.
+	 * Don't use these in new code.
+	 */
+	--bg-primary: var(--ollo-ground);
+	--bg-secondary: var(--ollo-stone);
+	--bg-tertiary: var(--ollo-stone-2);
+	--accent: var(--ollo-bronze);
+	--accent-alt: var(--ollo-verdigris);
+	--text-primary: var(--ollo-fg);
+	--text-secondary: var(--ollo-mute);
+	--card-bg: var(--ollo-stone);
+	--card-border: var(--ollo-line);
+
+	font-family: var(--font-sans);
+	line-height: 1.55;
+	font-weight: 400;
+	color: var(--foreground);
 	font-synthesis: none;
 	text-rendering: optimizeLegibility;
 	-webkit-font-smoothing: antialiased;
 	-moz-osx-font-smoothing: grayscale;
 }
 
-body {
-	margin: 0;
-	min-width: 320px;
-	min-height: 100vh;
-	background: var(--bg-primary);
-	background-attachment: fixed;
-	transition: background-color 0.3s ease;
+@theme inline {
+	--font-sans: "Hanken Grotesk Variable", "Helvetica Neue", Arial, sans-serif;
+	--font-display: "Marcellus", "Trajan Pro", Georgia, serif;
+	--font-heading: var(--font-display);
+
+	--color-ground: var(--ollo-ground);
+	--color-stone: var(--ollo-stone);
+	--color-stone-2: var(--ollo-stone-2);
+	--color-bronze: var(--ollo-bronze);
+	--color-bronze-ink: var(--ollo-bronze-ink);
+	--color-verdigris: var(--ollo-verdigris);
+	--color-scrim: var(--ollo-scrim);
+
+	--color-ring: var(--ring);
+	--color-input: var(--input);
+	--color-border: var(--border);
+	--color-destructive: var(--destructive);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-accent: var(--ui-accent);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-muted: var(--muted);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-secondary: var(--secondary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-primary: var(--primary);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-popover: var(--popover);
+	--color-card-foreground: var(--card-foreground);
+	--color-card: var(--card);
+	--color-foreground: var(--foreground);
+	--color-background: var(--background);
+	--radius-sm: calc(var(--radius) * 0.6);
+	--radius-md: calc(var(--radius) * 0.8);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) * 1.4);
+	--radius-2xl: calc(var(--radius) * 1.6);
 }
 
-#root {
-	min-height: 100vh;
+@layer base {
+	* {
+		@apply border-border outline-ring/50;
+	}
+	body {
+		margin: 0;
+		min-width: 320px;
+		min-height: 100vh;
+		position: relative; /* Base UI popups on iOS Safari */
+		@apply bg-background text-foreground;
+	}
+	#root {
+		min-height: 100vh;
+		isolation: isolate; /* keeps Base UI portals above page content */
+	}
+	h1,
+	h2,
+	h3 {
+		text-wrap: balance;
+	}
+	a {
+		color: inherit;
+		text-decoration: inherit;
+	}
+	:focus-visible {
+		outline: 2px solid var(--ring);
+		outline-offset: 2px;
+	}
+	::selection {
+		background: color-mix(in srgb, var(--ollo-verdigris) 35%, transparent);
+	}
 }
 
-a {
-	font-weight: 500;
-	color: var(--accent);
-	text-decoration: inherit;
-}
-a:hover {
-	color: var(--accent-alt);
-	text-shadow: 0 0 10px color-mix(in srgb, var(--accent-alt) 50%, transparent);
-}
-
-h1 {
-	font-size: 2.5em;
-	line-height: 1.1;
-}
-
-button {
-	border-radius: 6px;
-	border: 1px solid transparent;
-	padding: 0.5em 1em;
-	font-size: 1em;
-	font-weight: 500;
-	font-family: inherit;
-	cursor: pointer;
-	transition: all 0.2s ease;
-}
-
-button:focus,
-button:focus-visible {
-	outline: 2px solid var(--accent);
-	outline-offset: 2px;
-}
-
-/* Scrollbar styling */
+/* Thin scrollbars that take the surface colour */
 ::-webkit-scrollbar {
-	width: 6px;
-	height: 6px;
+	width: 8px;
+	height: 8px;
 }
-
 ::-webkit-scrollbar-track {
-	background: var(--bg-primary);
+	background: transparent;
 }
-
 ::-webkit-scrollbar-thumb {
-	background: var(--border);
-	border-radius: 3px;
+	background: var(--ollo-line);
+	border-radius: 8px;
 }
-
 ::-webkit-scrollbar-thumb:hover {
-	background: var(--accent);
+	background: var(--ollo-mute);
 }
 
-/* Selection styling */
-::selection {
-	background: color-mix(in srgb, var(--accent) 30%, transparent);
-	color: #fff;
-}
-
-/* Scanlines effect for Phosphor theme */
-.scanlines::before {
-	content: "";
-	position: fixed;
-	top: 0;
-	left: 0;
-	width: 100%;
-	height: 100%;
-	pointer-events: none;
-	background: repeating-linear-gradient(
-		0deg,
-		rgba(0, 0, 0, 0.15),
-		rgba(0, 0, 0, 0.15) 1px,
-		transparent 1px,
-		transparent 2px
-	);
-	z-index: 9999;
-}
-
-/* CRT flicker for Phosphor theme */
-.scanlines::after {
-	content: "";
-	position: fixed;
-	top: 0;
-	left: 0;
-	width: 100%;
-	height: 100%;
-	pointer-events: none;
-	background: radial-gradient(ellipse at center, transparent 0%, rgba(0, 0, 0, 0.3) 100%);
-	z-index: 9998;
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		transition-duration: 0.01ms !important;
+	}
 }
