@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { authMiddleware } from "../middleware/auth";
+import { adminMiddleware, authMiddleware } from "../middleware/auth";
 import {
 	cleanupPendingTransactions,
 	getCreditPackages,
@@ -11,6 +11,7 @@ import {
 	initiatePayment,
 	initiateSubscriptionPayment,
 	isSolanaConfigured,
+	isWalletLinkedToOtherUser,
 	verifyAndCreditTransaction,
 	verifyAndCreateSubscription,
 } from "../services/solana";
@@ -63,8 +64,6 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 		"/api/billing/solana/initiate",
 		{ preHandler: authMiddleware },
 		async (request, reply) => {
-			fastify.log.info({ body: request.body }, "Solana initiate request received");
-
 			if (!isSolanaConfigured()) {
 				return reply.status(400).send({ error: "Solana payments not configured" });
 			}
@@ -83,6 +82,12 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 			// Basic wallet address validation
 			if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(walletAddress)) {
 				return reply.status(400).send({ error: "Invalid wallet address format" });
+			}
+
+			// The paying wallet is recorded and must sign the transaction; it can't be a wallet
+			// that belongs to someone else's account.
+			if (isWalletLinkedToOtherUser(userId, walletAddress)) {
+				return reply.status(400).send({ error: "This wallet is linked to a different account" });
 			}
 
 			const payment = initiatePayment(userId, packageId, walletAddress);
@@ -117,8 +122,6 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 			},
 		},
 		async (request, reply) => {
-			fastify.log.info({ body: request.body }, "Solana verify request received");
-
 			if (!isSolanaConfigured()) {
 				fastify.log.warn("Solana payments not configured");
 				return reply.status(400).send({ error: "Solana payments not configured" });
@@ -133,13 +136,13 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 			const { paymentId, signature } = request.body;
 
 			if (!paymentId || !signature) {
-				fastify.log.warn({ paymentId, signature }, "Missing paymentId or signature");
+				request.log.warn("Missing paymentId or signature");
 				return reply.status(400).send({ error: "Missing paymentId or signature" });
 			}
 
 			// Basic signature validation (base58, 87-88 chars)
 			if (!/^[1-9A-HJ-NP-Za-km-z]{87,88}$/.test(signature)) {
-				fastify.log.warn({ signature }, "Invalid signature format");
+				request.log.warn("Invalid signature format");
 				return reply.status(400).send({ error: "Invalid transaction signature format" });
 			}
 
@@ -206,8 +209,6 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 		"/api/billing/solana/subscribe/initiate",
 		{ preHandler: authMiddleware },
 		async (request, reply) => {
-			fastify.log.info({ body: request.body }, "Solana subscription initiate request received");
-
 			if (!isSolanaConfigured()) {
 				return reply.status(400).send({ error: "Solana payments not configured" });
 			}
@@ -226,6 +227,12 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 			// Basic wallet address validation
 			if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(walletAddress)) {
 				return reply.status(400).send({ error: "Invalid wallet address format" });
+			}
+
+			// The paying wallet is recorded and must sign the transaction; it can't be a wallet
+			// that belongs to someone else's account.
+			if (isWalletLinkedToOtherUser(userId, walletAddress)) {
+				return reply.status(400).send({ error: "This wallet is linked to a different account" });
 			}
 
 			const payment = initiateSubscriptionPayment(userId, productId, walletAddress);
@@ -265,8 +272,6 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 			},
 		},
 		async (request, reply) => {
-			fastify.log.info({ body: request.body }, "Solana subscription verify request received");
-
 			if (!isSolanaConfigured()) {
 				fastify.log.warn("Solana payments not configured");
 				return reply.status(400).send({ error: "Solana payments not configured" });
@@ -281,13 +286,13 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 			const { paymentId, signature } = request.body;
 
 			if (!paymentId || !signature) {
-				fastify.log.warn({ paymentId, signature }, "Missing paymentId or signature");
+				request.log.warn("Missing paymentId or signature");
 				return reply.status(400).send({ error: "Missing paymentId or signature" });
 			}
 
 			// Basic signature validation (base58, 87-88 chars)
 			if (!/^[1-9A-HJ-NP-Za-km-z]{87,88}$/.test(signature)) {
-				fastify.log.warn({ signature }, "Invalid signature format");
+				request.log.warn("Invalid signature format");
 				return reply.status(400).send({ error: "Invalid transaction signature format" });
 			}
 
@@ -312,8 +317,8 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 		},
 	);
 
-	// Cleanup endpoint (can be called by cron or admin)
-	fastify.post("/api/billing/solana/cleanup", async () => {
+	// Cleanup endpoint (admin only): marks stale pending payments as expired
+	fastify.post("/api/billing/solana/cleanup", { preHandler: adminMiddleware }, async () => {
 		cleanupPendingTransactions();
 		return { success: true };
 	});
