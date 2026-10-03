@@ -22,9 +22,13 @@ const DEFAULT_CREDIT_COST = 2;
 /**
  * Credits for ONE output of `modelId` at `tier` with `refs` reference images.
  *
- * Admin overrides in model_credit_costs win: a `<model>:<tier>` row overrides
- * that tier, a plain `<model>` row overrides every tier. Otherwise the catalog
- * formula. Unknown models cost the default (2).
+ * Admin overrides in model_credit_costs set a price with no reference images:
+ * a `<model>:<tier>` row for that tier, a plain `<model>` row for the model's
+ * DEFAULT tier. Other tiers and reference images keep the catalog formula's
+ * proportions relative to the overridden price (rounded up), so an override
+ * never flattens tier or reference pricing. Rows that aren't positive integers
+ * are ignored (logged). Without an override: the catalog formula. Unknown
+ * models cost the default (2), or their plain override.
  */
 export function getModelCreditCost(modelId: string, tier?: Tier, refs = 0): number {
 	return creditCostResolver()(modelId, tier, refs);
@@ -35,21 +39,57 @@ export function getModelCreditCost(modelId: string, tier?: Tier, refs = 0): numb
  * function (for callers pricing many model/tier/ref combinations at once).
  */
 export function creditCostResolver(): (modelId: string, tier?: Tier, refs?: number) => number {
+	const overrides = loadValidOverrides();
+	return (modelId, tier, refs = 0) => {
+		const model = getCatalogModel(modelId);
+		const resolvedTier = model ? resolveTier(model, tier) : tier;
+		if (!model || !resolvedTier) return overrides.get(modelId) ?? DEFAULT_CREDIT_COST;
+
+		const formula = catalogCredits(model, resolvedTier, refs);
+		const tierOverride = overrides.get(`${modelId}:${resolvedTier}`);
+		if (tierOverride !== undefined) {
+			return scaleOverride(tierOverride, formula, catalogCredits(model, resolvedTier, 0));
+		}
+		const plainOverride = overrides.get(modelId);
+		if (plainOverride !== undefined) {
+			return scaleOverride(plainOverride, formula, catalogCredits(model, model.defaultTier, 0));
+		}
+		return formula;
+	};
+}
+
+/** `override` is the price where the formula says `base`; keep the formula's ratio elsewhere. */
+function scaleOverride(override: number, formula: number, base: number): number {
+	if (!(base > 0) || formula === base) return override;
+	return Math.max(1, Math.ceil((override * formula) / base));
+}
+
+const loggedBadOverrides = new Set<string>();
+
+/**
+ * Override rows that are positive integers. Anything else (0, negative, fractional) would make
+ * generation free or make reserveCredits throw, so it is ignored and logged once per value.
+ */
+function loadValidOverrides(): Map<string, number> {
 	const rows = getDb().prepare("SELECT model_id, credit_cost FROM model_credit_costs").all() as {
 		model_id: string;
 		credit_cost: number;
 	}[];
-	const overrides = new Map(rows.map((r) => [r.model_id, r.credit_cost]));
-	return (modelId, tier, refs = 0) => {
-		const model = getCatalogModel(modelId);
-		const resolvedTier = model ? resolveTier(model, tier) : tier;
-		const override =
-			(resolvedTier !== undefined ? overrides.get(`${modelId}:${resolvedTier}`) : undefined) ??
-			overrides.get(modelId);
-		if (override !== undefined) return override;
-		if (!model || !resolvedTier) return DEFAULT_CREDIT_COST;
-		return catalogCredits(model, resolvedTier, refs);
-	};
+	const valid = new Map<string, number>();
+	for (const r of rows) {
+		if (Number.isInteger(r.credit_cost) && r.credit_cost > 0) {
+			valid.set(r.model_id, r.credit_cost);
+			continue;
+		}
+		const key = `${r.model_id}=${r.credit_cost}`;
+		if (!loggedBadOverrides.has(key)) {
+			loggedBadOverrides.add(key);
+			console.warn(
+				`[credits] Ignoring model_credit_costs override ${r.model_id} = ${r.credit_cost}: credit costs must be positive integers`,
+			);
+		}
+	}
+	return valid;
 }
 
 export function getAllModelCreditCosts(): {
@@ -57,12 +97,7 @@ export function getAllModelCreditCosts(): {
 	creditCost: number;
 	isOverride: boolean;
 }[] {
-	const db = getDb();
-	const overrides = db.prepare("SELECT model_id, credit_cost FROM model_credit_costs").all() as {
-		model_id: string;
-		credit_cost: number;
-	}[];
-	const overrideMap = new Map(overrides.map((r) => [r.model_id, r.credit_cost]));
+	const overrideMap = loadValidOverrides();
 
 	// Merge all known models from the hardcoded map
 	// Every model ollo runs now, plus any id with an override row.

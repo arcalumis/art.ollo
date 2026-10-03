@@ -2,7 +2,7 @@
 // input mapping, the allowed_models migration and /api/models. Pure where
 // possible; nothing touches the network.
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { getDb } from "../server/db";
 import {
 	PHASE35_LINEUP,
@@ -28,9 +28,10 @@ import {
 import {
 	deleteModelCreditCost,
 	getModelCreditCost,
+	reserveCredits,
 	setModelCreditCost,
 } from "../server/services/usage";
-import { getApp } from "./helpers";
+import { createUser, getApp } from "./helpers";
 
 const model = (id: string) => {
 	const m = getCatalogModel(id);
@@ -138,6 +139,43 @@ describe("credit rule", () => {
 		}
 		expect(getModelCreditCost(id, "draft")).toBe(3);
 		expect(getModelCreditCost("nobody/unknown")).toBe(2);
+	});
+
+	test("a plain override prices the default tier and keeps tier and reference proportions", () => {
+		const id = "ideogram-ai/ideogram-4-5"; // default standard: 3; max: 5 (10 with 2 refs)
+		setModelCreditCost(id, 6);
+		try {
+			expect(getModelCreditCost(id)).toBe(6);
+			expect(getModelCreditCost(id, "standard")).toBe(6);
+			expect(getModelCreditCost(id, "max")).toBe(10);
+			expect(getModelCreditCost(id, "max", 2)).toBe(20);
+			expect(getModelCreditCost(id, "draft")).toBe(4);
+			// A tier override sets that tier's no-reference price; references still scale it
+			setModelCreditCost(`${id}:max`, 8);
+			expect(getModelCreditCost(id, "max")).toBe(8);
+			expect(getModelCreditCost(id, "max", 2)).toBe(16);
+		} finally {
+			deleteModelCreditCost(id);
+			deleteModelCreditCost(`${id}:max`);
+		}
+	});
+
+	test("overrides that aren't positive integers are ignored, never free or throwing", () => {
+		const id = "ideogram-ai/ideogram-4-5";
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			for (const bad of [0, -3, 2.5]) {
+				setModelCreditCost(id, bad);
+				expect(getModelCreditCost(id, "standard")).toBe(3);
+				expect(getModelCreditCost(id, "max", 2)).toBe(10);
+			}
+			expect(warn).toHaveBeenCalled();
+			const user = createUser({ credits: 10 });
+			expect(() => reserveCredits(user.id, getModelCreditCost(id), "test")).not.toThrow();
+		} finally {
+			deleteModelCreditCost(id);
+			warn.mockRestore();
+		}
 	});
 });
 
