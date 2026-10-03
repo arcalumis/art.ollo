@@ -41,9 +41,9 @@ function linkCustomer(userId: string): string {
 	return customer;
 }
 
-async function sendEvent(type: string, object: Record<string, unknown>, id = rid("evt")) {
+async function sendEvent(type: string, object: Record<string, unknown>, id = rid("evt"), created?: number) {
 	const app = await getApp();
-	const payload = JSON.stringify({ id, object: "event", type, data: { object } });
+	const payload = JSON.stringify({ id, object: "event", type, data: { object }, ...(created ? { created } : {}) });
 	const signature = await stripeService.stripe!.webhooks.generateTestHeaderStringAsync({ payload, secret: WEBHOOK_SECRET });
 	return app.inject({
 		method: "POST",
@@ -419,5 +419,108 @@ describe("billing checkout guards", () => {
 		});
 		expect(res.statusCode).toBe(409);
 		expect(res.json().usePortal).toBe(true);
+	});
+
+	function checkout(user: ReturnType<typeof createUser>, priceId: string) {
+		return getApp().then((app) =>
+			app.inject({
+				method: "POST",
+				url: "/api/billing/checkout",
+				headers: authHeader(user),
+				payload: { priceId, successUrl: "http://localhost:5173/ok", cancelUrl: "http://localhost:5173/no" },
+			}),
+		);
+	}
+
+	test("asks Stripe too: a live subscription not yet seen locally blocks a second checkout", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const product = makeProduct();
+		const s = stripeService.stripe!;
+		const list = spyOn(s.subscriptions, "list").mockResolvedValue({ data: [{ id: "sub_x", status: "past_due" }] } as never);
+		const create = spyOn(s.checkout.sessions, "create").mockResolvedValue({ url: "https://checkout.example/x" } as never);
+		try {
+			const res = await checkout(user, product.priceId);
+			expect(res.statusCode).toBe(409);
+			expect(res.json().usePortal).toBe(true);
+			expect(list).toHaveBeenCalledWith({ customer, status: "all", limit: 100 });
+			expect(create).not.toHaveBeenCalled();
+		} finally {
+			list.mockRestore();
+			create.mockRestore();
+		}
+	});
+
+	test("only ended subscriptions in Stripe: checkout proceeds and other open subscription checkouts are expired", async () => {
+		const user = createUser();
+		linkCustomer(user.id);
+		const product = makeProduct();
+		const s = stripeService.stripe!;
+		const list = spyOn(s.subscriptions, "list").mockResolvedValue({
+			data: [{ id: "sub_old", status: "canceled" }, { id: "sub_inc", status: "incomplete_expired" }],
+		} as never);
+		const openSessions = spyOn(s.checkout.sessions, "list").mockResolvedValue({
+			data: [
+				{ id: "cs_tab1", mode: "subscription" },
+				{ id: "cs_pack", mode: "payment" },
+			],
+		} as never);
+		const expire = spyOn(s.checkout.sessions, "expire").mockResolvedValue({} as never);
+		const create = spyOn(s.checkout.sessions, "create").mockResolvedValue({ url: "https://checkout.example/new" } as never);
+		try {
+			const res = await checkout(user, product.priceId);
+			expect(res.statusCode).toBe(200);
+			expect(res.json().url).toBe("https://checkout.example/new");
+			expect(expire.mock.calls.map((c) => c[0])).toEqual(["cs_tab1"]);
+			expect(create).toHaveBeenCalledTimes(1);
+		} finally {
+			list.mockRestore();
+			openSessions.mockRestore();
+			expire.mockRestore();
+			create.mockRestore();
+		}
+	});
+});
+
+describe("out-of-order subscription events", () => {
+	function status(sub: string): string | undefined {
+		const row = getDb().prepare("SELECT status FROM user_subscriptions WHERE stripe_subscription_id = ?").get(sub) as {
+			status: string;
+		} | null;
+		return row?.status;
+	}
+
+	test("an older subscription event delivered late doesn't overwrite newer state", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const product = makeProduct();
+		const sub = rid("sub");
+		const t = Math.floor(Date.now() / 1000);
+		const obj = (s: string) => subscriptionObject({ sub, customer, priceId: product.priceId, status: s });
+
+		expect((await sendEvent("customer.subscription.updated", obj("active"), rid("evt"), t)).statusCode).toBe(200);
+		// An older 'incomplete' arrives after the newer 'active': ignored, but acknowledged
+		const stale = rid("evt");
+		expect((await sendEvent("customer.subscription.updated", obj("incomplete"), stale, t - 60)).statusCode).toBe(200);
+		expect(isProcessed(stale)).toBe(true);
+		expect(status(sub)).toBe("active");
+
+		// A late, older payment failure doesn't flip it to past_due either
+		await sendEvent(
+			"invoice.payment_failed",
+			{ id: rid("in"), object: "invoice", customer, subscription: sub, payment_intent: rid("pi"), amount_due: 1500 },
+			rid("evt"),
+			t - 30,
+		);
+		expect(status(sub)).toBe("active");
+
+		// Newer events still apply
+		expect((await sendEvent("customer.subscription.updated", obj("past_due"), rid("evt"), t + 60)).statusCode).toBe(200);
+		expect(status(sub)).toBe("past_due");
+		expect((await sendEvent("customer.subscription.deleted", obj("canceled"), rid("evt"), t + 120)).statusCode).toBe(200);
+		expect(status(sub)).toBe("canceled");
+		// A stale 'active' after deletion can't resurrect it
+		await sendEvent("customer.subscription.updated", obj("active"), rid("evt"), t + 90);
+		expect(status(sub)).toBe("canceled");
 	});
 });

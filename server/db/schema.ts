@@ -1146,4 +1146,13 @@ function runPhase1BMigrations(db: Database): void {
 	`);
 	// Per-IP daily cap on auth email.
 	db.exec("CREATE INDEX IF NOT EXISTS idx_email_send_log_ip ON email_send_log(ip, created_at)");
+	// Newest Stripe event applied per subscription, so a late-delivered older event is ignored.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS stripe_subscription_event_state (
+			stripe_subscription_id TEXT PRIMARY KEY,
+			last_event_created INTEGER NOT NULL,
+			last_event_id TEXT NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`);
 }

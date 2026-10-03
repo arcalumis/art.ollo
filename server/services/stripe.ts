@@ -108,6 +108,8 @@ export async function createCheckoutSession(
 
 	if (!customerId) return null;
 
+	await expireOpenSubscriptionCheckouts(customerId);
+
 	const session = await stripe.checkout.sessions.create({
 		customer: customerId,
 		mode: "subscription",
@@ -433,6 +435,75 @@ export function syncStripeSubscription(
 	}
 
 	return { subscriptionId, bonusGranted };
+}
+
+/** Stripe statuses that mean the customer already has a subscription to manage, not a new one. */
+const LIVE_REMOTE_STATUSES = new Set(["active", "trialing", "past_due"]);
+
+/**
+ * Ask Stripe (not our possibly-lagging local rows) whether the user's customer already has a
+ * live subscription: a checkout completed in another tab may not have reached our webhook yet.
+ */
+export async function hasLiveSubscriptionInStripe(userId: string): Promise<boolean> {
+	if (!stripe) return false;
+	const customerId = getStripeCustomerId(userId);
+	if (!customerId) return false;
+	const subscriptions = await stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 });
+	return subscriptions.data.some((s) => LIVE_REMOTE_STATUSES.has(s.status));
+}
+
+/**
+ * Expire the customer's other open subscription Checkout Sessions, so two tabs can't both be
+ * completed into two subscriptions. Best effort: a failure here never blocks the new checkout.
+ */
+async function expireOpenSubscriptionCheckouts(customerId: string): Promise<void> {
+	if (!stripe) return;
+	try {
+		const open = await stripe.checkout.sessions.list({ customer: customerId, status: "open", limit: 100 });
+		for (const session of open.data) {
+			if (session.mode === "subscription") await stripe.checkout.sessions.expire(session.id);
+		}
+	} catch (err) {
+		console.warn("[stripe] Could not expire open checkout sessions:", err instanceof Error ? err.message : err);
+	}
+}
+
+/**
+ * Last Stripe event (by its `created` time) applied to a subscription. Events for one
+ * subscription can arrive out of order; an older one must not overwrite newer state.
+ */
+export function lastAppliedSubscriptionEvent(stripeSubscriptionId: string): number | null {
+	const row = getDb()
+		.prepare("SELECT last_event_created FROM stripe_subscription_event_state WHERE stripe_subscription_id = ?")
+		.get(stripeSubscriptionId) as { last_event_created: number } | null;
+	return row?.last_event_created ?? null;
+}
+
+/** True when an event created at `created` is older than what was already applied. */
+export function isStaleSubscriptionEvent(stripeSubscriptionId: string, created: number | undefined): boolean {
+	if (!created) return false;
+	const last = lastAppliedSubscriptionEvent(stripeSubscriptionId);
+	// Stripe timestamps are whole seconds, so equal times are applied (in arrival order).
+	return last !== null && created < last;
+}
+
+export function recordAppliedSubscriptionEvent(
+	stripeSubscriptionId: string,
+	eventId: string,
+	created: number | undefined,
+): void {
+	if (!created) return;
+	getDb()
+		.prepare(`
+			INSERT INTO stripe_subscription_event_state (stripe_subscription_id, last_event_created, last_event_id)
+			VALUES (?, ?, ?)
+			ON CONFLICT(stripe_subscription_id) DO UPDATE SET
+				last_event_created = excluded.last_event_created,
+				last_event_id = excluded.last_event_id,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE excluded.last_event_created >= stripe_subscription_event_state.last_event_created
+		`)
+		.run(stripeSubscriptionId, created, eventId);
 }
 
 /** Does the user already have a live Stripe subscription (should manage it in the portal)? */

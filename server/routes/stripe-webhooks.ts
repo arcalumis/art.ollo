@@ -6,7 +6,9 @@ import {
 	STRIPE_WEBHOOK_SECRET,
 	getProductByStripePriceId,
 	getUserIdFromStripeCustomer,
+	isStaleSubscriptionEvent,
 	isStripeConfigured,
+	recordAppliedSubscriptionEvent,
 	recordPayment,
 	recordRevenueEvent,
 	stripe,
@@ -108,15 +110,22 @@ export function processStripeEvent(event: Stripe.Event): "processed" | "duplicat
 				handleInvoicePaid(event.data.object as Stripe.Invoice, outbox);
 				break;
 			case "invoice.payment_failed":
-				handleInvoicePaymentFailed(event.data.object as Stripe.Invoice, outbox);
+				handleInvoicePaymentFailed(event.data.object as Stripe.Invoice, outbox, event.created);
 				break;
 			case "customer.subscription.created":
 			case "customer.subscription.updated":
-				handleSubscriptionChange(event.data.object as Stripe.Subscription);
+			case "customer.subscription.deleted": {
+				const subscription = event.data.object as Stripe.Subscription;
+				// Events can arrive out of order; never let an older one overwrite newer state.
+				if (isStaleSubscriptionEvent(subscription.id, event.created)) {
+					console.log(`Ignoring stale ${event.type} ${event.id} for ${subscription.id}`);
+					break;
+				}
+				if (event.type === "customer.subscription.deleted") handleSubscriptionDeleted(subscription);
+				else handleSubscriptionChange(subscription);
+				recordAppliedSubscriptionEvent(subscription.id, event.id, event.created);
 				break;
-			case "customer.subscription.deleted":
-				handleSubscriptionDeleted(event.data.object as Stripe.Subscription);
-				break;
+			}
 			case "checkout.session.completed":
 			case "checkout.session.async_payment_succeeded":
 				handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session, outbox);
@@ -228,7 +237,7 @@ function handleInvoicePaid(invoice: Stripe.Invoice, outbox: Outbox): void {
 	}
 }
 
-function handleInvoicePaymentFailed(invoice: Stripe.Invoice, outbox: Outbox): void {
+function handleInvoicePaymentFailed(invoice: Stripe.Invoice, outbox: Outbox, eventCreated?: number): void {
 	const customer = customerId(invoice.customer as string | null);
 	if (!customer) return;
 
@@ -251,7 +260,8 @@ function handleInvoicePaymentFailed(invoice: Stripe.Invoice, outbox: Outbox): vo
 	// Only the subscription this invoice belongs to becomes past_due (never Free/admin rows).
 	// customer.subscription.updated carries the same status change and is handled too.
 	const subscriptionId = invoiceSubscriptionId(invoice);
-	if (subscriptionId) {
+	// A late failure (older than the last subscription event applied) must not undo a recovery.
+	if (subscriptionId && !isStaleSubscriptionEvent(subscriptionId, eventCreated)) {
 		getDb()
 			.prepare(
 				"UPDATE user_subscriptions SET status = 'past_due' WHERE stripe_subscription_id = ? AND status IN ('active', 'trialing')",
