@@ -4,6 +4,21 @@ import path from "node:path";
 import Replicate from "replicate";
 import sharp from "sharp";
 import type { Model } from "../../src/types";
+import {
+	CATALOG,
+	type CatalogModel,
+	MATCH_INPUT,
+	PROMPT_ENHANCEMENT_COST,
+	REF_MAX_PIXELS,
+	type Tier,
+	getCatalogModel,
+	priceOfOutput,
+	resolveTier,
+	slugFor,
+	snapDimensions,
+	snapRatio,
+	tierFromResolution,
+} from "./model-catalog";
 import { getImagesDir, getUploadsDir, resolveInside } from "./storage";
 
 // Maximum file size for Replicate inputs (5MB)
@@ -12,6 +27,8 @@ const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 const MAX_DIMENSION = 2048;
 // Maximum size of a single downloaded output image (guards memory)
 const MAX_OUTPUT_BYTES = 50 * 1024 * 1024;
+// Inputs above this many megapixels go to the large-image upscaler.
+const CRISP_UPSCALE_MAX_MP = 4;
 
 // Default Replicate client uses REPLICATE_API_TOKEN from env
 const defaultReplicate = new Replicate();
@@ -75,369 +92,133 @@ function getReplicateClient(apiKey?: string): Replicate {
 	return defaultReplicate;
 }
 
+// ---- Catalog views for older consumers (admin) -------------------------------------
+
 export interface ExtendedModel extends Model {
 	supportsImageInput: boolean;
 	maxImages?: number;
-	supportsNumOutputs?: boolean; // Can generate multiple images in one call
-	supportsSeed?: boolean; // Supports seed parameter for reproducibility
-	isVariationModel?: boolean; // Model designed for image variations (Redux)
-	isEditModel?: boolean; // Model designed for image editing (Kontext)
-	category?: "fast" | "quality" | "ultra" | "variation" | "edit" | "external";
+	category?: string;
+	hidden?: boolean;
+	kind?: "image" | "tool";
+}
+
+function toExtendedModel(m: CatalogModel): ExtendedModel {
+	return {
+		id: m.id,
+		name: m.name,
+		description: m.description,
+		supportsImageInput: m.refs.max > 0,
+		maxImages: m.refs.max,
+		category: m.group,
+		hidden: m.hidden,
+		kind: m.kind,
+	};
+}
+
+/** Every model ollo runs now (picker models and tools; no dropped models). */
+export const MODELS: ExtendedModel[] = CATALOG.filter((m) => !m.hidden).map(toExtendedModel);
+
+export function getModels(): ExtendedModel[] {
+	return MODELS;
 }
 
 /**
- * Model pricing configuration based on actual Replicate/BFL pricing (Jan 2025)
- * Sources:
- * - https://replicate.com/pricing
- * - https://docs.bfl.ml/quick_start/pricing
- *
- * Pricing types:
- * - "per_image": Fixed cost per image generated
- * - "per_megapixel": Cost scales with output resolution (FLUX 2 models)
- */
-interface ModelPricing {
-	type: "per_image" | "per_megapixel";
-	baseCost: number; // Cost per image or per megapixel
-	inputMpCost?: number; // Additional cost per input megapixel (for image editing)
-}
-
-const MODEL_PRICING: Record<string, ModelPricing> = {
-	// FLUX.1 Series - Fixed per-image pricing
-	"black-forest-labs/flux-schnell": { type: "per_image", baseCost: 0.003 },
-	"black-forest-labs/flux-dev": { type: "per_image", baseCost: 0.025 },
-
-	// FLUX 1.1 Series - Fixed per-image pricing
-	"black-forest-labs/flux-1.1-pro": { type: "per_image", baseCost: 0.04 },
-	"black-forest-labs/flux-1.1-pro-ultra": { type: "per_image", baseCost: 0.06 },
-
-	// FLUX 2 Series - Megapixel-based pricing
-	// FLUX.2 [pro]: $0.015 + $0.015 per input/output megapixel
-	"black-forest-labs/flux-2-pro": { type: "per_megapixel", baseCost: 0.015, inputMpCost: 0.015 },
-	// FLUX.2 [dev]: $0.012 per megapixel
-	"black-forest-labs/flux-2-dev": { type: "per_megapixel", baseCost: 0.012, inputMpCost: 0.012 },
-
-	// FLUX Redux - Actual costs from Replicate billing
-	"black-forest-labs/flux-redux-schnell": { type: "per_image", baseCost: 0.025 },
-	"black-forest-labs/flux-redux-dev": { type: "per_image", baseCost: 0.10 },
-
-	// FLUX Kontext - Fixed per-image pricing
-	"black-forest-labs/flux-kontext-pro": { type: "per_image", baseCost: 0.04 },
-
-	// External models - Actual costs from Replicate billing
-	// Nano Banana Pro: $0.15-$0.30 depending on resolution, using $0.20 as average
-	"google/nano-banana-pro": { type: "per_image", baseCost: 0.20 },
-
-	// LLM models for prompt enhancement
-	"meta/meta-llama-3-70b-instruct": { type: "per_image", baseCost: 0.01 },
-};
-
-// Default fallback pricing (uses time-based estimate if model not configured)
-const DEFAULT_PRICING: ModelPricing = { type: "per_image", baseCost: 0.025 };
-
-/**
- * Convert aspect ratio and resolution to width/height dimensions
- * Used for models that don't support aspect_ratio parameter directly
- */
-function aspectRatioToWidthHeight(aspectRatio: string, resolution: string): { width: number; height: number } {
-	// Parse aspect ratio (e.g., "16:9", "4:3", "1:1")
-	const [wRatio, hRatio] = aspectRatio.split(":").map(Number);
-	if (!wRatio || !hRatio) {
-		return { width: 1024, height: 1024 }; // Default fallback
-	}
-
-	// Base dimensions for each resolution
-	// 1K ≈ 1MP, 2K ≈ 2MP, 4K ≈ 8MP
-	let targetPixels: number;
-	switch (resolution) {
-		case "4K":
-			targetPixels = 8_000_000; // ~8MP
-			break;
-		case "2K":
-			targetPixels = 2_000_000; // ~2MP
-			break;
-		case "1K":
-		default:
-			targetPixels = 1_000_000; // ~1MP
-			break;
-	}
-
-	// Calculate dimensions maintaining aspect ratio
-	// width * height = targetPixels
-	// width / height = wRatio / hRatio
-	// Therefore: width = sqrt(targetPixels * wRatio / hRatio)
-	const width = Math.round(Math.sqrt(targetPixels * wRatio / hRatio));
-	const height = Math.round(width * hRatio / wRatio);
-
-	// Round to nearest 8 (some models require this)
-	const roundedWidth = Math.round(width / 8) * 8;
-	const roundedHeight = Math.round(height / 8) * 8;
-
-	return { width: roundedWidth, height: roundedHeight };
-}
-
-/**
- * Calculate megapixels from resolution string or dimensions
- */
-function calculateMegapixels(resolution?: string, width?: number, height?: number): number {
-	// Parse resolution strings like "1 MP", "2 MP", "4 MP", "1K", "2K", "4K"
-	if (resolution) {
-		const mpMatch = resolution.match(/(\d+)\s*MP/i);
-		if (mpMatch) return Number.parseFloat(mpMatch[1]);
-
-		const kMatch = resolution.match(/(\d+)K/i);
-		if (kMatch) {
-			// Approximate: 1K ≈ 1MP, 2K ≈ 2MP, 4K ≈ 8MP
-			const k = Number.parseInt(kMatch[1]);
-			if (k === 1) return 1;
-			if (k === 2) return 2;
-			if (k === 4) return 8;
-		}
-	}
-
-	// Calculate from dimensions
-	if (width && height) {
-		return (width * height) / 1_000_000;
-	}
-
-	// Default to 1 megapixel (1024x1024)
-	return 1;
-}
-
-/**
- * Calculate the cost for a generation based on model and parameters
+ * Official cost of a generation (all outputs). Kept for the admin cost
+ * recalculation: `resolution` maps onto a tier, width/height give the output
+ * megapixels for per-MP models.
  */
 export function calculateGenerationCost(
 	model: string,
 	options: {
 		numOutputs?: number;
 		resolution?: string;
+		tier?: Tier;
 		width?: number;
 		height?: number;
-		hasImageInput?: boolean;
 		inputImageCount?: number;
+		hasImageInput?: boolean;
 	} = {},
 ): number {
-	const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
-	const numOutputs = options.numOutputs || 1;
-
-	if (pricing.type === "per_image") {
-		return pricing.baseCost * numOutputs;
-	}
-
-	// Megapixel-based pricing (FLUX 2 models)
-	const outputMp = calculateMegapixels(options.resolution, options.width, options.height);
-	let cost = pricing.baseCost * outputMp * numOutputs;
-
-	// Add input megapixel cost if applicable
-	if (options.hasImageInput && pricing.inputMpCost) {
-		const inputCount = options.inputImageCount || 1;
-		// Assume input images are ~1MP average
-		cost += pricing.inputMpCost * inputCount;
-	}
-
-	return cost;
+	const m = getCatalogModel(model);
+	if (!m) return 0.025 * (options.numOutputs || 1);
+	const tier = resolveTier(m, options.tier ?? tierFromResolution(options.resolution));
+	const outputMp =
+		options.width && options.height ? (options.width * options.height) / 1_000_000 : undefined;
+	const refs = options.inputImageCount ?? (options.hasImageInput ? 1 : 0);
+	return priceOfOutput(m, tier, { outputMp, refs }) * (options.numOutputs || 1);
 }
 
-export const MODELS: ExtendedModel[] = [
-	// === FLUX.1 Series (Fast) ===
-	{
-		id: "black-forest-labs/flux-schnell",
-		name: "FLUX.1 Schnell",
-		description: "Fastest FLUX model, great for quick iterations (4 steps)",
-		defaultParams: { num_inference_steps: 4 },
-		supportsImageInput: false,
-		supportsNumOutputs: true, // 1-4 outputs per call
-		supportsSeed: true,
-		category: "fast",
-	},
-	{
-		id: "black-forest-labs/flux-dev",
-		name: "FLUX.1 Dev",
-		description: "Development model with excellent quality (28 steps)",
-		defaultParams: { num_inference_steps: 28 },
-		supportsImageInput: false,
-		supportsNumOutputs: true, // 1-4 outputs per call
-		supportsSeed: true,
-		category: "quality",
-	},
-
-	// === FLUX 1.1 Series (Quality) ===
-	{
-		id: "black-forest-labs/flux-1.1-pro",
-		name: "FLUX 1.1 Pro",
-		description: "High quality FLUX model with excellent prompt adherence",
-		defaultParams: {},
-		supportsImageInput: false,
-		supportsNumOutputs: false,
-		supportsSeed: true,
-		category: "quality",
-	},
-	{
-		id: "black-forest-labs/flux-1.1-pro-ultra",
-		name: "FLUX 1.1 Pro Ultra",
-		description: "Up to 4MP images with raw mode for natural look",
-		defaultParams: { raw: false },
-		supportsImageInput: true, // Supports image_prompt for Redux-style blending
-		maxImages: 1,
-		supportsNumOutputs: false,
-		supportsSeed: true,
-		category: "ultra",
-	},
-
-	// === FLUX 2 Series (Latest) ===
-	{
-		id: "black-forest-labs/flux-2-pro",
-		name: "FLUX 2 Pro",
-		description: "Latest high-quality model with up to 8 reference images, 4MP output",
-		defaultParams: { resolution: "2 MP" },
-		supportsImageInput: true,
-		maxImages: 8,
-		supportsNumOutputs: false,
-		supportsSeed: true,
-		category: "quality",
-	},
-	{
-		id: "black-forest-labs/flux-2-dev",
-		name: "FLUX 2 Dev",
-		description: "Fast FLUX 2 with up to 5 reference images",
-		defaultParams: { go_fast: true },
-		supportsImageInput: true,
-		maxImages: 5,
-		supportsNumOutputs: false,
-		supportsSeed: true,
-		category: "fast",
-	},
-
-	// === FLUX Redux (Variations) ===
-	{
-		id: "black-forest-labs/flux-redux-schnell",
-		name: "FLUX Redux Schnell",
-		description: "Fast image variations - generates similar images from a reference",
-		defaultParams: { num_inference_steps: 4 },
-		supportsImageInput: true, // Required: redux_image
-		maxImages: 1,
-		supportsNumOutputs: true, // 1-4 outputs per call
-		supportsSeed: true,
-		isVariationModel: true,
-		category: "variation",
-	},
-	{
-		id: "black-forest-labs/flux-redux-dev",
-		name: "FLUX Redux Dev",
-		description: "High-quality image variations with more control",
-		defaultParams: { num_inference_steps: 28, guidance: 3 },
-		supportsImageInput: true, // Required: redux_image
-		maxImages: 1,
-		supportsNumOutputs: true, // 1-4 outputs per call
-		supportsSeed: true,
-		isVariationModel: true,
-		category: "variation",
-	},
-
-	// === FLUX Kontext (Editing) ===
-	{
-		id: "black-forest-labs/flux-kontext-pro",
-		name: "FLUX Kontext Pro",
-		description: "Text-based image editing - describe changes in natural language",
-		defaultParams: {},
-		supportsImageInput: true, // input_image for editing
-		maxImages: 1,
-		supportsNumOutputs: false,
-		supportsSeed: true,
-		isEditModel: true,
-		category: "edit",
-	},
-
-	// === External Models ===
-	{
-		id: "google/nano-banana-pro",
-		name: "Nano Banana Pro",
-		description: "Google's image gen/edit with text, real-time info, up to 14 input images",
-		defaultParams: {
-			resolution: "2K",
-			aspect_ratio: "4:3",
-			output_format: "png",
-			safety_filter_level: "block_only_high",
-		},
-		supportsImageInput: true,
-		maxImages: 14,
-		supportsNumOutputs: false,
-		supportsSeed: false,
-		category: "external",
-	},
-];
-
-export interface GenerationResult {
-	id: string;
-	replicateId: string;
-	imagePath: string;
-	imageUrl: string;
-	cost: number;
-	predictTime: number;
+/**
+ * True when Replicate bills this model per output / per megapixel (every
+ * catalog model is an official model), so the formula IS the billed cost and
+ * predict_time-based reconciliation must not be used for it.
+ */
+export function isPerOutputPriced(model: string): boolean {
+	return getCatalogModel(model) !== undefined;
 }
 
-export interface GenerateOptions {
-	width?: number;
-	height?: number;
-	numOutputs?: number;
-	imageInputs?: string[]; // Local file paths for image inputs
-	aspectRatio?: string;
-	resolution?: string;
-	outputFormat?: string;
-	apiKey?: string; // Optional BYO API key
-	seed?: number; // Random seed for reproducibility/variation
+// ---- Image inputs -------------------------------------------------------------
+
+interface PreparedImage {
+	uri: string;
+	width: number;
+	height: number;
 }
 
-// Convert local file to base64 data URI, resizing if needed
-async function fileToDataUri(filePath: string): Promise<string> {
+const MIME_TYPES: Record<string, string> = {
+	".png": "image/png",
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif": "image/gif",
+	".webp": "image/webp",
+	".avif": "image/avif",
+};
+
+/**
+ * Read a local image as a data URI. SVGs are rasterized to PNG; images over
+ * `maxPixels` (per-megapixel models bill input pixels) or over 5MB are scaled
+ * down. Returns the dimensions actually sent.
+ */
+async function fileToDataUri(filePath: string, maxPixels?: number): Promise<PreparedImage> {
 	let buffer: Buffer = fs.readFileSync(filePath);
-	const originalSize = buffer.length;
+	const ext = path.extname(filePath).toLowerCase();
+	const meta = await sharp(buffer).metadata();
+	let width = meta.width ?? 0;
+	let height = meta.height ?? 0;
+	let mime = MIME_TYPES[ext] || "image/png";
 
-	// Check if resize is needed
+	if (ext === ".svg") {
+		buffer = await sharp(buffer).png().toBuffer();
+		mime = "image/png";
+	}
+
+	if (maxPixels && width * height > maxPixels) {
+		const scale = Math.sqrt(maxPixels / (width * height));
+		width = Math.max(1, Math.floor(width * scale));
+		height = Math.max(1, Math.floor(height * scale));
+		buffer = await sharp(buffer).resize(width, height, { fit: "fill" }).png().toBuffer();
+		mime = "image/png";
+	}
+
 	if (buffer.length > MAX_IMAGE_SIZE) {
-		console.log(`Resizing image: ${filePath} (${(originalSize / 1024 / 1024).toFixed(2)}MB)`);
-
-		// Get image metadata
-		const metadata = await sharp(buffer).metadata();
-		const { width = 0, height = 0 } = metadata;
-
-		// Calculate new dimensions
-		let newWidth = width;
-		let newHeight = height;
-		if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
-			const ratio = Math.min(MAX_DIMENSION / width, MAX_DIMENSION / height);
-			newWidth = Math.round(width * ratio);
-			newHeight = Math.round(height * ratio);
-		}
-
-		// Resize and compress
+		const ratio = Math.min(1, MAX_DIMENSION / width, MAX_DIMENSION / height);
+		const newWidth = Math.round(width * ratio);
+		const newHeight = Math.round(height * ratio);
 		let quality = 85;
 		while (quality >= 50) {
 			buffer = await sharp(buffer)
 				.resize(newWidth, newHeight, { fit: "inside", withoutEnlargement: true })
 				.jpeg({ quality })
 				.toBuffer();
-
 			if (buffer.length <= MAX_IMAGE_SIZE) break;
 			quality -= 10;
 		}
-
-		console.log(
-			`Resized: ${newWidth}x${newHeight}, ${(buffer.length / 1024 / 1024).toFixed(2)}MB (was ${(originalSize / 1024 / 1024).toFixed(2)}MB)`,
-		);
+		width = newWidth;
+		height = newHeight;
+		mime = "image/jpeg";
 	}
 
-	// Determine mime type from original or use jpeg if resized
-	const ext = path.extname(filePath).toLowerCase();
-	const mimeTypes: Record<string, string> = {
-		".png": "image/png",
-		".jpg": "image/jpeg",
-		".jpeg": "image/jpeg",
-		".gif": "image/gif",
-		".webp": "image/webp",
-	};
-	const mimeType = buffer.length !== originalSize ? "image/jpeg" : (mimeTypes[ext] || "image/png");
-	return `data:${mimeType};base64,${buffer.toString("base64")}`;
+	return { uri: `data:${mime};base64,${buffer.toString("base64")}`, width, height };
 }
 
 /**
@@ -464,186 +245,44 @@ export function resolveImageInputPath(input: string): string {
 	return full;
 }
 
-// Helper to convert image input paths to data URIs (with resize if needed).
-// Any invalid or missing input aborts the generation rather than silently
-// generating without the reference image the user paid for.
-async function convertImageInputsToDataUris(imageInputs: string[]): Promise<string[]> {
-	const results: string[] = [];
-
+// Convert image input paths to data URIs. Any invalid or missing input aborts
+// the generation rather than silently generating without the reference image
+// the user paid for.
+async function prepareImageInputs(
+	imageInputs: string[],
+	maxPixels?: number,
+): Promise<PreparedImage[]> {
+	const results: PreparedImage[] = [];
 	for (const inputPath of imageInputs) {
 		const fullPath = resolveImageInputPath(inputPath);
 		if (!fs.existsSync(fullPath)) {
 			throw new InvalidImageInputError("Input image not found");
 		}
-		results.push(await fileToDataUri(fullPath));
+		try {
+			results.push(await fileToDataUri(fullPath, maxPixels));
+		} catch (err) {
+			if (err instanceof InvalidImageInputError) throw err;
+			throw new InvalidImageInputError("Input image could not be read");
+		}
 	}
-
 	return results;
 }
 
-// Build input object for a specific model
-async function buildModelInput(
-	model: string,
-	prompt: string,
-	options: GenerateOptions,
-	seed?: number,
-): Promise<Record<string, unknown>> {
-	const { width = 1024, height = 1024, numOutputs = 1, imageInputs = [] } = options;
-	const modelInfo = MODELS.find((m) => m.id === model);
-	const imageDataUris = imageInputs.length > 0 ? await convertImageInputsToDataUris(imageInputs) : [];
-
-	// === Google Nano Banana Pro ===
-	if (model === "google/nano-banana-pro") {
-		return {
-			prompt,
-			image_input: imageDataUris,
-			resolution: options.resolution || "2K",
-			aspect_ratio: options.aspectRatio || "4:3",
-			output_format: options.outputFormat || "png",
-			safety_filter_level: "block_only_high",
-		};
+/** Pixel size of an owned image reference (for tool routing and Match input). */
+export async function imageInputDimensions(
+	input: string,
+): Promise<{ width: number; height: number }> {
+	const fullPath = resolveImageInputPath(input);
+	if (!fs.existsSync(fullPath)) throw new InvalidImageInputError("Input image not found");
+	try {
+		const meta = await sharp(fullPath).metadata();
+		return { width: meta.width ?? 0, height: meta.height ?? 0 };
+	} catch {
+		throw new InvalidImageInputError("Input image could not be read");
 	}
-
-	// === FLUX Redux Models (Variation) ===
-	if (model.includes("flux-redux")) {
-		if (imageDataUris.length === 0) {
-			throw new Error("FLUX Redux requires an input image (redux_image)");
-		}
-		// Redux only supports specific aspect ratios, not "match_input_image"
-		const validReduxAspectRatios = ["1:1", "16:9", "21:9", "3:2", "2:3", "4:5", "5:4", "3:4", "4:3", "9:16", "9:21"];
-		const reduxAspectRatio = validReduxAspectRatios.includes(options.aspectRatio || "")
-			? options.aspectRatio
-			: "1:1";
-		const input: Record<string, unknown> = {
-			redux_image: imageDataUris[0], // Single image required
-			aspect_ratio: reduxAspectRatio,
-			output_format: options.outputFormat || "webp",
-			megapixels: "1",
-		};
-		if (modelInfo?.supportsNumOutputs) {
-			input.num_outputs = numOutputs;
-		}
-		if (model.includes("schnell")) {
-			input.num_inference_steps = 4;
-		} else {
-			input.num_inference_steps = 28;
-			input.guidance = 3;
-		}
-		if (seed !== undefined) {
-			input.seed = seed;
-		}
-		return input;
-	}
-
-	// === FLUX Kontext Models (Editing) ===
-	if (model.includes("flux-kontext")) {
-		const input: Record<string, unknown> = {
-			prompt,
-			output_format: options.outputFormat || "png",
-		};
-		if (imageDataUris.length > 0) {
-			input.input_image = imageDataUris[0];
-			input.aspect_ratio = options.aspectRatio || "match_input_image";
-		} else {
-			input.aspect_ratio = options.aspectRatio || "1:1";
-		}
-		if (seed !== undefined) {
-			input.seed = seed;
-		}
-		return input;
-	}
-
-	// === FLUX 2 Series ===
-	if (model.includes("flux-2")) {
-		// Map resolution from K format to MP format for flux-2
-		const resolutionMap: Record<string, string> = {
-			"1K": "1 MP",
-			"2K": "2 MP",
-			"4K": "4 MP",
-		};
-		const input: Record<string, unknown> = {
-			prompt,
-			aspect_ratio: options.aspectRatio || "1:1",
-			output_format: options.outputFormat || "webp",
-		};
-		if (imageDataUris.length > 0) {
-			input.input_images = imageDataUris; // Array of images
-		}
-		if (model.includes("flux-2-pro")) {
-			input.resolution = resolutionMap[options.resolution || ""] || options.resolution || "2 MP";
-		}
-		if (model.includes("flux-2-dev")) {
-			input.go_fast = true;
-		}
-		if (seed !== undefined) {
-			input.seed = seed;
-		}
-		return input;
-	}
-
-	// === FLUX 1.1 Pro Ultra ===
-	if (model === "black-forest-labs/flux-1.1-pro-ultra") {
-		const input: Record<string, unknown> = {
-			prompt,
-			aspect_ratio: options.aspectRatio || "1:1",
-			output_format: options.outputFormat || "jpg",
-			raw: false, // Set to true for more natural look
-		};
-		if (imageDataUris.length > 0) {
-			input.image_prompt = imageDataUris[0]; // For Redux-style blending
-			input.image_prompt_strength = 0.1;
-		}
-		if (seed !== undefined) {
-			input.seed = seed;
-		}
-		return input;
-	}
-
-	// === FLUX 1.1 Pro ===
-	if (model === "black-forest-labs/flux-1.1-pro") {
-		const input: Record<string, unknown> = {
-			prompt,
-			aspect_ratio: options.aspectRatio || "1:1",
-			output_format: options.outputFormat || "webp",
-		};
-		if (seed !== undefined) {
-			input.seed = seed;
-		}
-		return input;
-	}
-
-	// === FLUX 1.x Schnell/Dev (original models) ===
-	const input: Record<string, unknown> = {
-		prompt,
-	};
-
-	// These models support width/height instead of aspect_ratio
-	if (model.includes("flux-schnell") || model === "black-forest-labs/flux-dev") {
-		// Convert aspect ratio and resolution to width/height
-		if (options.aspectRatio && options.aspectRatio !== "match_input_image") {
-			const dims = aspectRatioToWidthHeight(options.aspectRatio, options.resolution || "1K");
-			input.width = dims.width;
-			input.height = dims.height;
-		} else {
-			input.width = width || 1024;
-			input.height = height || 1024;
-		}
-	} else {
-		input.aspect_ratio = options.aspectRatio || "1:1";
-	}
-
-	// Only add num_outputs for models that support it
-	if (modelInfo?.supportsNumOutputs) {
-		input.num_outputs = numOutputs;
-	}
-
-	// Add seed for models that support it
-	if (modelInfo?.supportsSeed && seed !== undefined) {
-		input.seed = seed;
-	}
-
-	return input;
 }
+
+// ---- Predictions ----------------------------------------------------------------
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -699,33 +338,63 @@ const CONTENT_TYPE_EXT: Record<string, string> = {
 	"image/webp": "webp",
 	"image/gif": "gif",
 	"image/avif": "avif",
+	"image/svg+xml": "svg",
 };
 
 /** Pick the file extension from the response content type, then the URL, then the requested format. */
-function pickExtension(contentType: string | null, imageUrl: string, requestedFormat?: string): string {
+function pickExtension(
+	contentType: string | null,
+	imageUrl: string,
+	requestedFormat?: string,
+): string {
 	const ct = (contentType || "").split(";")[0].trim().toLowerCase();
 	if (CONTENT_TYPE_EXT[ct]) return CONTENT_TYPE_EXT[ct];
 	try {
 		const urlExt = path.extname(new URL(imageUrl).pathname).slice(1).toLowerCase();
 		if (urlExt === "jpeg") return "jpg";
-		if (["png", "jpg", "webp", "gif", "avif"].includes(urlExt)) return urlExt;
+		if (["png", "jpg", "webp", "gif", "avif", "svg"].includes(urlExt)) return urlExt;
 	} catch {
 		// fall through to the requested format
 	}
 	const fmt = (requestedFormat || "").toLowerCase();
 	if (fmt === "jpeg" || fmt === "jpg") return "jpg";
-	if (fmt === "png" || fmt === "webp") return fmt;
+	if (fmt === "png" || fmt === "webp" || fmt === "svg") return fmt;
 	return "png";
 }
 
-// Download image and save locally
+/**
+ * SVGs are served from our own origin, so anything that could run script is
+ * refused outright (Recraft never emits these; a hit means something is wrong).
+ */
+const UNSAFE_SVG =
+	/<\s*(script|foreignObject|iframe|embed|object|use)\b|\son\w+\s*=|javascript:|data:text\/html|<!ENTITY/i;
+
+/** One saved output with its official cost and real pixel size. */
+export interface GenerationResult {
+	id: string;
+	replicateId: string;
+	imagePath: string;
+	imageUrl: string;
+	/** Official cost of record for this output (USD). */
+	cost: number;
+	predictTime: number;
+	width: number;
+	height: number;
+}
+
+interface SavedImage {
+	id: string;
+	imagePath: string;
+	imageUrl: string;
+	width: number;
+	height: number;
+}
+
+// Download an output and save it locally, recording its real dimensions.
 async function downloadAndSaveImage(
 	imageUrl: string,
-	replicateId: string,
-	cost: number,
-	predictTime: number,
 	requestedFormat?: string,
-): Promise<GenerationResult | null> {
+): Promise<SavedImage | null> {
 	if (!imageUrl || !/^https?:\/\//i.test(imageUrl)) {
 		console.log("Skipping invalid URL:", imageUrl);
 		return null;
@@ -744,21 +413,28 @@ async function downloadAndSaveImage(
 		throw new Error("Downloaded generated image is too large");
 	}
 
-	const id = crypto.randomUUID();
 	const ext = pickExtension(response.headers.get("content-type"), imageUrl, requestedFormat);
+	if (ext === "svg" && UNSAFE_SVG.test(buffer.toString("utf8"))) {
+		throw new Error("Generated SVG contained unsafe content");
+	}
+
+	let width = 0;
+	let height = 0;
+	try {
+		const meta = await sharp(buffer).metadata();
+		width = meta.width ?? 0;
+		height = meta.height ?? 0;
+	} catch {
+		throw new Error("Downloaded generated image could not be read");
+	}
+
+	const id = crypto.randomUUID();
 	const filename = `${id}.${ext}`;
 	const dir = getImagesDir();
 	fs.mkdirSync(dir, { recursive: true });
 	fs.writeFileSync(path.join(dir, filename), buffer);
 
-	return {
-		id,
-		replicateId,
-		imagePath: filename,
-		imageUrl: `/images/${filename}`,
-		cost,
-		predictTime,
-	};
+	return { id, imagePath: filename, imageUrl: `/images/${filename}`, width, height };
 }
 
 /** Normalize a prediction's output (string, array, null, FileOutput) to a list of URL strings. */
@@ -767,6 +443,59 @@ function outputToUrls(output: unknown): string[] {
 	const items = Array.isArray(output) ? output : [output];
 	return items.filter((item) => item !== null && item !== undefined).map((item) => String(item));
 }
+
+export interface GenerateOptions {
+	numOutputs?: number;
+	imageInputs?: string[]; // "/uploads/<file>" or "/images/<file>" references
+	aspectRatio?: string;
+	/** Size tier; wins over `resolution`. */
+	tier?: Tier;
+	/** Legacy: "1K"/"2K"/"4K" (or "1 MP"…) map onto draft/standard/max. */
+	resolution?: string;
+	outputFormat?: string;
+	apiKey?: string; // Optional BYO API key
+	seed?: number; // Random seed for reproducibility/variation
+}
+
+/** What the server will actually run for a request: used for both pricing and the call. */
+export interface ResolvedRequest {
+	model: CatalogModel;
+	tier: Tier;
+	/** Ratio sent to the model (may be "match_input_image" for models that match natively). */
+	ratio: string;
+	/** The requested ratio, when it was snapped to a different one. */
+	snappedFrom?: string;
+	slug: string;
+}
+
+/**
+ * Resolve tier and ratio for a model. `firstInputSize` is the first reference
+ * image's size, used for "Match input" on models that can't match natively.
+ */
+export function resolveRequest(
+	model: CatalogModel,
+	opts: { tier?: Tier; resolution?: string; aspectRatio?: string },
+	firstInputSize?: { width: number; height: number },
+): ResolvedRequest {
+	const tier = resolveTier(model, opts.tier ?? tierFromResolution(opts.resolution));
+	const requested = opts.aspectRatio || "1:1";
+	let ratio: string;
+	let snappedFrom: string | undefined;
+	if (requested === MATCH_INPUT) {
+		if (firstInputSize && model.nativeMatch && !model.custom) ratio = MATCH_INPUT;
+		else if (firstInputSize)
+			ratio = snapDimensions(model, firstInputSize.width, firstInputSize.height);
+		else ratio = snapRatio(model, "1:1").ratio;
+	} else {
+		const snap = snapRatio(model, requested);
+		ratio = snap.ratio;
+		if (snap.snapped) snappedFrom = requested;
+	}
+	return { model, tier, ratio, snappedFrom, slug: slugFor(model, tier) };
+}
+
+/** Megapixels billed for the given pixel size. */
+const billedMp = (w: number, h: number) => (w * h) / 1_000_000;
 
 /**
  * Run a generation and download its outputs.
@@ -777,52 +506,67 @@ function outputToUrls(output: unknown): string[] {
  */
 export async function generateImage(
 	prompt: string,
-	model = "black-forest-labs/flux-schnell",
+	modelId: string,
 	options: GenerateOptions = {},
 ): Promise<GenerationResult[]> {
-	const { numOutputs = 1, apiKey } = options;
+	const model = getCatalogModel(modelId);
+	if (!model?.build || model.hidden) throw new Error(`Unknown model: ${modelId}`);
+	const { numOutputs = 1, apiKey, imageInputs = [] } = options;
 	const replicate = getReplicateClient(apiKey);
-	const modelInfo = MODELS.find((m) => m.id === model);
 
-	// Check if model supports num_outputs natively
-	const supportsNumOutputs = modelInfo?.supportsNumOutputs ?? false;
-	const supportsSeed = modelInfo?.supportsSeed ?? false;
+	const firstSize = imageInputs.length > 0 ? await imageInputDimensions(imageInputs[0]) : undefined;
+	const resolved = resolveRequest(model, options, firstSize);
+	const tierSpec = model.tiers[resolved.tier];
+	// Per-megapixel models bill input pixels: send references at no more than ~1 MP.
+	const maxRefPixels = tierSpec?.price.perInputMp ? REF_MAX_PIXELS : undefined;
+	const refs = imageInputs.length > 0 ? await prepareImageInputs(imageInputs, maxRefPixels) : [];
+	const inputMps = refs.map((r) => billedMp(r.width, r.height));
+	const build = model.build;
 
-	// Calculate cost per image using actual model pricing
-	const costPerImage = calculateGenerationCost(model, {
-		numOutputs: 1,
-		resolution: options.resolution,
-		width: options.width,
-		height: options.height,
-		hasImageInput: (options.imageInputs?.length || 0) > 0,
-		inputImageCount: options.imageInputs?.length,
-	});
-
-	const runAndDownload = async (input: Record<string, unknown>): Promise<GenerationResult[]> => {
-		const { output, predictTime, replicateId } = await runSinglePrediction(replicate, model, input);
+	const runAndDownload = async (outputs: number, seed?: number): Promise<GenerationResult[]> => {
+		const input = build({
+			prompt,
+			ratio: resolved.ratio,
+			tier: resolved.tier,
+			refs: refs.map((r) => r.uri),
+			outputs,
+			seed,
+			outputFormat: options.outputFormat,
+		});
+		const { output, predictTime, replicateId } = await runSinglePrediction(
+			replicate,
+			resolved.slug,
+			input,
+		);
 		const out: GenerationResult[] = [];
 		for (const url of outputToUrls(output)) {
-			const result = await downloadAndSaveImage(url, replicateId, costPerImage, predictTime, options.outputFormat);
-			if (result) out.push(result);
+			const saved = await downloadAndSaveImage(url, options.outputFormat ?? model.outputFormat);
+			if (!saved) continue;
+			const outputMp =
+				saved.width && saved.height ? billedMp(saved.width, saved.height) : undefined;
+			out.push({
+				...saved,
+				replicateId,
+				predictTime,
+				cost: priceOfOutput(model, resolved.tier, { outputMp, inputMps }),
+			});
 		}
 		return out;
 	};
 
-	// For models that support num_outputs, make a single call
-	if (supportsNumOutputs || numOutputs === 1) {
-		const input = await buildModelInput(model, prompt, options, options.seed);
-		return runAndDownload(input);
+	// One prediction when the model returns several outputs itself (or only one is wanted).
+	if (model.nativeOutputs || numOutputs === 1) {
+		return runAndDownload(numOutputs, options.seed);
 	}
 
-	// For models that don't support num_outputs, make parallel API calls.
-	// Partial success is kept; the caller refunds credits for missing outputs.
+	// Otherwise parallel predictions. Partial success is kept; the caller refunds missing outputs.
+	const baseSeed = model.seed
+		? (options.seed ?? Math.floor(Math.random() * 2147483000))
+		: undefined;
 	const settled = await Promise.allSettled(
-		Array.from({ length: numOutputs }, async (_, i) => {
-			// Generate different seeds for each call if model supports seeds
-			const seed = supportsSeed ? (options.seed ?? Math.floor(Math.random() * 2147483647)) + i : undefined;
-			const input = await buildModelInput(model, prompt, { ...options, numOutputs: 1 }, seed);
-			return runAndDownload(input);
-		}),
+		Array.from({ length: numOutputs }, (_, i) =>
+			runAndDownload(1, baseSeed !== undefined ? baseSeed + i : undefined),
+		),
 	);
 
 	const results = settled.flatMap((s) => (s.status === "fulfilled" ? s.value : []));
@@ -833,26 +577,48 @@ export async function generateImage(
 	return results;
 }
 
-export function getModels(): ExtendedModel[] {
-	return MODELS;
+// ---- Tools ------------------------------------------------------------------------
+
+export type ToolName = "upscale" | "remove-background";
+export const TOOL_NAMES: ToolName[] = ["upscale", "remove-background"];
+
+/** The catalog model that runs a tool on an input of this size. */
+export function toolModelFor(
+	tool: ToolName,
+	input: { width: number; height: number },
+): CatalogModel {
+	const id =
+		tool === "remove-background"
+			? "recraft-ai/recraft-remove-background"
+			: billedMp(input.width, input.height) > CRISP_UPSCALE_MAX_MP
+				? "prunaai/p-image-upscale"
+				: "recraft-ai/recraft-crisp-upscale";
+	const model = getCatalogModel(id);
+	if (!model) throw new Error(`Tool model missing from catalog: ${id}`);
+	return model;
 }
 
-/**
- * True when Replicate bills this model per output / per megapixel (official
- * models), so our estimate IS the actual cost and predict_time-based
- * reconciliation would understate it.
- */
-export function isPerOutputPriced(model: string): boolean {
-	return model in MODEL_PRICING;
+/** Run a tool on one owned image; returns the saved output (or throws). */
+export async function runTool(
+	tool: ToolName,
+	imageInput: string,
+	opts: { apiKey?: string; model?: CatalogModel } = {},
+): Promise<GenerationResult> {
+	const model = opts.model ?? toolModelFor(tool, await imageInputDimensions(imageInput));
+	const [result] = await generateImage("", model.id, {
+		imageInputs: [imageInput],
+		apiKey: opts.apiKey,
+	});
+	if (!result) throw new Error("The tool returned no image");
+	return result;
 }
+
+// ---- Prompt enhancement -----------------------------------------------------------
 
 export interface EnhancePromptResult {
 	enhanced: string;
 	cost: number;
 }
-
-// Cost for Llama prompt enhancement (~$0.005 per call based on typical 2-4 sec runtime)
-const PROMPT_ENHANCEMENT_COST = 0.005;
 
 /**
  * Enhance a prompt using Llama to make it more detailed and interesting
@@ -874,7 +640,7 @@ IMPORTANT: The user has reference images attached. Do NOT invent or specify phys
 - Add environmental and stylistic details, not subject-specific physical traits
 
 Output ONLY the enhanced prompt - no explanations, no quotes, no prefixes. Keep it under 150 words.`
-		: `You are an expert image prompt engineer. Your job is to take a basic image description and transform it into a rich, detailed prompt for AI image generation. Add specific visual details, lighting, color palette, artistic style, composition, and atmosphere. Output ONLY the enhanced prompt - no explanations, no quotes, no prefixes. Keep it under 150 words.`;
+		: "You are an expert image prompt engineer. Your job is to take a basic image description and transform it into a rich, detailed prompt for AI image generation. Add specific visual details, lighting, color palette, artistic style, composition, and atmosphere. Output ONLY the enhanced prompt - no explanations, no quotes, no prefixes. Keep it under 150 words.";
 
 	const userPrompt = `Enhance this image prompt: ${prompt}`;
 

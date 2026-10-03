@@ -1,141 +1,73 @@
-import { useState } from "react";
-import { getModelConfig, getModelCategory } from "../config/models";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
+import { CircleHelpIcon } from "lucide-react";
+import {
+	TIER_LABELS,
+	availableTiers,
+	catalogCredits,
+	getModelConfig,
+	visibleModels,
+} from "../config/models";
 
 interface ModelInfoTooltipProps {
 	modelId: string;
 	className?: string;
 }
 
-export function ModelInfoTooltip({ modelId, className = "" }: ModelInfoTooltipProps) {
-	const [isOpen, setIsOpen] = useState(false);
+/** A small "?" that explains a model in plain words, with its cost in credits per size. */
+export function ModelInfoTooltip({ modelId, className }: ModelInfoTooltipProps) {
 	const config = getModelConfig(modelId);
-	const categoryInfo = getModelCategory(modelId);
-
-	if (!config) return null;
+	const catalog = visibleModels().find((m) => m.id === modelId);
+	if (!config || !catalog) return null;
 
 	return (
-		<div className={`relative inline-flex ${className}`}>
-			<button
-				type="button"
-				onClick={() => setIsOpen(!isOpen)}
-				onMouseEnter={() => setIsOpen(true)}
-				onMouseLeave={() => setIsOpen(false)}
-				className="w-5 h-5 rounded-full border border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors flex items-center justify-center text-xs font-medium"
-				aria-label="Model information"
-			>
-				?
-			</button>
-
-			{isOpen && (
-				<div className="absolute left-full ml-2 top-1/2 -translate-y-1/2 z-50 w-72 p-3 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-lg">
-					{/* Arrow */}
-					<div className="absolute right-full top-1/2 -translate-y-1/2 w-0 h-0 border-t-[6px] border-t-transparent border-b-[6px] border-b-transparent border-r-[6px] border-r-[var(--border)]" />
-
-					{/* Header */}
-					<div className="flex items-center gap-2 mb-2">
-						<span className="text-sm font-semibold text-[var(--text-primary)]">
-							{config.name}
-						</span>
-						{categoryInfo && (
-							<span
-								className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
-								style={{
-									backgroundColor: `${categoryInfo.color}20`,
-									color: categoryInfo.color,
-								}}
-							>
-								{categoryInfo.label}
-							</span>
+		<Popover>
+			<PopoverTrigger
+				render={
+					<button
+						type="button"
+						className={cn(
+							"inline-flex size-6 items-center justify-center rounded-full text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50",
+							className,
 						)}
-					</div>
-
-					{/* Description */}
-					<p className="text-xs text-[var(--text-secondary)] mb-3 leading-relaxed">
-						{config.detailedDescription}
+						aria-label={`About ${config.name}`}
+					/>
+				}
+			>
+				<CircleHelpIcon className="size-4" />
+			</PopoverTrigger>
+			<PopoverContent
+				side="top"
+				className="w-72 rounded-xl border border-border bg-card p-3 ring-0"
+			>
+				<p className="font-medium text-foreground">{config.name}</p>
+				<p className="text-[0.82rem] text-muted-foreground">{config.description}</p>
+				{config.bestFor.length > 0 && (
+					<p className="text-[0.78rem] text-muted-foreground">
+						Good for: {config.bestFor.join(", ").toLowerCase()}
 					</p>
-
-					{/* Best for */}
-					<div className="mb-2">
-						<span className="text-[10px] uppercase tracking-wider text-[var(--text-secondary)]">
-							Best for:
-						</span>
-						<div className="flex flex-wrap gap-1 mt-1">
-							{config.bestFor.map((use) => (
-								<span
-									key={use}
-									className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-secondary)]"
-								>
-									{use}
-								</span>
-							))}
-						</div>
-					</div>
-
-					{/* Differentiator */}
-					{config.differentiators && (
-						<p className="text-[10px] text-[var(--accent)] italic">
-							{config.differentiators}
-						</p>
-					)}
-
-					{/* Pricing */}
-					<div className="mt-2 pt-2 border-t border-[var(--border)] flex items-center justify-between">
-						<span className="text-[10px] text-[var(--text-secondary)]">Cost:</span>
-						<div className="flex items-center gap-2">
-							<span className="text-xs font-mono text-[var(--text-secondary)]">
-								{config.pricing.displayCost}
-							</span>
-							<span className="text-xs font-mono text-[var(--accent)]">
-								{config.pricing.creditCost} {config.pricing.creditCost === 1 ? "credit" : "credits"}
-							</span>
-						</div>
-					</div>
-
-					{/* Image input indicator */}
-					{config.capabilities.requiresImageInput && (
-						<div className="mt-2 p-2 rounded bg-[var(--accent)]/10 border border-[var(--accent)]/30">
-							<span className="text-[10px] text-[var(--accent)] font-medium">
-								Requires an image to be uploaded
-							</span>
-						</div>
-					)}
-				</div>
-			)}
-		</div>
+				)}
+				<p className="text-[0.78rem] text-foreground tabular-nums">
+					{availableTiers(catalog)
+						.map((t) => `${TIER_LABELS[t]} ${catalogCredits(catalog, t, 0)}`)
+						.join(" · ")}{" "}
+					credits per image
+				</p>
+				{config.capabilities.requiresImageInput && (
+					<p className="text-[0.78rem] text-muted-foreground">Needs an image to work from.</p>
+				)}
+			</PopoverContent>
+		</Popover>
 	);
 }
 
-interface ImageRequiredTooltipProps {
-	modelId: string;
-	show: boolean;
-}
-
-export function ImageRequiredTooltip({ modelId, show }: ImageRequiredTooltipProps) {
+/** A plain prompt shown when the selected model needs an image and none is attached. */
+export function ImageRequiredTooltip({ modelId, show }: { modelId: string; show: boolean }) {
 	const config = getModelConfig(modelId);
-
 	if (!show || !config?.capabilities.requiresImageInput) return null;
-
-	const isVariation = config.category === "variation";
-	const isEdit = config.category === "edit";
-
-	let message = "This model works with reference images.";
-	if (isVariation) {
-		message = "Upload an image to create variations of it. The model will generate similar images with different compositions.";
-	} else if (isEdit) {
-		message = "Upload an image to edit it. Describe the changes you want in your prompt.";
-	}
-
 	return (
-		<div className="p-3 rounded-lg bg-[var(--accent)]/10 border border-[var(--accent)]/30 mb-3 animate-pulse">
-			<div className="flex items-start gap-2">
-				<span className="text-[var(--accent)] text-lg">↓</span>
-				<div>
-					<p className="text-sm text-[var(--accent)] font-medium mb-1">
-						{isVariation ? "Upload a reference image" : isEdit ? "Upload an image to edit" : "Add an image"}
-					</p>
-					<p className="text-xs text-[var(--text-secondary)]">{message}</p>
-				</div>
-			</div>
-		</div>
+		<p className="rounded-lg border border-border bg-muted px-3 py-2 text-sm text-muted-foreground">
+			Add the image you want to edit, then describe the change.
+		</p>
 	);
 }

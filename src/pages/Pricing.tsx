@@ -10,6 +10,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAuth } from "@/contexts/AuthContext";
 import { cn } from "@/lib/utils";
+import { DEFAULT_MODEL_ID, fallbackCreditCost, visibleModels } from "../config/models";
 
 const FAQ: { q: string; a: string }[] = [
 	{
@@ -55,10 +56,11 @@ export function Pricing() {
 	}, [token]);
 
 	const plans = catalog?.plans ?? [];
-	const defaultModel = catalog?.costs?.defaultModel ?? "black-forest-labs/flux-2-dev";
-	const perImage = catalog?.costs?.costs[defaultModel] ?? 2;
+	// "About N images with <model>" and "N of M models": server costs (admin overrides), catalog until they load.
+	const defaultModel = catalog?.costs?.defaultModel ?? DEFAULT_MODEL_ID;
+	const perImage = catalog?.costs?.costs[defaultModel] ?? fallbackCreditCost(defaultModel);
 	const defaultModelName = modelName(defaultModel);
-	const totalModels = catalog?.costs ? Object.keys(catalog.costs.costs).length : undefined;
+	const totalModels = catalog?.costs ? Object.keys(catalog.costs.costs).length : visibleModels().length;
 	const recommendedId = (plans.find((p) => p.name === RECOMMENDED_PLAN_NAME) ?? plans[Math.min(1, plans.length - 1)])?.id;
 	const onPaidPlan = currentPrice > 0;
 

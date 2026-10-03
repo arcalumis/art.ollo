@@ -1,10 +1,19 @@
 import type { FastifyInstance } from "fastify";
 import { getDb } from "../db";
 import { optionalAuthMiddleware } from "../middleware/auth";
-import { getModels } from "../services/replicate";
-import { getAllowedModelsForUser, getModelCreditCost } from "../services/usage";
-
-const DEFAULT_MODEL = "black-forest-labs/flux-2-dev";
+import {
+	CATALOG,
+	type CatalogModel,
+	DEFAULT_MODEL_ID,
+	TIER_LABELS,
+	availableTiers,
+	isTierAllowed,
+	ratioChoices,
+	supportedRatios,
+	toolModels,
+	visibleModels,
+} from "../services/model-catalog";
+import { creditCostResolver, getAllowedModelsForUser } from "../services/usage";
 
 interface ModelStats {
 	model: string;
@@ -12,52 +21,98 @@ interface ModelStats {
 	sample_count: number;
 }
 
+/** One catalog model as the client sees it: credits, never internal dollar prices. */
+function toApiModel(
+	m: CatalogModel,
+	allowed: string[] | null,
+	stats: ModelStats | undefined,
+	getModelCreditCost: ReturnType<typeof creditCostResolver>,
+) {
+	const tiers = availableTiers(m).map((tier) => ({
+		tier,
+		label: TIER_LABELS[tier],
+		hint: m.tiers[tier]?.hint ?? null,
+		/** Credits per output, indexed by number of reference images (0..maxImages). */
+		credits: Array.from({ length: m.refs.max + 1 }, (_, refs) =>
+			getModelCreditCost(m.id, tier, refs),
+		),
+		allowed: isTierAllowed(allowed, m.id, tier),
+	}));
+	return {
+		id: m.id,
+		name: m.name,
+		description: m.description,
+		group: m.group,
+		bestFor: m.bestFor,
+		kind: m.kind,
+		hidden: m.hidden ?? false,
+		replacedBy: m.replacedBy ?? null,
+		supportsImageInput: m.refs.max > 0,
+		maxImages: m.refs.max,
+		minImages: m.refs.min,
+		requiresImage: m.refs.min > 0,
+		ratios: supportedRatios(m),
+		ratioChoices: ratioChoices(m),
+		matchInput: m.refs.max > 0,
+		tiers,
+		defaultTier: m.defaultTier,
+		maxOutputs: Math.min(4, m.maxOutputs),
+		outputFormat: m.outputFormat,
+		/** Per-output credits at the default tier with no reference images (admin overrides applied). */
+		creditCost: getModelCreditCost(m.id, m.defaultTier, 0),
+		/** The current user's plan includes this model (at its default tier). */
+		allowed: isTierAllowed(allowed, m.id, m.defaultTier),
+		avgGenerationTime: stats?.avg_time || null,
+		sampleCount: stats?.sample_count || 0,
+	};
+}
+
 export async function modelsRoutes(fastify: FastifyInstance): Promise<void> {
-	fastify.get("/api/models", { preHandler: optionalAuthMiddleware }, async (request) => {
-		const models = getModels();
-		const db = getDb();
+	/**
+	 * The model catalog. Visible picker models (every model, locked ones flagged
+	 * `allowed: false` so the picker can offer an upgrade), plus `tools`.
+	 * `?all=1` (admins) also returns dropped models.
+	 */
+	fastify.get<{ Querystring: { all?: string } }>(
+		"/api/models",
+		{ preHandler: optionalAuthMiddleware },
+		async (request) => {
+			const db = getDb();
+			const allowed = request.user ? getAllowedModelsForUser(request.user.userId) : null;
+			const includeHidden = request.query?.all === "1" && request.user?.isAdmin === true;
 
-		// Filter models based on user's subscription tier
-		let filteredModels = models;
-		if (request.user) {
-			const allowedModels = getAllowedModelsForUser(request.user.userId);
-			if (allowedModels !== null) {
-				filteredModels = models.filter((m) => allowedModels.includes(m.id));
-			}
-		}
+			const stats = db
+				.prepare(
+					`SELECT model, AVG(predict_time) as avg_time, COUNT(*) as sample_count
+					FROM generations
+					WHERE predict_time IS NOT NULL AND deleted_at IS NULL
+					GROUP BY model`,
+				)
+				.all() as ModelStats[];
+			const statsMap = new Map(stats.map((s) => [s.model, s]));
 
-		// Calculate average predict_time per model from recent generations
-		const statsQuery = `
-			SELECT
-				model,
-				AVG(predict_time) as avg_time,
-				COUNT(*) as sample_count
-			FROM generations
-			WHERE predict_time IS NOT NULL AND deleted_at IS NULL
-			GROUP BY model
-		`;
+			const cost = creditCostResolver();
+			const list = includeHidden ? CATALOG.filter((m) => m.kind === "image") : visibleModels();
+			return {
+				models: list.map((m) => toApiModel(m, allowed, statsMap.get(m.id), cost)),
+				tools: toolModels().map((m) => ({
+					id: m.id,
+					name: m.name,
+					description: m.description,
+					creditCost: cost(m.id),
+				})),
+				defaultModel: DEFAULT_MODEL_ID,
+			};
+		},
+	);
 
-		const stats = db.prepare(statsQuery).all() as ModelStats[];
-
-		// Create lookup map
-		const statsMap = new Map(stats.map((s) => [s.model, s]));
-
-		// Merge stats into models
-		const modelsWithStats = filteredModels.map((m) => ({
-			...m,
-			creditCost: getModelCreditCost(m.id),
-			avgGenerationTime: statsMap.get(m.id)?.avg_time || null,
-			sampleCount: statsMap.get(m.id)?.sample_count || 0,
-		}));
-
-		return { models: modelsWithStats };
-	});
-
-	// Per-image credit cost of every model (admin overrides applied), unfiltered by tier so the
-	// public pricing page can translate credits into image counts.
+	// Per-image credit cost of every picker model at its default tier (admin overrides
+	// applied), unfiltered by plan, so the public pricing page can translate credits into
+	// image counts and say "N of M models".
 	fastify.get("/api/models/credit-costs", async () => {
 		const costs: Record<string, number> = {};
-		for (const m of getModels()) costs[m.id] = getModelCreditCost(m.id);
-		return { defaultModel: DEFAULT_MODEL, costs };
+		const cost = creditCostResolver();
+		for (const m of visibleModels()) costs[m.id] = cost(m.id, m.defaultTier, 0);
+		return { defaultModel: DEFAULT_MODEL_ID, costs };
 	});
 }

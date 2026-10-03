@@ -102,26 +102,33 @@ export function useEnhancePrompt(token: string | null) {
 	return { enhance };
 }
 
-export function useModels() {
+/**
+ * GET /api/models: the picker catalog (every visible model, locked ones flagged
+ * `allowed: false`), per-tier credit tables and the tools. Pass the token to get
+ * the plan flags for the signed-in user.
+ */
+export function useModels(token?: string | null) {
 	const [models, setModels] = useState<ModelsResponse["models"]>([]);
+	const [tools, setTools] = useState<NonNullable<ModelsResponse["tools"]>>([]);
 	const [loading, setLoading] = useState(false);
 
 	const fetchModels = useCallback(async () => {
 		setLoading(true);
 		try {
-			const response = await fetch(`${API_BASE}/api/models`);
+			const response = await fetch(`${API_BASE}/api/models`, { headers: getAuthHeaders(token ?? null, false) });
 			// A 429/500 body has no `models`; keep the last good list instead of crashing on undefined.
 			if (!response.ok) return;
 			const data = (await response.json()) as ModelsResponse;
 			if (Array.isArray(data.models)) setModels(data.models);
+			if (Array.isArray(data.tools)) setTools(data.tools);
 		} catch (err) {
 			console.error("Failed to fetch models:", err);
 		} finally {
 			setLoading(false);
 		}
-	}, []);
+	}, [token]);
 
-	return { models, fetchModels, loading };
+	return { models, tools, fetchModels, loading };
 }
 
 export function useHistory(token: string | null) {

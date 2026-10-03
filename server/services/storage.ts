@@ -17,8 +17,11 @@ export function getUploadsDir(): string {
 	return process.env.OLLO_UPLOADS_DIR || path.join(process.cwd(), "uploads");
 }
 
-/** Filenames we write ourselves: uuid-ish stem + image extension. Nothing else is ever read or deleted. */
-export const SAFE_IMAGE_FILENAME = /^[\w-]+\.(png|jpe?g|webp|gif|avif)$/i;
+/**
+ * Filenames we write ourselves: uuid-ish stem + image extension. Nothing else is ever read or deleted.
+ * svg: vector model outputs in generated-images (uploads validate their own, narrower list).
+ */
+export const SAFE_IMAGE_FILENAME = /^[\w-]+\.(png|jpe?g|webp|gif|avif|svg)$/i;
 
 /**
  * Resolve a bare filename inside `dir`, or return null if it is not a safe

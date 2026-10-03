@@ -3,17 +3,34 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { GenerateRequest } from "../../src/types";
 import { getDb } from "../db";
 import { authMiddleware, verifyToken } from "../middleware/auth";
-import {
-	enhancePrompt,
-	GenerationCanceledError,
-	GenerationTimeoutError,
-	generateImage,
-	InvalidImageInputError,
-	isPerOutputPriced,
-	MODELS,
-	type GenerationResult,
-} from "../services/replicate";
 import { maybeSendLowCreditEmail } from "../services/email";
+import {
+	ALL_RATIOS,
+	type CatalogModel,
+	DEFAULT_MODEL_ID,
+	MATCH_INPUT,
+	TIERS,
+	type Tier,
+	currentModelId,
+	getCatalogModel,
+	resolveTier,
+	tierFromResolution,
+} from "../services/model-catalog";
+import {
+	GenerationCanceledError,
+	type GenerationResult,
+	GenerationTimeoutError,
+	InvalidImageInputError,
+	TOOL_NAMES,
+	type ToolName,
+	enhancePrompt,
+	generateImage,
+	imageInputDimensions,
+	isPerOutputPriced,
+	resolveRequest,
+	runTool,
+	toolModelFor,
+} from "../services/replicate";
 import { recordPlatformCost } from "../services/replicate-billing";
 import { SAFE_IMAGE_FILENAME } from "../services/storage";
 import {
@@ -27,15 +44,18 @@ import {
 } from "../services/usage";
 import { getUserApiKey } from "./user";
 
-interface ExtendedGenerateRequest extends Omit<GenerateRequest, "prompt"> {
+interface ExtendedGenerateRequest extends Omit<GenerateRequest, "prompt" | "tier"> {
 	prompt?: string;
 	imageInputs?: string[];
 	aspectRatio?: string;
+	/** Size tier ("draft" | "standard" | "max"); wins over `resolution`. */
+	tier?: string;
+	/** Legacy tier spelling: "1K" | "2K" | "4K" (also "1 MP"…). */
 	resolution?: string;
 	outputFormat?: string;
 	seed?: number;
 	threadId?: string;
-	/** Ask the server to pick the best variation model the user's tier allows. */
+	/** Ask the server to pick a variation model the user's tier allows (Vary buttons). */
 	variation?: boolean;
 }
 
@@ -56,52 +76,38 @@ export type GenerateErrorCode =
 	| "GENERATION_NO_OUTPUT"
 	| "GENERATION_FAILED";
 
-const DEFAULT_MODEL = "black-forest-labs/flux-schnell";
 const MAX_OUTPUTS = 4;
 const MAX_PROMPT_LENGTH = 10_000;
 const MAX_ENHANCE_PROMPT_LENGTH = 2_000;
-// Hard ceiling on reference images regardless of model (largest model maxImages is 14).
-const MAX_IMAGE_INPUTS = 14;
 const MAX_SEED = 2_147_483_647;
 
-// Union of every aspect ratio the frontend offers and the Redux/Kontext/FLUX 2 lists.
-const ALLOWED_ASPECT_RATIOS = new Set([
-	"match_input_image",
-	"1:1",
-	"16:9",
-	"21:9",
-	"3:2",
-	"2:3",
-	"4:5",
-	"5:4",
-	"3:4",
-	"4:3",
-	"9:16",
-	"9:21",
-]);
+const ALLOWED_ASPECT_RATIOS = new Set([MATCH_INPUT, ...ALL_RATIOS]);
 const ALLOWED_RESOLUTIONS = new Set(["1K", "2K", "4K", "1 MP", "2 MP", "4 MP"]);
 // Normalized to the spelling Replicate models accept.
-const OUTPUT_FORMATS: Record<string, string> = { png: "png", jpg: "jpg", jpeg: "jpg", webp: "webp" };
+const OUTPUT_FORMATS: Record<string, string> = {
+	png: "png",
+	jpg: "jpg",
+	jpeg: "jpg",
+	webp: "webp",
+};
 
-// Best first. Used when the client asks for `variation: true` (Vary buttons).
+// Vary: an approved model that takes the image as a reference. Best first; the
+// server falls back to a cheaper one (and fewer outputs) so Free can always Vary.
 const VARIATION_MODEL_PREFERENCE = [
-	"black-forest-labs/flux-redux-dev",
-	"black-forest-labs/flux-redux-schnell",
-	"black-forest-labs/flux-kontext-pro",
+	"black-forest-labs/flux-2-dev",
+	"black-forest-labs/flux-2-klein-4b",
 ];
-const KONTEXT_VARIATION_PROMPT = "Create a subtle variation of this image";
-
-// Generate a thread title from a prompt (first ~50 chars, cleaned up)
-function generateThreadTitle(prompt: string | undefined): string {
-	const cleaned = (prompt ?? "").trim().replace(/\s+/g, " ");
-	if (cleaned.length === 0) return "Variation";
-	if (cleaned.length <= 50) return cleaned;
-	// Cut at word boundary
-	const truncated = cleaned.slice(0, 50);
-	const lastSpace = truncated.lastIndexOf(" ");
-	return lastSpace > 30 ? `${truncated.slice(0, lastSpace)}...` : `${truncated}...`;
+function variationPrompt(prompt: string): string {
+	const base =
+		"Create a new variation of the reference image. Keep the same subject, style, colors and mood, and vary the composition, pose and details.";
+	const original = prompt.trim();
+	return original ? `${base} The original image was described as: ${original}` : base;
 }
 
+const TOOL_TITLES: Record<ToolName, string> = {
+	upscale: "Upscaled image",
+	"remove-background": "Background removed",
+};
 function sendError(
 	reply: FastifyReply,
 	status: number,
@@ -201,12 +207,31 @@ function resolveOwnedImageInputs(userId: string, inputs: unknown[]): string[] | 
 	return normalized;
 }
 
-/** Pick the best variation-capable model the user's tier allows. */
-function pickVariationModel(userId: string, requested: string | undefined): string | null {
-	if (requested && VARIATION_MODEL_PREFERENCE.includes(requested) && canUserUseModel(userId, requested)) {
-		return requested;
-	}
-	return VARIATION_MODEL_PREFERENCE.find((m) => canUserUseModel(userId, m)) ?? null;
+/**
+ * Pick the variation model for a Vary request: the best one the user's plan
+ * allows that the balance covers at the requested outputs. When none covers
+ * them, the cheapest allowed model with as many outputs as the balance buys
+ * (at least 1), so Free can always Vary. Own-key users get the best allowed.
+ */
+function pickVariation(
+	userId: string,
+	tier: Tier | undefined,
+	outputs: number,
+	refs: number,
+	balance: number | null,
+): { model: CatalogModel; tier: Tier; outputs: number } | null {
+	const candidates = VARIATION_MODEL_PREFERENCE.map((id) => getCatalogModel(id))
+		.filter((m): m is CatalogModel => !!m)
+		.map((m) => ({ model: m, tier: resolveTier(m, tier) }))
+		.filter((c) => canUserUseModel(userId, c.model.id, c.tier));
+	if (candidates.length === 0) return null;
+	if (balance === null) return { ...candidates[0], outputs };
+	const per = (c: (typeof candidates)[number]) => getModelCreditCost(c.model.id, c.tier, refs);
+	const fits = candidates.find((c) => per(c) * outputs <= balance);
+	if (fits) return { ...fits, outputs };
+	const cheapest = candidates.reduce((a, b) => (per(b) < per(a) ? b : a));
+	const affordable = Math.floor(balance / per(cheapest));
+	return { ...cheapest, outputs: Math.max(1, Math.min(outputs, affordable)) };
 }
 
 /** Per-user key for route rate limits; falls back to IP for unauthenticated calls. */
@@ -217,6 +242,163 @@ function userRateLimitKey(request: FastifyRequest): string {
 		if (payload?.userId) return `user:${payload.userId}`;
 	}
 	return `ip:${request.ip}`;
+}
+
+// Generate a thread title from a prompt (first ~50 chars, cleaned up)
+function generateThreadTitle(prompt: string | undefined, fallback = "Variation"): string {
+	const cleaned = (prompt ?? "").trim().replace(/\s+/g, " ");
+	if (cleaned.length === 0) return fallback;
+	if (cleaned.length <= 50) return cleaned;
+	// Cut at word boundary
+	const truncated = cleaned.slice(0, 50);
+	const lastSpace = truncated.lastIndexOf(" ");
+	return lastSpace > 30 ? `${truncated.slice(0, lastSpace)}...` : `${truncated}...`;
+}
+
+/** Credit reservation with capped, idempotent-ish partial refunds. */
+function makeReservation(userId: string, totalCredits: number) {
+	let reservationId: string | null = null;
+	let refunded = 0;
+	return {
+		reserve(reason: string): boolean {
+			reservationId = reserveCredits(userId, totalCredits, reason);
+			return reservationId !== null;
+		},
+		refund(amount: number, reason: string) {
+			if (!reservationId) return;
+			const capped = Math.min(amount, totalCredits - refunded);
+			if (capped <= 0) return;
+			refundReservation(userId, reservationId, capped, reason);
+			refunded += capped;
+		},
+		get charged() {
+			return reservationId ? totalCredits - refunded : 0;
+		},
+	};
+}
+
+/** Map a failed Replicate run to the error response (after refunding). */
+function sendRunError(reply: FastifyReply, error: unknown) {
+	if (error instanceof InvalidImageInputError) {
+		return sendError(reply, 400, "INVALID_IMAGE_INPUT", error.message);
+	}
+	if (error instanceof GenerationTimeoutError) {
+		return sendError(
+			reply,
+			504,
+			"GENERATION_TIMEOUT",
+			"Generation timed out. Your credits were refunded.",
+		);
+	}
+	if (error instanceof GenerationCanceledError) {
+		return sendError(
+			reply,
+			502,
+			"GENERATION_CANCELED",
+			"Generation was canceled. Your credits were refunded.",
+		);
+	}
+	const message = error instanceof Error ? error.message : "Generation failed";
+	return sendError(reply, 500, "GENERATION_FAILED", message);
+}
+
+interface SaveArgs {
+	userId: string;
+	model: string;
+	prompt: string;
+	results: GenerationResult[];
+	threadId: string | undefined;
+	threadTitle: string;
+	parameters: Record<string, unknown>;
+	usedOwnKey: boolean;
+}
+
+/** Record usage, the generation row (one row; extra outputs in parameters.images) and platform cost. */
+function saveGeneration(args: SaveArgs, log: FastifyInstance["log"]): { threadId: string } {
+	const db = getDb();
+	const { results, userId, usedOwnKey } = args;
+	const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
+
+	// Create the thread only once there is something to put in it.
+	let threadId = args.threadId;
+	if (threadId) {
+		db.prepare("UPDATE threads SET updated_at = datetime('now') WHERE id = ?").run(threadId);
+	} else {
+		threadId = crypto.randomUUID();
+		db.prepare(`
+			INSERT INTO threads (id, user_id, title, created_at, updated_at)
+			VALUES (?, ?, ?, datetime('now'), datetime('now'))
+		`).run(threadId, userId, args.threadTitle);
+	}
+
+	recordUsage(userId, totalCost, usedOwnKey);
+
+	const primary = results[0];
+	const parameters = { ...args.parameters };
+	if (results.length > 1) {
+		parameters.images = results.map((r) => ({
+			id: r.id,
+			url: r.imageUrl,
+			path: r.imagePath,
+			width: r.width,
+			height: r.height,
+		}));
+	}
+
+	db.prepare(`
+		INSERT INTO generations (id, prompt, model, image_path, width, height, parameters, user_id, cost, replicate_id, predict_time, thread_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`).run(
+		primary.id,
+		args.prompt,
+		args.model,
+		primary.imagePath,
+		primary.width || null,
+		primary.height || null,
+		JSON.stringify(parameters),
+		userId,
+		totalCost,
+		primary.replicateId,
+		primary.predictTime,
+		threadId,
+	);
+
+	// Platform cost (only when we paid Replicate). The official formula is the
+	// cost of record, so per-output-priced models are reconciled immediately.
+	if (!usedOwnKey) {
+		try {
+			recordPlatformCost(
+				primary.id,
+				primary.replicateId,
+				args.model,
+				totalCost,
+				isPerOutputPriced(args.model) ? totalCost : undefined,
+				primary.predictTime,
+			);
+		} catch (err) {
+			log.error(err, "Failed to record platform cost");
+		}
+		// Low-balance email (throttled, fire-and-forget; never affects the response).
+		try {
+			void maybeSendLowCreditEmail(userId, getAvailableCredits(userId));
+		} catch {}
+	}
+
+	return { threadId };
+}
+
+function parseTier(body: { tier?: unknown; resolution?: unknown }): Tier | undefined | null {
+	if (body.tier !== undefined) {
+		return typeof body.tier === "string" && (TIERS as string[]).includes(body.tier)
+			? (body.tier as Tier)
+			: null;
+	}
+	if (body.resolution !== undefined) {
+		return typeof body.resolution === "string" && ALLOWED_RESOLUTIONS.has(body.resolution)
+			? tierFromResolution(body.resolution)
+			: null;
+	}
+	return undefined;
 }
 
 export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
@@ -230,81 +412,32 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 			}
 
 			const body = (request.body ?? {}) as ExtendedGenerateRequest;
-			const { width, height, aspectRatio, resolution, seed, threadId } = body;
+			const { width, height, aspectRatio, seed, threadId } = body;
 			let prompt = typeof body.prompt === "string" ? body.prompt : "";
 			const rawInputs: unknown[] = body.imageInputs ?? [];
+			const isVariation = body.variation === true;
 
 			// ---- Validate the request shape ----------------------------------
 			if (!Array.isArray(rawInputs)) {
 				return sendError(reply, 400, "INVALID_REQUEST", "imageInputs must be an array");
 			}
 			if (prompt.length > MAX_PROMPT_LENGTH) {
-				return sendError(reply, 400, "INVALID_REQUEST", `Prompt must be at most ${MAX_PROMPT_LENGTH} characters`);
+				return sendError(
+					reply,
+					400,
+					"INVALID_REQUEST",
+					`Prompt must be at most ${MAX_PROMPT_LENGTH} characters`,
+				);
 			}
 			if (body.model !== undefined && typeof body.model !== "string") {
 				return sendError(reply, 400, "INVALID_REQUEST", "Unknown model");
 			}
-
-			// Variation requests: the server picks the model the user's tier allows.
-			let model = body.model || DEFAULT_MODEL;
-			if (body.variation === true) {
-				const picked = pickVariationModel(userId, body.model);
-				if (!picked) {
-					return sendError(
-						reply,
-						403,
-						"MODEL_NOT_ALLOWED",
-						"Variations are not available on your subscription tier. Please upgrade to access more models.",
-						{ modelRestricted: true },
-					);
-				}
-				model = picked;
+			const requestedTier = parseTier(body);
+			if (requestedTier === null) {
+				return sendError(reply, 400, "INVALID_REQUEST", "Unsupported size");
 			}
-
-			const modelConfig = MODELS.find((m) => m.id === model);
-			if (!modelConfig) {
-				return sendError(reply, 400, "INVALID_REQUEST", "Unknown model");
-			}
-			const isVariationModel = modelConfig.isVariationModel === true;
-			const hasImageInputs = rawInputs.length > 0;
-
-			if (body.variation === true && !isVariationModel && prompt.trim().length === 0) {
-				// Fallback model (Kontext) needs an instruction.
-				prompt = KONTEXT_VARIATION_PROMPT;
-			}
-
-			// Variation models can work without a prompt (image-to-image)
-			if (!isVariationModel && prompt.trim().length === 0) {
-				return sendError(reply, 400, "INVALID_REQUEST", "Prompt is required");
-			}
-			// Variation models require image inputs
-			if (isVariationModel && !hasImageInputs) {
-				return sendError(reply, 400, "INVALID_REQUEST", "Variation models require an input image");
-			}
-
-			const maxInputs = modelConfig.supportsImageInput ? Math.min(modelConfig.maxImages ?? 1, MAX_IMAGE_INPUTS) : 0;
-			if (rawInputs.length > maxInputs) {
-				return sendError(
-					reply,
-					400,
-					"INVALID_IMAGE_INPUT",
-					maxInputs === 0
-						? "This model does not accept image inputs"
-						: `This model accepts at most ${maxInputs} input image${maxInputs === 1 ? "" : "s"}`,
-				);
-			}
-
-			// numOutputs: clamp to 1..MAX_OUTPUTS; each output is charged.
-			const requestedOutputs = Math.floor(Number(body.numOutputs ?? 1));
-			const numOutputs = Number.isFinite(requestedOutputs)
-				? Math.min(MAX_OUTPUTS, Math.max(1, requestedOutputs))
-				: 1;
-
 			if (aspectRatio !== undefined && !ALLOWED_ASPECT_RATIOS.has(aspectRatio)) {
 				return sendError(reply, 400, "INVALID_REQUEST", "Unsupported aspect ratio");
-			}
-			if (resolution !== undefined && !ALLOWED_RESOLUTIONS.has(resolution)) {
-				return sendError(reply, 400, "INVALID_REQUEST", "Unsupported resolution");
 			}
 			let outputFormat: string | undefined;
 			if (body.outputFormat !== undefined) {
@@ -318,7 +451,12 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 				["height", height],
 			] as const) {
 				if (value !== undefined && (!Number.isInteger(value) || value < 256 || value > 2048)) {
-					return sendError(reply, 400, "INVALID_REQUEST", `${name} must be an integer between 256 and 2048`);
+					return sendError(
+						reply,
+						400,
+						"INVALID_REQUEST",
+						`${name} must be an integer between 256 and 2048`,
+					);
 				}
 			}
 			if (seed !== undefined && (!Number.isInteger(seed) || seed < 0 || seed > MAX_SEED)) {
@@ -327,15 +465,96 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 			if (threadId !== undefined && typeof threadId !== "string") {
 				return sendError(reply, 400, "THREAD_NOT_FOUND", "Thread not found");
 			}
+			const requestedOutputs = Math.floor(Number(body.numOutputs ?? 1));
+			let numOutputs = Number.isFinite(requestedOutputs)
+				? Math.min(MAX_OUTPUTS, Math.max(1, requestedOutputs))
+				: 1;
+
+			// Dropped models are served by their replacement (old clients, saved pending prompts).
+			let model: CatalogModel | undefined = getCatalogModel(
+				currentModelId(body.model || DEFAULT_MODEL_ID),
+			);
+			if (!isVariation && (!model || model.hidden || model.kind !== "image")) {
+				return sendError(reply, 400, "INVALID_REQUEST", "Unknown model");
+			}
 
 			// ---- Image inputs must be files this user owns (C1) ---------------
 			const imageInputs = resolveOwnedImageInputs(userId, rawInputs);
 			if (!imageInputs) {
-				return sendError(reply, 400, "INVALID_IMAGE_INPUT", "One or more input images were not found");
+				return sendError(
+					reply,
+					400,
+					"INVALID_IMAGE_INPUT",
+					"One or more input images were not found",
+				);
 			}
 
+			// ---- Key ------------------------------------------------------------
+			const { key: userApiKey, unreadable } = loadUserApiKey(userId);
+			if (unreadable) {
+				return sendError(reply, 400, "API_KEY_UNREADABLE", API_KEY_UNREADABLE_MESSAGE);
+			}
+			// Own-key generations are paid to Replicate by the user: no credits, no
+			// platform cost-limit check (usage is still recorded).
+			const usedOwnKey = !!userApiKey;
+
+			// ---- Vary: the server picks the model, tier and affordable outputs ----
+			let tier: Tier;
+			if (isVariation) {
+				if (imageInputs.length === 0) {
+					return sendError(reply, 400, "INVALID_REQUEST", "Variations need an input image");
+				}
+				const picked = pickVariation(
+					userId,
+					requestedTier,
+					numOutputs,
+					Math.min(imageInputs.length, 1),
+					usedOwnKey ? null : getAvailableCredits(userId),
+				);
+				if (!picked) {
+					return sendError(
+						reply,
+						403,
+						"MODEL_NOT_ALLOWED",
+						"Variations are not available on your subscription tier. Please upgrade to access more models.",
+						{ modelRestricted: true },
+					);
+				}
+				model = picked.model;
+				tier = picked.tier;
+				numOutputs = picked.outputs;
+				prompt = variationPrompt(prompt);
+				imageInputs.splice(1);
+			} else {
+				tier = resolveTier(model as CatalogModel, requestedTier);
+			}
+			const m = model as CatalogModel;
+
+			if (prompt.trim().length === 0) {
+				return sendError(reply, 400, "INVALID_REQUEST", "Prompt is required");
+			}
+			if (imageInputs.length > m.refs.max) {
+				return sendError(
+					reply,
+					400,
+					"INVALID_IMAGE_INPUT",
+					m.refs.max === 0
+						? "This model does not accept image inputs"
+						: `This model accepts at most ${m.refs.max} input image${m.refs.max === 1 ? "" : "s"}`,
+				);
+			}
+			if (imageInputs.length < m.refs.min) {
+				return sendError(
+					reply,
+					400,
+					"INVALID_IMAGE_INPUT",
+					"This model needs an image to work from",
+				);
+			}
+			numOutputs = Math.min(numOutputs, m.maxOutputs);
+
 			// ---- Tier gate ----------------------------------------------------
-			if (!canUserUseModel(userId, model)) {
+			if (!canUserUseModel(userId, m.id, tier)) {
 				return sendError(
 					reply,
 					403,
@@ -345,17 +564,25 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 				);
 			}
 
-			// ---- Key + credits --------------------------------------------------
-			const { key: userApiKey, unreadable } = loadUserApiKey(userId);
-			if (unreadable) {
-				return sendError(reply, 400, "API_KEY_UNREADABLE", API_KEY_UNREADABLE_MESSAGE);
+			// What will actually run (snapped ratio, Match input resolved).
+			let resolved: ReturnType<typeof resolveRequest>;
+			try {
+				const firstSize =
+					imageInputs.length > 0 ? await imageInputDimensions(imageInputs[0]) : undefined;
+				resolved = resolveRequest(
+					m,
+					{ tier, aspectRatio: aspectRatio ?? (isVariation ? MATCH_INPUT : undefined) },
+					firstSize,
+				);
+			} catch (error) {
+				if (error instanceof InvalidImageInputError) {
+					return sendError(reply, 400, "INVALID_IMAGE_INPUT", error.message);
+				}
+				throw error;
 			}
-			// Own-key generations are paid to Replicate by the user: no credits, no
-			// platform cost-limit check (usage is still recorded).
-			const usedOwnKey = !!userApiKey;
-			const perImageCredits = getModelCreditCost(model);
-			const totalCredits = perImageCredits * numOutputs;
 
+			const perImageCredits = getModelCreditCost(m.id, tier, imageInputs.length);
+			const totalCredits = perImageCredits * numOutputs;
 			const db = getDb();
 
 			// Validate the thread before reserving anything.
@@ -368,18 +595,9 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 				}
 			}
 
-			let reservationId: string | null = null;
-			let refunded = 0;
-			const refund = (amount: number, reason: string) => {
-				if (!reservationId) return;
-				const capped = Math.min(amount, totalCredits - refunded);
-				if (capped <= 0) return;
-				refundReservation(userId, reservationId, capped, reason);
-				refunded += capped;
-			};
-
+			const reservation = makeReservation(userId, totalCredits);
 			if (!usedOwnKey) {
-				const limitCheck = canUserGenerate(userId, model, totalCredits);
+				const limitCheck = canUserGenerate(userId, m.id, totalCredits);
 				if (!limitCheck.allowed) {
 					const code = limitCheck.code ?? "INSUFFICIENT_CREDITS";
 					return sendError(
@@ -397,46 +615,39 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 					);
 				}
 				// Atomic check-and-deduct BEFORE the slow Replicate call (C2).
-				reservationId = reserveCredits(userId, totalCredits, `Generation: ${model} x${numOutputs}`);
-				if (!reservationId) {
-					return sendError(reply, 402, "INSUFFICIENT_CREDITS", "Not enough credits for this generation.", {
-						limitReached: true,
-						creditCost: totalCredits,
-					});
+				if (!reservation.reserve(`Generation: ${m.id} ${tier} x${numOutputs}`)) {
+					return sendError(
+						reply,
+						402,
+						"INSUFFICIENT_CREDITS",
+						"Not enough credits for this generation.",
+						{
+							limitReached: true,
+							creditCost: totalCredits,
+						},
+					);
 				}
 			}
 
 			let results: GenerationResult[];
 			try {
-				results = await generateImage(prompt, model, {
-					width,
-					height,
+				results = await generateImage(prompt, m.id, {
 					numOutputs,
 					imageInputs,
-					aspectRatio,
-					resolution,
+					aspectRatio: resolved.ratio,
+					tier,
 					outputFormat,
 					apiKey: userApiKey || undefined,
 					seed,
 				});
 			} catch (error) {
-				refund(totalCredits, "Generation failed");
+				reservation.refund(totalCredits, "Generation failed");
 				fastify.log.error(error);
-				if (error instanceof InvalidImageInputError) {
-					return sendError(reply, 400, "INVALID_IMAGE_INPUT", error.message);
-				}
-				if (error instanceof GenerationTimeoutError) {
-					return sendError(reply, 504, "GENERATION_TIMEOUT", "Generation timed out. Your credits were refunded.");
-				}
-				if (error instanceof GenerationCanceledError) {
-					return sendError(reply, 502, "GENERATION_CANCELED", "Generation was canceled. Your credits were refunded.");
-				}
-				const message = error instanceof Error ? error.message : "Generation failed";
-				return sendError(reply, 500, "GENERATION_FAILED", message);
+				return sendRunError(reply, error);
 			}
 
 			if (results.length === 0) {
-				refund(totalCredits, "Generation returned no images");
+				reservation.refund(totalCredits, "Generation returned no images");
 				return sendError(
 					reply,
 					502,
@@ -444,107 +655,226 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 					"The model returned no images. Your credits were refunded.",
 				);
 			}
+			// Native multi-output models may return extras: keep only what was paid for.
+			results = results.slice(0, numOutputs);
 			if (results.length < numOutputs) {
-				refund((numOutputs - results.length) * perImageCredits, "Generation returned fewer images");
+				reservation.refund(
+					(numOutputs - results.length) * perImageCredits,
+					"Generation returned fewer images",
+				);
 			}
 
 			try {
-				const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
-				const storedPrompt = prompt.trim();
-
-				// Create the thread only once there is something to put in it.
-				let finalThreadId = threadId;
-				if (threadId) {
-					db.prepare("UPDATE threads SET updated_at = datetime('now') WHERE id = ?").run(threadId);
-				} else {
-					finalThreadId = crypto.randomUUID();
-					db.prepare(`
-						INSERT INTO threads (id, user_id, title, created_at, updated_at)
-						VALUES (?, ?, ?, datetime('now'), datetime('now'))
-					`).run(finalThreadId, userId, generateThreadTitle(body.prompt));
-				}
-
-				recordUsage(userId, totalCost, usedOwnKey);
-
-				const images = results.map((result) => ({
-					id: result.id,
-					url: result.imageUrl,
-					path: result.imagePath,
-					cost: result.cost,
-				}));
-
-				// For multi-output generations, store as a single row with an images array (4-up grid)
-				const isMultiOutput = results.length > 1;
-				const primaryResult = results[0];
-				const parameters: Record<string, unknown> = {
-					numOutputs,
-					imageInputs,
-					aspectRatio,
-					resolution,
-					outputFormat,
-					creditsCharged: usedOwnKey ? 0 : totalCredits - refunded,
-				};
-				if (isMultiOutput) {
-					parameters.images = images.map((img) => ({ id: img.id, url: img.url, path: img.path }));
-				}
-
-				db.prepare(`
-					INSERT INTO generations (id, prompt, model, image_path, width, height, parameters, user_id, cost, replicate_id, predict_time, thread_id)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				`).run(
-					primaryResult.id,
-					storedPrompt,
-					model,
-					primaryResult.imagePath,
-					width || 1024,
-					height || 1024,
-					JSON.stringify(parameters),
-					userId,
-					totalCost,
-					primaryResult.replicateId,
-					primaryResult.predictTime,
-					finalThreadId ?? null,
+				const creditsCharged = usedOwnKey ? 0 : reservation.charged;
+				const { threadId: finalThreadId } = saveGeneration(
+					{
+						userId,
+						model: m.id,
+						prompt: prompt.trim(),
+						results,
+						threadId,
+						threadTitle: generateThreadTitle(isVariation ? "" : body.prompt),
+						usedOwnKey,
+						parameters: {
+							numOutputs,
+							imageInputs,
+							aspectRatio:
+								resolved.ratio === MATCH_INPUT ? (aspectRatio ?? MATCH_INPUT) : resolved.ratio,
+							requestedAspectRatio: aspectRatio,
+							tier,
+							resolution: body.resolution,
+							outputFormat,
+							variation: isVariation || undefined,
+							creditsCharged,
+						},
+					},
+					fastify.log,
 				);
 
-				// Platform cost tracking (only when we paid Replicate). Per-output-priced
-				// models are reconciled immediately: the estimate is the billed price.
-				if (!usedOwnKey) {
-					try {
-						recordPlatformCost(
-							primaryResult.id,
-							primaryResult.replicateId,
-							model,
-							totalCost,
-							isPerOutputPriced(model) ? totalCost : undefined,
-							primaryResult.predictTime,
-						);
-					} catch (err) {
-						fastify.log.error(err, "Failed to record platform cost");
-					}
-				}
-
-				// Low-balance email (throttled, fire-and-forget; never affects the response).
-				if (!usedOwnKey) {
-					try {
-						void maybeSendLowCreditEmail(userId, getAvailableCredits(userId));
-					} catch {}
-				}
-
 				return {
-					id: primaryResult.id,
+					id: results[0].id,
 					status: "succeeded",
-					images,
-					cost: totalCost,
-					model,
-					creditsCharged: usedOwnKey ? 0 : totalCredits - refunded,
+					images: results.map((r) => ({
+						id: r.id,
+						url: r.imageUrl,
+						path: r.imagePath,
+						cost: r.cost,
+						width: r.width,
+						height: r.height,
+					})),
+					cost: results.reduce((sum, r) => sum + r.cost, 0),
+					model: m.id,
+					tier,
+					aspectRatio: resolved.ratio,
+					creditsCharged,
 					usedOwnKey,
 					threadId: finalThreadId,
 				};
 			} catch (error) {
 				// Images exist on disk but we could not record them: refund what was charged.
-				refund(totalCredits, "Failed to save generation");
+				reservation.refund(totalCredits, "Failed to save generation");
 				fastify.log.error(error);
 				return sendError(reply, 500, "GENERATION_FAILED", "Failed to save generation");
+			}
+		},
+	);
+
+	/**
+	 * Tools: run one tool on one image the user owns and save the result as a new
+	 * generation in the same thread.
+	 *
+	 * POST /api/tools/:tool   tool = "upscale" | "remove-background"
+	 * Body: { image: "/images/<file>" | "/uploads/<file>", threadId?: string }
+	 * Thread: `threadId` if given, else the source generation's thread, else a new one.
+	 * 200 -> same shape as /api/generate plus `tool`; errors use the same codes.
+	 */
+	fastify.post<{ Params: { tool: string }; Body: { image?: unknown; threadId?: unknown } }>(
+		"/api/tools/:tool",
+		{ preHandler: authMiddleware },
+		async (request, reply) => {
+			const userId = request.user?.userId;
+			if (!userId) {
+				return reply.status(401).send({ error: "Unauthorized" });
+			}
+			const tool = request.params.tool as ToolName;
+			if (!TOOL_NAMES.includes(tool)) {
+				return sendError(reply, 400, "INVALID_REQUEST", "Unknown tool");
+			}
+			const body = request.body ?? {};
+			const threadIdInput = body.threadId;
+			if (threadIdInput !== undefined && typeof threadIdInput !== "string") {
+				return sendError(reply, 400, "THREAD_NOT_FOUND", "Thread not found");
+			}
+			const owned =
+				typeof body.image === "string" ? resolveOwnedImageInputs(userId, [body.image]) : null;
+			if (!owned) {
+				return sendError(reply, 400, "INVALID_IMAGE_INPUT", "Image not found");
+			}
+			const image = owned[0];
+
+			let model: CatalogModel;
+			try {
+				model = toolModelFor(tool, await imageInputDimensions(image));
+			} catch (error) {
+				if (error instanceof InvalidImageInputError) {
+					return sendError(reply, 400, "INVALID_IMAGE_INPUT", error.message);
+				}
+				throw error;
+			}
+
+			const db = getDb();
+			// The source generation (if the image is one of ours) gives the thread and the prompt.
+			const filename = image.split("/").pop() as string;
+			const source = image.startsWith("/images/")
+				? (db
+						.prepare(
+							`SELECT prompt, thread_id FROM generations
+							WHERE user_id = ? AND deleted_at IS NULL AND purged_at IS NULL
+							AND (image_path = ? OR parameters LIKE ? ESCAPE '\\')
+							ORDER BY created_at DESC LIMIT 1`,
+						)
+						.get(userId, filename, `%${escapeLike(filename)}%`) as
+						| { prompt: string | null; thread_id: string | null }
+						| undefined)
+				: undefined;
+
+			let threadId: string | undefined = threadIdInput ?? source?.thread_id ?? undefined;
+			if (threadId) {
+				const exists = db
+					.prepare("SELECT id FROM threads WHERE id = ? AND user_id = ? AND deleted_at IS NULL")
+					.get(threadId, userId);
+				if (!exists) {
+					if (threadIdInput) return sendError(reply, 400, "THREAD_NOT_FOUND", "Thread not found");
+					threadId = undefined; // source thread was deleted: start a new one
+				}
+			}
+
+			const { key: userApiKey, unreadable } = loadUserApiKey(userId);
+			if (unreadable) {
+				return sendError(reply, 400, "API_KEY_UNREADABLE", API_KEY_UNREADABLE_MESSAGE);
+			}
+			const usedOwnKey = !!userApiKey;
+			const credits = getModelCreditCost(model.id);
+			const reservation = makeReservation(userId, credits);
+			if (!usedOwnKey) {
+				const limitCheck = canUserGenerate(userId, model.id, credits);
+				if (!limitCheck.allowed) {
+					const code = limitCheck.code ?? "INSUFFICIENT_CREDITS";
+					return sendError(
+						reply,
+						code === "INSUFFICIENT_CREDITS" ? 402 : 403,
+						code,
+						limitCheck.reason || "Limit reached",
+						{
+							limitReached: true,
+							creditCost: credits,
+							availableCredits: limitCheck.availableCredits,
+						},
+					);
+				}
+				if (!reservation.reserve(`Tool: ${tool} (${model.id})`)) {
+					return sendError(reply, 402, "INSUFFICIENT_CREDITS", "Not enough credits.", {
+						limitReached: true,
+						creditCost: credits,
+					});
+				}
+			}
+
+			let result: GenerationResult;
+			try {
+				result = await runTool(tool, image, { apiKey: userApiKey || undefined, model });
+			} catch (error) {
+				reservation.refund(credits, `Tool ${tool} failed`);
+				fastify.log.error(error);
+				return sendRunError(reply, error);
+			}
+
+			try {
+				const creditsCharged = usedOwnKey ? 0 : reservation.charged;
+				const prompt = source?.prompt?.trim() || TOOL_TITLES[tool];
+				const { threadId: finalThreadId } = saveGeneration(
+					{
+						userId,
+						model: model.id,
+						prompt,
+						results: [result],
+						threadId,
+						threadTitle: TOOL_TITLES[tool],
+						usedOwnKey,
+						parameters: {
+							tool,
+							sourceImage: image,
+							imageInputs: [image],
+							numOutputs: 1,
+							creditsCharged,
+						},
+					},
+					fastify.log,
+				);
+				return {
+					id: result.id,
+					status: "succeeded",
+					tool,
+					images: [
+						{
+							id: result.id,
+							url: result.imageUrl,
+							path: result.imagePath,
+							cost: result.cost,
+							width: result.width,
+							height: result.height,
+						},
+					],
+					cost: result.cost,
+					model: model.id,
+					creditsCharged,
+					usedOwnKey,
+					threadId: finalThreadId,
+				};
+			} catch (error) {
+				reservation.refund(credits, "Failed to save tool result");
+				fastify.log.error(error);
+				return sendError(reply, 500, "GENERATION_FAILED", "Failed to save the result");
 			}
 		},
 	);
@@ -583,12 +913,18 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 
 			const { key: userApiKey, unreadable } = loadUserApiKey(userId);
 			if (unreadable) {
-				return reply.status(400).send({ code: "API_KEY_UNREADABLE", error: API_KEY_UNREADABLE_MESSAGE });
+				return reply
+					.status(400)
+					.send({ code: "API_KEY_UNREADABLE", error: API_KEY_UNREADABLE_MESSAGE });
 			}
 			const usedOwnKey = !!userApiKey;
 
 			try {
-				const result = await enhancePrompt(prompt.trim(), userApiKey || undefined, hasImages === true);
+				const result = await enhancePrompt(
+					prompt.trim(),
+					userApiKey || undefined,
+					hasImages === true,
+				);
 
 				// Track enhancement cost
 				recordUsage(userId, result.cost, usedOwnKey);
