@@ -390,7 +390,7 @@ export interface GenerateOptions {
 
 // Convert local file to base64 data URI, resizing if needed
 async function fileToDataUri(filePath: string): Promise<string> {
-	let buffer = fs.readFileSync(filePath);
+	let buffer: Buffer = fs.readFileSync(filePath);
 	const originalSize = buffer.length;
 
 	// Check if resize is needed
