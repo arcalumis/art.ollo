@@ -20,7 +20,9 @@ import {
 	GenerationCanceledError,
 	type GenerationResult,
 	GenerationTimeoutError,
+	GpuBusyError,
 	InvalidImageInputError,
+	type RunTracker,
 	TOOL_NAMES,
 	type ToolName,
 	enhancePrompt,
@@ -31,6 +33,12 @@ import {
 	runTool,
 	toolModelFor,
 } from "../services/replicate";
+import {
+	CLIENT_REQUEST_ID,
+	getStatus,
+	setPhase,
+	startStatus,
+} from "../services/generation-status";
 import { recordPlatformCost } from "../services/replicate-billing";
 import { SAFE_IMAGE_FILENAME } from "../services/storage";
 import {
@@ -57,6 +65,8 @@ interface ExtendedGenerateRequest extends Omit<GenerateRequest, "prompt" | "tier
 	threadId?: string;
 	/** Ask the server to pick a variation model the user's tier allows (Vary buttons). */
 	variation?: boolean;
+	/** Client-generated UUID for GET /api/generate/status/:clientRequestId. */
+	clientRequestId?: string;
 }
 
 /**
@@ -74,7 +84,8 @@ export type GenerateErrorCode =
 	| "GENERATION_TIMEOUT"
 	| "GENERATION_CANCELED"
 	| "GENERATION_NO_OUTPUT"
-	| "GENERATION_FAILED";
+	| "GENERATION_FAILED"
+	| "GPU_BUSY";
 
 const MAX_OUTPUTS = 4;
 const MAX_PROMPT_LENGTH = 10_000;
@@ -282,6 +293,14 @@ function sendRunError(reply: FastifyReply, error: unknown) {
 	if (error instanceof InvalidImageInputError) {
 		return sendError(reply, 400, "INVALID_IMAGE_INPUT", error.message);
 	}
+	if (error instanceof GpuBusyError) {
+		return sendError(
+			reply,
+			503,
+			"GPU_BUSY",
+			"Image generation is busy right now. Your credits were returned.",
+		);
+	}
 	if (error instanceof GenerationTimeoutError) {
 		return sendError(
 			reply,
@@ -300,6 +319,59 @@ function sendRunError(reply: FastifyReply, error: unknown) {
 	}
 	const message = error instanceof Error ? error.message : "Generation failed";
 	return sendError(reply, 500, "GENERATION_FAILED", message);
+}
+
+// ---- Live status --------------------------------------------------------------
+
+/** The status id each tracked request registered, so onResponse can close it. */
+const trackedRequests = new WeakMap<FastifyRequest, string>();
+
+/**
+ * Register the request's clientRequestId (optional; older clients don't send
+ * one). Returns an error response to send, or null to carry on.
+ */
+function beginTracking(
+	request: FastifyRequest,
+	reply: FastifyReply,
+	userId: string,
+	raw: unknown,
+	model: string,
+) {
+	if (raw === undefined || raw === null) return null;
+	if (typeof raw !== "string" || !CLIENT_REQUEST_ID.test(raw)) {
+		return sendError(reply, 400, "INVALID_REQUEST", "Invalid clientRequestId");
+	}
+	const id = raw.toLowerCase();
+	if (!startStatus(id, userId, model)) {
+		return sendError(reply, 409, "INVALID_REQUEST", "This request is already running");
+	}
+	trackedRequests.set(request, id);
+	return null;
+}
+
+function trackerFor(request: FastifyRequest): RunTracker | undefined {
+	const id = trackedRequests.get(request);
+	if (!id) return undefined;
+	return {
+		waitingGpu: () => setPhase(id, "waiting_gpu"),
+		rendering: () => setPhase(id, "rendering"),
+		saving: () => setPhase(id, "saving"),
+	};
+}
+
+/** Route hook: the response went out, so the request is done (2xx) or failed. */
+async function finishTracking(request: FastifyRequest, reply: FastifyReply) {
+	const id = trackedRequests.get(request);
+	if (id) setPhase(id, reply.statusCode < 400 ? "done" : "failed");
+}
+
+/** GPU wait and hedging, stored in generations.parameters for the admin Models page. */
+function queueStats(results: GenerationResult[]) {
+	return {
+		queueWaitMs: results[0]?.queueWaitMs,
+		predictionAttempts: results.reduce((n, r) => n + r.attempts, 0),
+		winningAttempt: results[0]?.winningAttempt,
+	};
 }
 
 interface SaveArgs {
@@ -402,9 +474,32 @@ function parseTier(body: { tier?: unknown; resolution?: unknown }): Tier | undef
 }
 
 export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
+	/**
+	 * Live phase of the caller's own in-flight request (owner-only; 404 for
+	 * anyone else, and once the entry expired 10 minutes after finishing).
+	 * Polled about once a second per request, so it has its own per-user limit.
+	 */
+	fastify.get<{ Params: { clientRequestId: string } }>(
+		"/api/generate/status/:clientRequestId",
+		{
+			preHandler: authMiddleware,
+			config: {
+				rateLimit: { max: 600, timeWindow: "1 minute", keyGenerator: userRateLimitKey },
+			},
+		},
+		async (request, reply) => {
+			const userId = request.user?.userId;
+			if (!userId) return reply.status(401).send({ error: "Unauthorized" });
+			const id = request.params.clientRequestId.toLowerCase();
+			const status = CLIENT_REQUEST_ID.test(id) ? getStatus(id, userId) : undefined;
+			if (!status) return reply.status(404).send({ code: "NOT_FOUND", error: "Not found" });
+			return status;
+		},
+	);
+
 	fastify.post<{ Body: ExtendedGenerateRequest }>(
 		"/api/generate",
-		{ preHandler: authMiddleware },
+		{ preHandler: authMiddleware, onResponse: finishTracking },
 		async (request, reply) => {
 			const userId = request.user?.userId;
 			if (!userId) {
@@ -412,6 +507,14 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 			}
 
 			const body = (request.body ?? {}) as ExtendedGenerateRequest;
+			const trackingError = beginTracking(
+				request,
+				reply,
+				userId,
+				body.clientRequestId,
+				typeof body.model === "string" ? currentModelId(body.model) : DEFAULT_MODEL_ID,
+			);
+			if (trackingError) return trackingError;
 			const { width, height, aspectRatio, seed, threadId } = body;
 			let prompt = typeof body.prompt === "string" ? body.prompt : "";
 			const rawInputs: unknown[] = body.imageInputs ?? [];
@@ -639,6 +742,7 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 					outputFormat,
 					apiKey: userApiKey || undefined,
 					seed,
+					tracker: trackerFor(request),
 				});
 			} catch (error) {
 				reservation.refund(totalCredits, "Generation failed");
@@ -687,6 +791,7 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 							outputFormat,
 							variation: isVariation || undefined,
 							creditsCharged,
+							...queueStats(results),
 						},
 					},
 					fastify.log,
@@ -729,9 +834,12 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 	 * Thread: `threadId` if given, else the source generation's thread, else a new one.
 	 * 200 -> same shape as /api/generate plus `tool`; errors use the same codes.
 	 */
-	fastify.post<{ Params: { tool: string }; Body: { image?: unknown; threadId?: unknown } }>(
+	fastify.post<{
+		Params: { tool: string };
+		Body: { image?: unknown; threadId?: unknown; clientRequestId?: unknown };
+	}>(
 		"/api/tools/:tool",
-		{ preHandler: authMiddleware },
+		{ preHandler: authMiddleware, onResponse: finishTracking },
 		async (request, reply) => {
 			const userId = request.user?.userId;
 			if (!userId) {
@@ -742,6 +850,14 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 				return sendError(reply, 400, "INVALID_REQUEST", "Unknown tool");
 			}
 			const body = request.body ?? {};
+			const trackingError = beginTracking(
+				request,
+				reply,
+				userId,
+				body.clientRequestId,
+				`tool:${tool}`,
+			);
+			if (trackingError) return trackingError;
 			const threadIdInput = body.threadId;
 			if (threadIdInput !== undefined && typeof threadIdInput !== "string") {
 				return sendError(reply, 400, "THREAD_NOT_FOUND", "Thread not found");
@@ -823,7 +939,11 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 
 			let result: GenerationResult;
 			try {
-				result = await runTool(tool, image, { apiKey: userApiKey || undefined, model });
+				result = await runTool(tool, image, {
+					apiKey: userApiKey || undefined,
+					model,
+					tracker: trackerFor(request),
+				});
 			} catch (error) {
 				reservation.refund(credits, `Tool ${tool} failed`);
 				fastify.log.error(error);
@@ -848,6 +968,7 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 							imageInputs: [image],
 							numOutputs: 1,
 							creditsCharged,
+							...queueStats([result]),
 						},
 					},
 					fastify.log,

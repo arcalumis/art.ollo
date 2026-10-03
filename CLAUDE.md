@@ -35,7 +35,11 @@ server/
   services/
     model-catalog.ts  SINGLE SOURCE OF TRUTH for models: ratios, size tiers → per-model params, official
                       price formulas, credits = max(1, ceil(cost × 42)) per output, plan locks, hidden legacy ids
-    replicate.ts      builds inputs from the catalog, polls with a 180s deadline, saves files, records real dims
+    replicate.ts      builds inputs from the catalog, saves files, records real dims. Waiting for a GPU: identical
+                      same-model hedges at 5/10/15s, first to start wins, others canceled; nothing started by
+                      45s → GPU_BUSY (refund). Render deadline 120s from start. Phases → generation-status.ts
+    generation-status.ts  in-memory live phase per clientRequestId (owner-only, 10 min TTL) for
+                      GET /api/generate/status/:id, polled by useGenerationQueue
     usage.ts          credit ledger, reserveCredits (atomic, before Replicate) + refunds, subscriptions, refills
     stripe.ts         customers, checkout, portal, recordPayment (upsert per payment intent / invoice)
     solana.ts         SOL packs/subscriptions; payments bound by a Solana Pay reference key
