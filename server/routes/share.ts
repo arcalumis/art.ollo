@@ -134,14 +134,17 @@ export function injectShareMeta(html: string, share: PublicShare | null, slug: s
 	tags.push(`<meta name="twitter:title" content="${escapeHtml(title)}" />`);
 
 	// Drop the shell's generic description/OG tags so crawlers see only these.
+	// Replacements are functions: a string replacement would expand `$&`, `$'` etc. from the
+	// user's prompt and splice parts of the page into the injected tags.
+	const titleTag = `<title>${escapeHtml(title)}</title>`;
 	let out = html
 		.replace(/<meta\s+(?:property|name)="(?:og:[^"]+|twitter:[^"]+|description)"[^>]*>\s*/gi, "")
 		.replace(/<link\s+rel="canonical"[^>]*>\s*/gi, "")
-		.replace(/<title>[\s\S]*?<\/title>/i, `<title>${escapeHtml(title)}</title>`);
+		.replace(/<title>[\s\S]*?<\/title>/i, () => titleTag);
 	if (share) tags.push(`<link rel="canonical" href="${escapeHtml(pageUrl)}" />`);
-	if (!/<title>/i.test(out))
-		out = out.replace(/<\/head>/i, `<title>${escapeHtml(title)}</title></head>`);
-	return out.replace(/<\/head>/i, `${tags.join("\n    ")}\n  </head>`);
+	if (!/<title>/i.test(out)) out = out.replace(/<\/head>/i, () => `${titleTag}</head>`);
+	const block = `${tags.join("\n    ")}\n  </head>`;
+	return out.replace(/<\/head>/i, () => block);
 }
 
 function indexHtmlPath(): string {

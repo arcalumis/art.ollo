@@ -174,6 +174,32 @@ describe("share page meta", () => {
     <meta name="twitter:card" content="summary_large_image" />
   </head><body><div id="root"></div></body></html>`;
 
+	test("replacement patterns in a prompt ($', $&, $`) are inserted literally", () => {
+		const prompt = "crow $' and $& and $` and $$ </script><script>alert(1)</script>";
+		const html = injectShareMeta(
+			shell,
+			{
+				slug: "abc",
+				imageUrl: "/images/x.png",
+				prompt,
+				model: "m",
+				width: null,
+				height: null,
+				createdAt: "2026-10-01 10:00:00",
+			},
+			"abc",
+		);
+		// The page around the tags is intact: one head, one body, the root div once.
+		expect(html.match(/<\/head>/g)).toHaveLength(1);
+		expect(html.match(/<body>/g)).toHaveLength(1);
+		expect(html.match(/<div id="root">/g)).toHaveLength(1);
+		expect(html.match(/<title>/g)).toHaveLength(1);
+		expect(html).not.toContain("<script>");
+		expect(html).not.toContain("</script>");
+		expect(html).toContain("crow $&#39; and $&#38; and $` and $$ &#60;/script&#62;");
+		expect(html).toContain("<title>crow $&#39; and $&#38;");
+	});
+
 	test("injects the image's own Open Graph tags and escapes the prompt", () => {
 		const html = injectShareMeta(
 			shell,
