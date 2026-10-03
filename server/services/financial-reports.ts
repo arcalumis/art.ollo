@@ -195,7 +195,8 @@ export function calculateMetrics(startDate: Date, endDate: Date): FinancialMetri
 
 	const mrr = endSnap.mrrCents / 100;
 	const activePaid = endSnap.paidSubscribers;
-	const arpu = activePaid > 0 ? revenue.total / activePaid : null;
+	// Monthly recurring revenue per paid subscriber; month-to-date revenue reads as 0 early in a month.
+	const arpu = activePaid > 0 ? mrr / activePaid : null;
 
 	const avgMonths = db
 		.prepare(
