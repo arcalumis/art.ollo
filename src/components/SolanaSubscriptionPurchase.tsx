@@ -6,11 +6,17 @@ import {
 	type SolanaSubscriptionProduct,
 	useSolanaBilling,
 } from "../hooks/useSolanaBilling";
+import { Button } from "@/components/ui/button";
 import { SolanaWalletButton } from "./SolanaWalletButton";
 
 type PurchaseStep = "select" | "confirm" | "signing" | "verifying" | "success" | "error";
 
-export function SolanaSubscriptionPurchase() {
+interface SolanaSubscriptionPurchaseProps {
+	/** Called after a verified 30-day plan purchase. */
+	onPurchaseComplete?: () => void;
+}
+
+export function SolanaSubscriptionPurchase({ onPurchaseComplete }: SolanaSubscriptionPurchaseProps = {}) {
 	const { connection } = useConnection();
 	const { publicKey, sendTransaction, connected } = useWallet();
 	const {
@@ -107,6 +113,7 @@ export function SolanaSubscriptionPurchase() {
 
 			if (result.success) {
 				setStep("success");
+				onPurchaseComplete?.();
 			} else {
 				throw new Error(result.error || "Failed to verify subscription");
 			}
@@ -127,6 +134,7 @@ export function SolanaSubscriptionPurchase() {
 		verifySubscription,
 		clearError,
 		error,
+		onPurchaseComplete,
 	]);
 
 	const resetPurchase = useCallback(() => {
@@ -136,173 +144,83 @@ export function SolanaSubscriptionPurchase() {
 		clearError();
 	}, [clearError]);
 
-	if (!status?.enabled) {
-		return null; // Don't render if Solana is not enabled
-	}
-
-	if (products.length === 0) {
-		return null; // No products available for SOL purchase
+	if (!status?.enabled || products.length === 0) {
+		return null;
 	}
 
 	return (
-		<div className="space-y-4">
-			<div className="flex items-center justify-between">
-				<div>
-					<h3 className="text-sm font-semibold text-[var(--text-primary)]">
-						Upgrade with SOL
-					</h3>
-					<p className="text-xs text-[var(--text-secondary)]">
-						{connected
-							? "Select a plan to upgrade"
-							: "Connect your wallet to upgrade"}
+		<div className="flex flex-col gap-3">
+			<div className="flex flex-wrap items-center justify-between gap-3">
+				<div className="min-w-0">
+					<p className="text-sm font-medium text-foreground">Pay for a plan with SOL</p>
+					<p className="text-xs text-muted-foreground">
+						30 days of the plan, paid once. It doesn't renew on its own.
 					</p>
 				</div>
 				<SolanaWalletButton />
 			</div>
 
-			{status.network === "devnet" && (
-				<p className="text-xs text-yellow-400">Using Devnet - for testing only</p>
+			{connected && step === "select" && (
+				<ul className="flex flex-col gap-2">
+					{products.map((product) => (
+						<li key={product.id} className="flex items-center justify-between gap-3 rounded-xl bg-muted px-4 py-3">
+							<div className="min-w-0">
+								<p className="text-sm font-medium text-foreground">{product.name}</p>
+								<p className="text-xs text-muted-foreground">
+									{product.priceSol} SOL for 30 days
+									{product.creditRefillAmount ? `, ${product.creditRefillAmount} credits` : ""}
+								</p>
+							</div>
+							<Button variant="outline" size="sm" onClick={() => handlePurchase(product)} disabled={loading}>
+								Choose
+							</Button>
+						</li>
+					))}
+				</ul>
 			)}
 
-			{connected && (
-				<>
-					{step === "select" && (
-						<div className="grid md:grid-cols-2 gap-4">
-							{products.map((product) => (
-								<div
-									key={product.id}
-									className="p-4 rounded-lg border border-[var(--border)] hover:border-purple-500/50 transition-all"
-								>
-									<h4 className="text-lg font-bold text-[var(--text-primary)]">
-										{product.name}
-									</h4>
-									<div className="flex items-baseline gap-2 mt-1">
-										<span className="text-2xl font-bold text-purple-400">
-											{product.priceSol} SOL
-										</span>
-										<span className="text-xs text-[var(--text-secondary)]">
-											(~${product.priceUsd}/mo)
-										</span>
-									</div>
-									{product.description && (
-										<p className="text-xs text-[var(--text-secondary)] mt-2">
-											{product.description}
-										</p>
-									)}
-									<ul className="mt-3 space-y-1 text-xs text-[var(--text-secondary)]">
-										{product.bonusCredits > 0 && (
-											<li>{product.bonusCredits} bonus credits on signup</li>
-										)}
-									</ul>
-									<button
-										type="button"
-										onClick={() => handlePurchase(product)}
-										disabled={loading}
-										className="mt-4 w-full cyber-button text-xs py-2 bg-purple-600 hover:bg-purple-500"
-									>
-										Upgrade with SOL
-									</button>
-								</div>
-							))}
-						</div>
-					)}
+			{connected && step === "confirm" && selectedProduct && (
+				<div className="flex flex-col gap-3 rounded-2xl border border-border p-4">
+					<dl className="grid grid-cols-2 gap-y-2 text-sm">
+						<dt className="text-muted-foreground">Plan</dt>
+						<dd className="text-right text-foreground">{selectedProduct.name}, 30 days</dd>
+						<dt className="text-muted-foreground">You pay</dt>
+						<dd className="text-right tabular-nums text-foreground">{selectedProduct.priceSol} SOL</dd>
+					</dl>
+					<div className="flex gap-2">
+						<Button variant="ghost" className="flex-1" onClick={resetPurchase}>
+							Back
+						</Button>
+						<Button className="flex-1" onClick={confirmPurchase} disabled={loading}>
+							Sign in wallet
+						</Button>
+					</div>
+				</div>
+			)}
 
-					{step === "confirm" && selectedProduct && (
-						<div className="cyber-card p-4">
-							<h3 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
-								Confirm Upgrade
-							</h3>
-							<div className="space-y-3">
-								<div className="flex justify-between text-sm">
-									<span className="text-[var(--text-secondary)]">Plan</span>
-									<span className="text-[var(--text-primary)]">
-										{selectedProduct.name}
-									</span>
-								</div>
-								<div className="flex justify-between text-sm">
-									<span className="text-[var(--text-secondary)]">Duration</span>
-									<span className="text-[var(--text-primary)]">30 days</span>
-								</div>
-								<div className="flex justify-between text-sm">
-									<span className="text-[var(--text-secondary)]">Amount</span>
-									<span className="text-purple-400 font-bold">
-										{selectedProduct.priceSol} SOL
-									</span>
-								</div>
-								<div className="pt-3 border-t border-[var(--border)] flex gap-3">
-									<button
-										type="button"
-										onClick={resetPurchase}
-										className="flex-1 cyber-button text-xs py-2"
-									>
-										Cancel
-									</button>
-									<button
-										type="button"
-										onClick={confirmPurchase}
-										disabled={loading}
-										className="flex-1 cyber-button text-xs py-2 bg-purple-600 hover:bg-purple-500"
-									>
-										Confirm & Sign
-									</button>
-								</div>
-							</div>
-						</div>
-					)}
+			{connected && (step === "signing" || step === "verifying") && (
+				<p className="text-sm text-foreground" aria-live="polite">
+					{step === "signing" ? "Approve the payment in your wallet." : "Confirming the payment on Solana."}
+				</p>
+			)}
 
-					{(step === "signing" || step === "verifying") && (
-						<div className="cyber-card p-4 text-center">
-							<div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-purple-500 mx-auto mb-4" />
-							<p className="text-[var(--text-primary)] font-semibold">
-								{step === "signing"
-									? "Please sign the transaction in your wallet..."
-									: "Verifying transaction..."}
-							</p>
-							<p className="text-xs text-[var(--text-secondary)] mt-2">
-								{step === "signing"
-									? "A popup should appear from your wallet"
-									: "Waiting for blockchain confirmation"}
-							</p>
-						</div>
-					)}
+			{connected && step === "success" && (
+				<p className="text-sm text-verdigris" aria-live="polite">
+					{selectedProduct?.name ?? "Your plan"} is active for the next 30 days.
+				</p>
+			)}
 
-					{step === "success" && (
-						<div className="cyber-card p-4 text-center">
-							<div className="text-green-400 text-4xl mb-4">&#10003;</div>
-							<p className="text-[var(--text-primary)] font-semibold">
-								Upgrade Complete!
-							</p>
-							<p className="text-[var(--text-secondary)] text-sm mt-2">
-								Your premium access is now active for 30 days
-							</p>
-							<a
-								href="/"
-								className="mt-4 inline-block cyber-button text-xs py-2 px-6 bg-purple-600 hover:bg-purple-500"
-							>
-								Start Creating
-							</a>
-						</div>
-					)}
-
-					{step === "error" && (
-						<div className="cyber-card p-4 text-center">
-							<div className="text-red-400 text-4xl mb-4">&#10007;</div>
-							<p className="text-[var(--text-primary)] font-semibold">
-								Upgrade Failed
-							</p>
-							<p className="text-red-400 text-sm mt-2">
-								{purchaseError || error || "Unknown error"}
-							</p>
-							<button
-								type="button"
-								onClick={resetPurchase}
-								className="mt-4 cyber-button text-xs py-2 px-6"
-							>
-								Try Again
-							</button>
-						</div>
-					)}
-				</>
+			{connected && step === "error" && (
+				<div className="flex flex-col gap-2" role="alert">
+					<p className="text-sm text-destructive">
+						{/reject|denied|cancel/i.test(purchaseError || error || "")
+							? "The wallet request was declined. Nothing was charged."
+							: "The payment didn't go through. Try again, or pay by card instead."}
+					</p>
+					<Button variant="outline" size="sm" className="self-start" onClick={resetPurchase}>
+						Try again
+					</Button>
+				</div>
 			)}
 		</div>
 	);
