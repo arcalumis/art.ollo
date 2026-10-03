@@ -26,7 +26,7 @@ dist-ssr
 # Generated images, uploads and database
 generated-images/
 uploads/
-data/
+/data/
 
 # Environment variables
 .env
