@@ -236,7 +236,22 @@ export async function cancelSubscription(subscriptionId: string): Promise<boolea
 	}
 }
 
-// Record a payment in the database
+export interface RecordedPayment {
+	/** payments.id of the (new or existing) row. */
+	id: string;
+	/**
+	 * True only when this call moved the payment into 'succeeded' (new row, or a failed row that
+	 * a retry paid). Revenue, metrics and receipts key off this so they happen exactly once.
+	 */
+	becameSucceeded: boolean;
+}
+
+/**
+ * Record a payment, idempotently per Stripe payment intent (or, when there is no payment intent,
+ * per invoice). Stripe retries a failed invoice on the SAME payment intent, so a later attempt
+ * updates the existing row instead of tripping the UNIQUE constraint (which used to roll the
+ * webhook back and 500 forever). A succeeded row is never downgraded by a late failure event.
+ */
 export function recordPayment(
 	userId: string,
 	stripePaymentIntentId: string | null,
@@ -246,15 +261,48 @@ export function recordPayment(
 	paymentType: string,
 	description?: string,
 	metadata?: Record<string, unknown>,
-): string {
+): RecordedPayment {
 	const db = getDb();
-	const id = crypto.randomUUID();
+	const metadataJson = metadata ? JSON.stringify(metadata) : null;
+
+	const previous = (
+		stripePaymentIntentId
+			? db.prepare("SELECT id, status FROM payments WHERE stripe_payment_intent_id = ?").get(stripePaymentIntentId)
+			: stripeInvoiceId
+				? db
+						.prepare(
+							"SELECT id, status FROM payments WHERE stripe_invoice_id = ? AND stripe_payment_intent_id IS NULL ORDER BY created_at DESC LIMIT 1",
+						)
+						.get(stripeInvoiceId)
+				: undefined
+	) as { id: string; status: string } | undefined | null;
+
+	const becameSucceeded = status === "succeeded" && previous?.status !== "succeeded";
+	// Used only when no row exists yet (an existing row keeps its id through the upsert).
+	const newId = crypto.randomUUID();
+
+	if (previous && !stripePaymentIntentId) {
+		db.prepare(`
+			UPDATE payments SET status = ?, amount_cents = ?, payment_type = ?,
+				description = COALESCE(?, description), metadata = COALESCE(?, metadata)
+			WHERE id = ? AND status <> 'succeeded'
+		`).run(status, amountCents, paymentType, description ?? null, metadataJson, previous.id);
+		return { id: previous.id, becameSucceeded };
+	}
 
 	db.prepare(`
 		INSERT INTO payments (id, user_id, stripe_payment_intent_id, stripe_invoice_id, amount_cents, status, payment_type, description, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(stripe_payment_intent_id) DO UPDATE SET
+			status = excluded.status,
+			amount_cents = excluded.amount_cents,
+			stripe_invoice_id = COALESCE(excluded.stripe_invoice_id, payments.stripe_invoice_id),
+			payment_type = excluded.payment_type,
+			description = COALESCE(excluded.description, payments.description),
+			metadata = COALESCE(excluded.metadata, payments.metadata)
+		WHERE payments.status <> 'succeeded'
 	`).run(
-		id,
+		newId,
 		userId,
 		stripePaymentIntentId,
 		stripeInvoiceId,
@@ -262,10 +310,11 @@ export function recordPayment(
 		status,
 		paymentType,
 		description ?? null,
-		metadata ? JSON.stringify(metadata) : null,
+		metadataJson,
 	);
 
-	return id;
+	const id = previous?.id ?? newId;
+	return { id, becameSucceeded };
 }
 
 // Record a revenue event

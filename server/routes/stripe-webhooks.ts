@@ -187,7 +187,7 @@ function handleInvoicePaid(invoice: Stripe.Invoice, outbox: Outbox): void {
 			? "subscription"
 			: "credit_purchase";
 
-	const paymentId = recordPayment(
+	const { id: paymentId, becameSucceeded } = recordPayment(
 		userId,
 		invoicePaymentIntentId(invoice),
 		invoice.id ?? null,
@@ -197,6 +197,12 @@ function handleInvoicePaid(invoice: Stripe.Invoice, outbox: Outbox): void {
 		invoice.description || `Invoice ${invoice.number}`,
 		{ billing_reason: invoice.billing_reason },
 	);
+
+	// A retried invoice.paid (new event id, same payment) must not count revenue twice.
+	if (!becameSucceeded) {
+		console.log(`Invoice ${invoice.id} payment already recorded as succeeded; skipping revenue and receipt`);
+		return;
+	}
 
 	recordRevenueEvent(userId, paymentType, amountCents, {
 		paymentId,
@@ -367,7 +373,10 @@ function handleCheckoutCompleted(session: Stripe.Checkout.Session, outbox: Outbo
 	}
 
 	const paymentIntentId = typeof session.payment_intent === "string" ? session.payment_intent : null;
-	if (paymentIntentId && db.prepare("SELECT 1 FROM payments WHERE stripe_payment_intent_id = ?").get(paymentIntentId)) {
+	if (
+		paymentIntentId &&
+		db.prepare("SELECT 1 FROM payments WHERE stripe_payment_intent_id = ? AND status = 'succeeded'").get(paymentIntentId)
+	) {
 		console.log(`Checkout ${session.id} already granted (payment intent ${paymentIntentId}); skipping`);
 		return;
 	}
@@ -375,7 +384,7 @@ function handleCheckoutCompleted(session: Stripe.Checkout.Session, outbox: Outbo
 	addCredits(userId, credits, "purchased", "Stripe credit purchase");
 
 	const amountCents = session.amount_total || 0;
-	const paymentId = recordPayment(
+	const { id: paymentId } = recordPayment(
 		userId,
 		paymentIntentId,
 		null,

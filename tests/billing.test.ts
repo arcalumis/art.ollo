@@ -222,6 +222,89 @@ describe("stripe webhooks", () => {
 	});
 });
 
+describe("invoice retries on the same payment intent", () => {
+	function invoice(opts: { id: string; customer: string; pi: string; amount?: number }) {
+		return {
+			id: opts.id,
+			object: "invoice",
+			customer: opts.customer,
+			payment_intent: opts.pi,
+			subscription: rid("sub"),
+			amount_paid: opts.amount ?? 1500,
+			amount_due: opts.amount ?? 1500,
+			billing_reason: "subscription_cycle",
+			number: "INV-1",
+			currency: "usd",
+		};
+	}
+	function paymentRows(pi: string) {
+		return getDb().prepare("SELECT id, status, amount_cents FROM payments WHERE stripe_payment_intent_id = ?").all(pi) as Array<{
+			id: string;
+			status: string;
+			amount_cents: number;
+		}>;
+	}
+	function revenueCount(userId: string): number {
+		return (getDb().prepare("SELECT COUNT(*) AS n FROM revenue_events WHERE user_id = ?").get(userId) as { n: number }).n;
+	}
+	function totalPaid(userId: string): number {
+		const row = getDb().prepare("SELECT total_paid_cents FROM user_metrics WHERE user_id = ?").get(userId) as
+			| { total_paid_cents: number }
+			| undefined;
+		return row?.total_paid_cents ?? 0;
+	}
+	function receiptClaims(invoiceId: string): number {
+		return (
+			getDb().prepare("SELECT COUNT(*) AS n FROM transactional_email_log WHERE dedupe_key = ?").get(`receipt:${invoiceId}`) as {
+				n: number;
+			}
+		).n;
+	}
+
+	test("failed then paid: the failed row becomes succeeded, revenue recorded once", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const inv = invoice({ id: rid("in"), customer, pi: rid("pi") });
+		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["failed"]);
+		expect(revenueCount(user.id)).toBe(0);
+
+		expect((await sendEvent("invoice.paid", inv)).statusCode).toBe(200);
+		const rows = paymentRows(inv.payment_intent);
+		expect(rows.map((r) => r.status)).toEqual(["succeeded"]);
+		expect(revenueCount(user.id)).toBe(1);
+		expect(totalPaid(user.id)).toBe(1500);
+		expect(receiptClaims(inv.id)).toBe(1);
+	});
+
+	test("failed, failed, then paid all return 200 and end as one succeeded row", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const inv = invoice({ id: rid("in"), customer, pi: rid("pi") });
+		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
+		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent)).toHaveLength(1);
+		expect((await sendEvent("invoice.paid", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["succeeded"]);
+		expect(revenueCount(user.id)).toBe(1);
+		expect(totalPaid(user.id)).toBe(1500);
+	});
+
+	test("invoice.paid delivered three times (distinct events) counts once; a late failure doesn't downgrade", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const inv = invoice({ id: rid("in"), customer, pi: rid("pi") });
+		for (let i = 0; i < 3; i++) expect((await sendEvent("invoice.paid", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["succeeded"]);
+		expect(revenueCount(user.id)).toBe(1);
+		expect(totalPaid(user.id)).toBe(1500);
+		expect(receiptClaims(inv.id)).toBe(1);
+
+		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["succeeded"]);
+	});
+});
+
 describe("subscriptions", () => {
 	test("assignSubscription retires the previous active row", () => {
 		const user = createUser();
