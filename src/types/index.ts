@@ -31,8 +31,33 @@ export interface Model {
 	maxImages?: number;
 	avgGenerationTime?: number | null;
 	sampleCount?: number;
-	/** Per-image credit cost from the server (admin overrides applied). */
+	/** Per-output credit cost at the default tier with no reference images (admin overrides applied). */
 	creditCost?: number;
+	// ---- Catalog fields from /api/models ----
+	group?: "Fast drafts" | "Best quality" | "Text and logos" | "Edit an image" | "Tools";
+	bestFor?: string[];
+	kind?: "image" | "tool";
+	hidden?: boolean;
+	minImages?: number;
+	requiresImage?: boolean;
+	/** Ratios the model renders exactly. */
+	ratios?: string[];
+	ratioChoices?: { square: string[]; portrait: string[]; landscape: string[] };
+	tiers?: ModelTierInfo[];
+	defaultTier?: "draft" | "standard" | "max";
+	maxOutputs?: number;
+	outputFormat?: string;
+	/** The signed-in user's plan includes this model at its default tier. */
+	allowed?: boolean;
+}
+
+export interface ModelTierInfo {
+	tier: "draft" | "standard" | "max";
+	label: string;
+	hint: string | null;
+	/** Credits per output, indexed by number of reference images. */
+	credits: number[];
+	allowed: boolean;
 }
 
 export interface GenerateRequest {
@@ -43,10 +68,25 @@ export interface GenerateRequest {
 	numOutputs?: number;
 	imageInputs?: string[];
 	aspectRatio?: string;
+	/** Size tier; wins over `resolution`. */
+	tier?: "draft" | "standard" | "max";
+	/** "1K" | "2K" | "4K" = Draft | Standard | Max. */
 	resolution?: string;
 	outputFormat?: string;
 	seed?: number;
+	/** Vary: the server picks an allowed model that takes the image as a reference. */
+	variation?: boolean;
+	threadId?: string;
 }
+
+/** POST /api/tools/:tool request body. */
+export interface ToolRequest {
+	/** "/images/<file>" or "/uploads/<file>" the user owns. */
+	image: string;
+	threadId?: string;
+}
+
+export type ToolName = "upscale" | "remove-background";
 
 /** Machine-readable error codes from /api/generate, plus client-side ones. */
 export type GenerateErrorCode =
@@ -68,7 +108,12 @@ export type GenerateErrorCode =
 export interface GenerateResponse {
 	id: string;
 	status: "starting" | "processing" | "succeeded" | "failed";
-	images?: { id: string; url: string; cost?: number }[];
+	images?: { id: string; url: string; cost?: number; width?: number; height?: number }[];
+	/** Set on /api/tools responses. */
+	tool?: ToolName;
+	tier?: "draft" | "standard" | "max";
+	/** The ratio the model rendered (after snapping). */
+	aspectRatio?: string;
 	cost?: number;
 	/** Server text; for logs only, never shown to users (UI branches on `code`). */
 	error?: string;
@@ -92,6 +137,8 @@ export interface HistoryResponse {
 
 export interface ModelsResponse {
 	models: Model[];
+	tools?: { id: string; name: string; description: string; creditCost: number }[];
+	defaultModel?: string;
 }
 
 export interface User {

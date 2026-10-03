@@ -44,7 +44,7 @@ import {
 } from "../services/usage";
 import { getUserApiKey } from "./user";
 
-interface ExtendedGenerateRequest extends Omit<GenerateRequest, "prompt"> {
+interface ExtendedGenerateRequest extends Omit<GenerateRequest, "prompt" | "tier"> {
 	prompt?: string;
 	imageInputs?: string[];
 	aspectRatio?: string;
