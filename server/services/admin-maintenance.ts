@@ -50,7 +50,9 @@ export function refreshMonthlySnapshots(now: Date = new Date()): void {
 	const previous = addUtcMonths(current, -1);
 	const prevStart = previous.toISOString().slice(0, 10);
 	const prevRow = db
-		.prepare("SELECT computed_at FROM financial_periods WHERE period_type = 'monthly' AND period_start = ?")
+		.prepare(
+			"SELECT computed_at FROM financial_periods WHERE period_type = 'monthly' AND period_start = ?",
+		)
 		.get(prevStart) as { computed_at: string | null } | undefined;
 	const closedAt = current.toISOString().slice(0, 19).replace("T", " ");
 	if (!prevRow || !prevRow.computed_at || prevRow.computed_at < closedAt) {
@@ -80,7 +82,9 @@ export function runAdminMaintenance(): void {
 	step("backfill financial periods", () => {
 		if (migrationDone(PERIOD_BACKFILL_MIGRATION)) return;
 		const n = backfillFinancialPeriods();
-		getDb().prepare("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)").run(PERIOD_BACKFILL_MIGRATION);
+		getDb()
+			.prepare("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)")
+			.run(PERIOD_BACKFILL_MIGRATION);
 		console.log(`[migration] Backfilled ${n} monthly financial snapshots`);
 	});
 	step("monthly snapshots", () => refreshMonthlySnapshots());
@@ -116,7 +120,9 @@ export function getReconcileJob(): ReconcileJobState {
  */
 export function startReconcileJob(
 	startedBy: string | null,
-	run: (limit: number) => Promise<{ processed: number; reconciled: number; errors: number }> = reconcileAllCosts,
+	run: (
+		limit: number,
+	) => Promise<{ processed: number; reconciled: number; errors: number }> = reconcileAllCosts,
 	limit = 500,
 ): { started: boolean; job: ReconcileJobState } {
 	if (reconcileState.status === "running") return { started: false, job: getReconcileJob() };
@@ -131,7 +137,12 @@ export function startReconcileJob(
 	const promise = Promise.resolve()
 		.then(() => run(limit))
 		.then((result) => {
-			reconcileState = { ...reconcileState, status: "done", finishedAt: new Date().toISOString(), result };
+			reconcileState = {
+				...reconcileState,
+				status: "done",
+				finishedAt: new Date().toISOString(),
+				result,
+			};
 		})
 		.catch((err: unknown) => {
 			reconcileState = {

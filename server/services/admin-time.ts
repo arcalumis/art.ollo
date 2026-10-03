@@ -20,7 +20,9 @@ export function toSqlDate(date: Date): string {
 /** Parse a DB time ("YYYY-MM-DD HH:MM:SS" UTC, or ISO) to epoch ms. */
 export function dbTimeMs(value: string | null | undefined): number | null {
 	if (!value) return null;
-	const iso = value.includes("T") ? value : `${value.replace(" ", "T")}${value.length <= 10 ? "T00:00:00" : ""}Z`;
+	const iso = value.includes("T")
+		? value
+		: `${value.replace(" ", "T")}${value.length <= 10 ? "T00:00:00" : ""}Z`;
 	const t = Date.parse(iso);
 	return Number.isNaN(t) ? null : t;
 }
@@ -59,7 +61,8 @@ export class InvalidDateError extends Error {
 
 /** Parse a query/body date. Throws InvalidDateError (routes answer 400) for garbage. */
 export function parseDateParam(value: unknown, field: string): Date {
-	if (typeof value !== "string" || value.trim() === "" || value.length > 40) throw new InvalidDateError(field);
+	if (typeof value !== "string" || value.trim() === "" || value.length > 40)
+		throw new InvalidDateError(field);
 	const d = new Date(value);
 	if (Number.isNaN(d.getTime())) throw new InvalidDateError(field);
 	return d;

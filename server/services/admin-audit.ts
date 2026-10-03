@@ -88,7 +88,11 @@ function parseJson(value: string | null): unknown {
 	}
 }
 
-export function listAudit(filter: AuditFilter = {}): { entries: AuditRow[]; total: number; actions: string[] } {
+export function listAudit(filter: AuditFilter = {}): {
+	entries: AuditRow[];
+	total: number;
+	actions: string[];
+} {
 	const db = getDb();
 	const where: string[] = [];
 	const params: SQLQueryBindings[] = [];
@@ -109,7 +113,9 @@ export function listAudit(filter: AuditFilter = {}): { entries: AuditRow[]; tota
 		params.push(filter.targetId);
 	}
 	if (filter.q) {
-		where.push("(a.reason LIKE ? OR a.admin_username LIKE ? OR u.username LIKE ? OR u.email LIKE ? OR a.target_id = ?)");
+		where.push(
+			"(a.reason LIKE ? OR a.admin_username LIKE ? OR u.username LIKE ? OR u.email LIKE ? OR a.target_id = ?)",
+		);
 		const like = `%${filter.q}%`;
 		params.push(like, like, like, like, filter.q);
 	}
@@ -140,7 +146,9 @@ export function listAudit(filter: AuditFilter = {}): { entries: AuditRow[]; tota
 		created_at: string | null;
 	}>;
 	const actions = (
-		db.prepare("SELECT DISTINCT action FROM admin_audit_log ORDER BY action").all() as Array<{ action: string }>
+		db.prepare("SELECT DISTINCT action FROM admin_audit_log ORDER BY action").all() as Array<{
+			action: string;
+		}>
 	).map((r) => r.action);
 
 	return {

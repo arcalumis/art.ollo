@@ -13,7 +13,9 @@ import { isoOrNull } from "./admin-time";
 export function recordWebhookFailure(eventId: string, eventType: string, error: unknown): void {
 	try {
 		getDb()
-			.prepare("INSERT INTO webhook_failures (id, stripe_event_id, event_type, error) VALUES (?, ?, ?, ?)")
+			.prepare(
+				"INSERT INTO webhook_failures (id, stripe_event_id, event_type, error) VALUES (?, ?, ?, ?)",
+			)
 			.run(
 				crypto.randomUUID(),
 				eventId,
@@ -59,7 +61,9 @@ export function replicateFailureWindow(hours: number): FailureWindow {
 }
 
 /** Newest file mtime in the backup directory (BACKUP_DIR, default the host path); null if absent. */
-export function lastBackupTime(dir = process.env.BACKUP_DIR || "/home/baud/backups/ollo"): string | null {
+export function lastBackupTime(
+	dir = process.env.BACKUP_DIR || "/home/baud/backups/ollo",
+): string | null {
 	try {
 		if (!fs.existsSync(dir)) return null;
 		let newest = 0;
@@ -100,7 +104,14 @@ export function getHealth() {
 			ORDER BY lastFailedAt DESC
 			LIMIT 50
 		`)
-		.all() as Array<{ eventId: string; type: string; lastFailedAt: string; attempts: number; error: string; resolved: number }>;
+		.all() as Array<{
+		eventId: string;
+		type: string;
+		lastFailedAt: string;
+		attempts: number;
+		error: string;
+		resolved: number;
+	}>;
 
 	const failedPayments = db
 		.prepare(`
@@ -111,7 +122,15 @@ export function getHealth() {
 			ORDER BY datetime(p.created_at) DESC
 			LIMIT 20
 		`)
-		.all() as Array<{ id: string; userId: string; username: string | null; amountCents: number; invoiceId: string | null; description: string | null; createdAt: string }>;
+		.all() as Array<{
+		id: string;
+		userId: string;
+		username: string | null;
+		amountCents: number;
+		invoiceId: string | null;
+		description: string | null;
+		createdAt: string;
+	}>;
 
 	const capRows = db
 		.prepare(`
@@ -125,9 +144,17 @@ export function getHealth() {
 			ORDER BY day DESC
 			LIMIT 20
 		`)
-		.all(PER_RECIPIENT_HOURLY, PER_RECIPIENT_DAILY) as Array<{ recipient: string; hour: number; day: number }>;
+		.all(PER_RECIPIENT_HOURLY, PER_RECIPIENT_DAILY) as Array<{
+		recipient: string;
+		hour: number;
+		day: number;
+	}>;
 	const emailTotal = (
-		db.prepare("SELECT COUNT(*) AS n FROM email_send_log WHERE datetime(created_at) > datetime('now', '-1 day')").get() as {
+		db
+			.prepare(
+				"SELECT COUNT(*) AS n FROM email_send_log WHERE datetime(created_at) > datetime('now', '-1 day')",
+			)
+			.get() as {
 			n: number;
 		}
 	).n;
@@ -144,7 +171,14 @@ export function getHealth() {
 			ORDER BY createdAt DESC
 			LIMIT 50
 		`)
-		.all() as Array<{ kind: string; id: string; userId: string; username: string | null; amountSol: number; createdAt: string }>;
+		.all() as Array<{
+		kind: string;
+		id: string;
+		userId: string;
+		username: string | null;
+		amountSol: number;
+		createdAt: string;
+	}>;
 
 	const unreconciled = db
 		.prepare(`

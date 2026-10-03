@@ -23,13 +23,15 @@ export interface BackfillGeneration {
 
 /** Official-formula cost of one historical generation (all of its outputs), in USD. */
 export function estimateHistoricalCost(gen: BackfillGeneration): number {
-	let params: { resolution?: unknown; tier?: unknown; imageInputs?: unknown; images?: unknown } = {};
+	let params: { resolution?: unknown; tier?: unknown; imageInputs?: unknown; images?: unknown } =
+		{};
 	try {
 		params = gen.parameters ? JSON.parse(gen.parameters) : {};
 	} catch {
 		params = {};
 	}
-	const outputs = Array.isArray(params.images) && params.images.length > 0 ? params.images.length : 1;
+	const outputs =
+		Array.isArray(params.images) && params.images.length > 0 ? params.images.length : 1;
 	const refs = Array.isArray(params.imageInputs) ? params.imageInputs.length : 0;
 	const model = getCatalogModel(gen.model);
 	if (!model) {
@@ -58,7 +60,12 @@ export function backfillPlatformCosts(db: Database): number {
 			AND NOT EXISTS (SELECT 1 FROM platform_costs pc WHERE pc.generation_id = g.id)
 		`)
 		.all() as Array<
-		BackfillGeneration & { id: string; replicate_id: string; predict_time: number | null; created_at: string }
+		BackfillGeneration & {
+			id: string;
+			replicate_id: string;
+			predict_time: number | null;
+			created_at: string;
+		}
 	>;
 	const insert = db.prepare(`
 		INSERT INTO platform_costs
@@ -78,6 +85,7 @@ export function backfillPlatformCosts(db: Database): number {
 			BACKFILL_SOURCE,
 		);
 	}
-	if (rows.length > 0) console.log(`[migration] Backfilled ${rows.length} estimated platform_costs rows`);
+	if (rows.length > 0)
+		console.log(`[migration] Backfilled ${rows.length} estimated platform_costs rows`);
 	return rows.length;
 }

@@ -69,7 +69,10 @@ export interface PeriodComparison {
 export type PeriodType = "daily" | "monthly" | "quarterly" | "yearly";
 
 /** [start, end) of the UTC period containing `date`. */
-export function getPeriodRange(periodType: PeriodType, date: Date = new Date()): { start: Date; end: Date } {
+export function getPeriodRange(
+	periodType: PeriodType,
+	date: Date = new Date(),
+): { start: Date; end: Date } {
 	switch (periodType) {
 		case "daily": {
 			const start = startOfUtcDay(date);
@@ -91,7 +94,10 @@ export function getPeriodRange(periodType: PeriodType, date: Date = new Date()):
 	}
 }
 
-function getPreviousPeriodRange(periodType: PeriodType, date: Date = new Date()): { start: Date; end: Date } {
+function getPreviousPeriodRange(
+	periodType: PeriodType,
+	date: Date = new Date(),
+): { start: Date; end: Date } {
 	const { start } = getPeriodRange(periodType, date);
 	return getPeriodRange(periodType, new Date(start.getTime() - 1));
 }
@@ -136,7 +142,11 @@ export function calculateMetrics(startDate: Date, endDate: Date): FinancialMetri
 			FROM platform_costs
 			WHERE datetime(created_at) >= datetime(?) AND datetime(created_at) < datetime(?)
 		`)
-		.get(start, end) as { estimated: number | null; actual: number | null; backfilled: number | null };
+		.get(start, end) as {
+		estimated: number | null;
+		actual: number | null;
+		backfilled: number | null;
+	};
 	const costs = {
 		platform: costRow.actual || 0,
 		estimated: costRow.estimated || 0,
@@ -180,14 +190,17 @@ export function calculateMetrics(startDate: Date, endDate: Date): FinancialMetri
 		`)
 		.all(start, end, start, end) as Array<{ user_id: string }>;
 	const churned = churnedRows.length;
-	const churnRate = startSnap.paidSubscribers > 0 ? (churned / startSnap.paidSubscribers) * 100 : null;
+	const churnRate =
+		startSnap.paidSubscribers > 0 ? (churned / startSnap.paidSubscribers) * 100 : null;
 
 	const mrr = endSnap.mrrCents / 100;
 	const activePaid = endSnap.paidSubscribers;
 	const arpu = activePaid > 0 ? revenue.total / activePaid : null;
 
 	const avgMonths = db
-		.prepare("SELECT AVG(subscription_months) AS avg FROM user_metrics WHERE subscription_months > 0")
+		.prepare(
+			"SELECT AVG(subscription_months) AS avg FROM user_metrics WHERE subscription_months > 0",
+		)
 		.get() as { avg: number | null };
 	const ltv = arpu !== null && avgMonths.avg ? arpu * avgMonths.avg : null;
 
@@ -232,7 +245,10 @@ export function getMetricsWithComparison(periodType: PeriodType): PeriodComparis
 		changes: {
 			revenue: calcChange(currentMetrics.revenue.total, previousMetrics.revenue.total),
 			profit: calcChange(currentMetrics.profit.gross, previousMetrics.profit.gross),
-			subscribers: calcChange(currentMetrics.subscribers.active, previousMetrics.subscribers.active),
+			subscribers: calcChange(
+				currentMetrics.subscribers.active,
+				previousMetrics.subscribers.active,
+			),
 			mrr: calcChange(currentMetrics.mrr, previousMetrics.mrr),
 			generations: calcChange(currentMetrics.generations, previousMetrics.generations),
 		},
@@ -268,14 +284,24 @@ export function getRevenueByTier(
 			GROUP BY tier
 			ORDER BY revenue DESC
 		`)
-		.all(toSqlTime(startDate), toSqlTime(endDate)) as Array<{ tier: string; revenue: number; subscribers: number }>;
+		.all(toSqlTime(startDate), toSqlTime(endDate)) as Array<{
+		tier: string;
+		revenue: number;
+		subscribers: number;
+	}>;
 }
 
 export function getTopCustomers(
 	startDate: Date,
 	endDate: Date,
 	limit = 10,
-): Array<{ userId: string; username: string; email: string | null; revenue: number; generations: number }> {
+): Array<{
+	userId: string;
+	username: string;
+	email: string | null;
+	revenue: number;
+	generations: number;
+}> {
 	const db = getDb();
 	const start = toSqlTime(startDate);
 	const end = toSqlTime(endDate);
@@ -305,7 +331,13 @@ export function getTopCustomers(
 export function getCostsByModel(
 	startDate: Date,
 	endDate: Date,
-): Array<{ model: string; estimatedCost: number; actualCost: number; generations: number; avgCost: number }> {
+): Array<{
+	model: string;
+	estimatedCost: number;
+	actualCost: number;
+	generations: number;
+	avgCost: number;
+}> {
 	const db = getDb();
 	const rows = db
 		.prepare(`
@@ -338,7 +370,10 @@ export interface TrendPoint {
 }
 
 /** Revenue, cost, paid subscribers (at period end) and signups per UTC day/week/month. */
-export function getRevenueTrend(periodType: "daily" | "weekly" | "monthly", count: number): TrendPoint[] {
+export function getRevenueTrend(
+	periodType: "daily" | "weekly" | "monthly",
+	count: number,
+): TrendPoint[] {
 	const db = getDb();
 	const records = loadSubscriptionRecords(db);
 	const now = new Date();
@@ -381,7 +416,10 @@ export function getRevenueTrend(periodType: "daily" | "weekly" | "monthly", coun
 		const revenue = (revenueStmt.get(a, b) as { total: number }).total;
 		const costs = (costStmt.get(a, b) as { total: number }).total;
 		const signups = (signupStmt.get(a, b) as { n: number }).n;
-		const snap: PaidSnapshot = paidSnapshot(new Date(Math.min(end.getTime() - 1, now.getTime())), records);
+		const snap: PaidSnapshot = paidSnapshot(
+			new Date(Math.min(end.getTime() - 1, now.getTime())),
+			records,
+		);
 		points.push({
 			period: label,
 			start: start.toISOString(),

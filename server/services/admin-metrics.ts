@@ -5,9 +5,18 @@
 import type { SQLQueryBindings } from "bun:sqlite";
 import { getDb } from "../db";
 import { listAudit } from "./admin-audit";
-import { listCurrentSubscriptions, loadSubscriptionRecords, paidSnapshot } from "./admin-subscriptions";
+import {
+	listCurrentSubscriptions,
+	loadSubscriptionRecords,
+	paidSnapshot,
+} from "./admin-subscriptions";
 import { isoOrNull, startOfUtcMonth } from "./admin-time";
-import { SOL_REVENUE_SQL, calculateMetrics, getRevenueByTier, getRevenueTrend } from "./financial-reports";
+import {
+	SOL_REVENUE_SQL,
+	calculateMetrics,
+	getRevenueByTier,
+	getRevenueTrend,
+} from "./financial-reports";
 import { CATALOG, CREDIT_MULTIPLIER, TIERS, catalogCredits, priceOfOutput } from "./model-catalog";
 
 // ---- Overview ------------------------------------------------------------------------
@@ -39,7 +48,12 @@ export function getOverview(now: Date = new Date()) {
 					AND EXISTS (SELECT 1 FROM generations g WHERE g.user_id = u.id) THEN 1 ELSE 0 END) AS activated30
 			FROM users u WHERE u.deleted_at IS NULL
 		`)
-		.get() as { users: number; activated: number | null; users30: number | null; activated30: number | null };
+		.get() as {
+		users: number;
+		activated: number | null;
+		users30: number | null;
+		activated30: number | null;
+	};
 
 	const failedPayments = (
 		db
@@ -91,7 +105,12 @@ export function getOverview(now: Date = new Date()) {
 
 // ---- Users ---------------------------------------------------------------------------
 
-export function listUsers(opts: { search?: string; page?: number; limit?: number; filter?: string }) {
+export function listUsers(opts: {
+	search?: string;
+	page?: number;
+	limit?: number;
+	filter?: string;
+}) {
 	const db = getDb();
 	const search = (opts.search ?? "").trim().slice(0, 100);
 	const limit = Math.min(100, Math.max(1, opts.limit ?? 25));
@@ -106,7 +125,9 @@ export function listUsers(opts: { search?: string; page?: number; limit?: number
 	if (opts.filter === "admins") where.push("u.is_admin = 1");
 	if (opts.filter === "inactive") where.push("(u.is_active = 0 OR u.deleted_at IS NOT NULL)");
 	const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-	const total = (db.prepare(`SELECT COUNT(*) AS n FROM users u ${whereSql}`).get(...params) as { n: number }).n;
+	const total = (
+		db.prepare(`SELECT COUNT(*) AS n FROM users u ${whereSql}`).get(...params) as { n: number }
+	).n;
 	const rows = db
 		.prepare(`
 			SELECT u.id, u.username, u.email, u.wallet_address, u.is_admin, u.is_active, u.deleted_at,
@@ -195,7 +216,13 @@ export function getUserDetail(userId: string) {
 		.prepare(
 			"SELECT id, credit_type, amount, reason, created_at FROM user_credits WHERE user_id = ? ORDER BY datetime(created_at) DESC, rowid DESC",
 		)
-		.all(userId) as Array<{ id: string; credit_type: string; amount: number; reason: string | null; created_at: string }>;
+		.all(userId) as Array<{
+		id: string;
+		credit_type: string;
+		amount: number;
+		reason: string | null;
+		created_at: string;
+	}>;
 	const balance = ledger.reduce((s, r) => s + r.amount, 0);
 
 	const generations = db
@@ -229,7 +256,9 @@ export function getUserDetail(userId: string) {
 		`)
 		.get(userId) as { n: number; cost: number };
 
-	const subs = loadSubscriptionRecords(db).filter((r) => r.userId === userId).reverse();
+	const subs = loadSubscriptionRecords(db)
+		.filter((r) => r.userId === userId)
+		.reverse();
 	const current = listCurrentSubscriptions(db).find((s) => s.userId === userId) ?? null;
 	const boosts = db
 		.prepare(`
@@ -256,7 +285,13 @@ export function getUserDetail(userId: string) {
 			FROM share_links s LEFT JOIN generations g ON g.id = s.generation_id
 			WHERE s.user_id = ? ORDER BY datetime(s.created_at) DESC
 		`)
-		.all(userId) as Array<{ slug: string; generation_id: string; created_at: string; revoked_at: string | null; image_path: string | null }>;
+		.all(userId) as Array<{
+		slug: string;
+		generation_id: string;
+		created_at: string;
+		revoked_at: string | null;
+		image_path: string | null;
+	}>;
 	const stripeCustomer = db
 		.prepare("SELECT stripe_customer_id FROM stripe_customers WHERE user_id = ? LIMIT 1")
 		.get(userId) as { stripe_customer_id: string } | undefined;
@@ -344,7 +379,13 @@ export interface PaymentItem {
 }
 
 /** Stripe payments, Stripe revenue events without a payment row, and SOL transactions, newest first. */
-export function listPayments(opts: { userId?: string; method?: string; status?: string; limit?: number; page?: number }) {
+export function listPayments(opts: {
+	userId?: string;
+	method?: string;
+	status?: string;
+	limit?: number;
+	page?: number;
+}) {
 	const db = getDb();
 	const limit = Math.min(500, Math.max(1, opts.limit ?? 50));
 	const page = Math.max(1, opts.page ?? 1);
@@ -413,7 +454,9 @@ export function listPayments(opts: { userId?: string; method?: string; status?: 
 
 	// SOL USD value: the revenue event booked at verification (same user, within 10 minutes).
 	const solRevenue = db
-		.prepare(`SELECT user_id, amount_cents, created_at FROM revenue_events WHERE ${SOL_REVENUE_SQL}`)
+		.prepare(
+			`SELECT user_id, amount_cents, created_at FROM revenue_events WHERE ${SOL_REVENUE_SQL}`,
+		)
 		.all() as Array<{ user_id: string; amount_cents: number; created_at: string }>;
 	const solUsd = (userId: string, at: string, status: string): number | null => {
 		if (status !== "completed") return null;
@@ -470,14 +513,16 @@ export function listPayments(opts: { userId?: string; method?: string; status?: 
 			amountSol: r.amount_sol,
 			currency: "sol",
 			status: r.status,
-			description: r.kind === "subscription" ? `${r.plan ?? "Plan"} (SOL)` : `${r.credits ?? 0} credits (SOL)`,
+			description:
+				r.kind === "subscription" ? `${r.plan ?? "Plan"} (SOL)` : `${r.credits ?? 0} credits (SOL)`,
 			stripePaymentIntentId: null,
 			stripeInvoiceId: null,
 			signature: r.transaction_signature?.startsWith("pending_") ? null : r.transaction_signature,
 			createdAt: isoOrNull(r.created_at),
 		})),
 	];
-	if (opts.method === "card" || opts.method === "sol") items = items.filter((i) => i.method === opts.method);
+	if (opts.method === "card" || opts.method === "sol")
+		items = items.filter((i) => i.method === opts.method);
 	if (opts.status) items = items.filter((i) => i.status === opts.status);
 	items.sort((a, b) => Date.parse(b.createdAt ?? "") - Date.parse(a.createdAt ?? ""));
 	return {
@@ -522,7 +567,12 @@ export function getModelEconomics(days: number) {
 			FROM generations g LEFT JOIN platform_costs pc ON pc.generation_id = g.id
 			WHERE 1 = 1 ${sinceSql}
 		`)
-		.all(...sinceParam) as Array<{ model: string; predict_time: number | null; cost: number; cost_source: string | null }>;
+		.all(...sinceParam) as Array<{
+		model: string;
+		predict_time: number | null;
+		cost: number;
+		cost_source: string | null;
+	}>;
 
 	const used = db
 		.prepare(`
@@ -546,7 +596,14 @@ export function getModelEconomics(days: number) {
 	const reservationModel = new Map<string, string>();
 	const stats = new Map<
 		string,
-		{ runs: number; failures: number; credits: number; cost: number; estimatedCost: number; latencies: number[] }
+		{
+			runs: number;
+			failures: number;
+			credits: number;
+			cost: number;
+			estimatedCost: number;
+			latencies: number[];
+		}
 	>();
 	const get = (model: string) => {
 		let s = stats.get(model);
@@ -581,18 +638,31 @@ export function getModelEconomics(days: number) {
 	}
 
 	const overrides = new Map(
-		(db.prepare("SELECT model_id, credit_cost FROM model_credit_costs").all() as Array<{ model_id: string; credit_cost: number }>).map(
-			(r) => [r.model_id, r.credit_cost],
-		),
+		(
+			db.prepare("SELECT model_id, credit_cost FROM model_credit_costs").all() as Array<{
+				model_id: string;
+				credit_cost: number;
+			}>
+		).map((r) => [r.model_id, r.credit_cost]),
 	);
 	const vpc = valuePerCredit();
 	const catalogIds = new Set(CATALOG.map((m) => m.id));
-	const ids = [...CATALOG.map((m) => m.id), ...[...stats.keys()].filter((id) => !catalogIds.has(id))];
+	const ids = [
+		...CATALOG.map((m) => m.id),
+		...[...stats.keys()].filter((id) => !catalogIds.has(id)),
+	];
 
 	const models = ids
 		.map((id) => {
 			const m = CATALOG.find((c) => c.id === id);
-			const s = stats.get(id) ?? { runs: 0, failures: 0, credits: 0, cost: 0, estimatedCost: 0, latencies: [] };
+			const s = stats.get(id) ?? {
+				runs: 0,
+				failures: 0,
+				credits: 0,
+				cost: 0,
+				estimatedCost: 0,
+				latencies: [],
+			};
 			const lat = [...s.latencies].sort((a, b) => a - b);
 			const attempts = s.runs + s.failures;
 			const revenueCents = s.credits * vpc.cents;
@@ -629,7 +699,12 @@ export function getModelEconomics(days: number) {
 
 // ---- Moderation --------------------------------------------------------------------------
 
-export function getRecentImages(opts: { page?: number; limit?: number; userId?: string; includeRemoved?: boolean }) {
+export function getRecentImages(opts: {
+	page?: number;
+	limit?: number;
+	userId?: string;
+	includeRemoved?: boolean;
+}) {
 	const db = getDb();
 	const limit = Math.min(120, Math.max(1, opts.limit ?? 48));
 	const page = Math.max(1, opts.page ?? 1);
@@ -641,7 +716,11 @@ export function getRecentImages(opts: { page?: number; limit?: number; userId?: 
 		params.push(opts.userId);
 	}
 	const whereSql = `WHERE ${where.join(" AND ")}`;
-	const total = (db.prepare(`SELECT COUNT(*) AS n FROM generations g ${whereSql}`).get(...params) as { n: number }).n;
+	const total = (
+		db.prepare(`SELECT COUNT(*) AS n FROM generations g ${whereSql}`).get(...params) as {
+			n: number;
+		}
+	).n;
 	const rows = db
 		.prepare(`
 			SELECT g.id, g.prompt, g.model, g.image_path, g.width, g.height, g.created_at, g.user_id, u.username,

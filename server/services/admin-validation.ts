@@ -26,14 +26,22 @@ export function checkCreditAmount(value: unknown): Check<number> {
 		return fail("INVALID_AMOUNT", "Enter a whole number of credits other than 0.");
 	}
 	if (Math.abs(value) > MAX_CREDIT_ADJUSTMENT) {
-		return fail("AMOUNT_TOO_LARGE", `Adjust at most ${MAX_CREDIT_ADJUSTMENT.toLocaleString("en-US")} credits at a time.`);
+		return fail(
+			"AMOUNT_TOO_LARGE",
+			`Adjust at most ${MAX_CREDIT_ADJUSTMENT.toLocaleString("en-US")} credits at a time.`,
+		);
 	}
 	return { ok: true, value };
 }
 
 export function checkBoostDays(value: unknown): Check<number> {
 	const days = value === undefined ? 30 : value;
-	if (typeof days !== "number" || !Number.isInteger(days) || days < MIN_BOOST_DAYS || days > MAX_BOOST_DAYS) {
+	if (
+		typeof days !== "number" ||
+		!Number.isInteger(days) ||
+		days < MIN_BOOST_DAYS ||
+		days > MAX_BOOST_DAYS
+	) {
 		return fail("INVALID_DURATION", `Boosts last ${MIN_BOOST_DAYS} to ${MAX_BOOST_DAYS} days.`);
 	}
 	return { ok: true, value: days };
@@ -79,7 +87,8 @@ export interface CreditPackageInput {
  */
 export function checkCreditPackage(input: CreditPackageInput): Check<CreditPackageInput> {
 	const name = typeof input.name === "string" ? input.name.trim() : "";
-	if (!name || name.length > 80) return fail("INVALID_NAME", "Give the pack a name (up to 80 characters).");
+	if (!name || name.length > 80)
+		return fail("INVALID_NAME", "Give the pack a name (up to 80 characters).");
 	if (!Number.isInteger(input.credits) || input.credits < 1 || input.credits > 1_000_000) {
 		return fail("INVALID_CREDITS", "Credits must be a whole number from 1 to 1,000,000.");
 	}
@@ -87,16 +96,27 @@ export function checkCreditPackage(input: CreditPackageInput): Check<CreditPacka
 		return fail("NO_PAYMENT_METHOD", "Sell the pack for USD, SOL, or both.");
 	}
 	if (input.availableForUsd) {
-		if (typeof input.priceCents !== "number" || !Number.isInteger(input.priceCents) || input.priceCents < 1) {
+		if (
+			typeof input.priceCents !== "number" ||
+			!Number.isInteger(input.priceCents) ||
+			input.priceCents < 1
+		) {
 			return fail("INVALID_PRICE_CENTS", "A USD pack needs a price in whole cents above 0.");
 		}
 	}
 	if (input.availableForSol) {
-		if (typeof input.priceSol !== "number" || !Number.isFinite(input.priceSol) || input.priceSol <= 0) {
+		if (
+			typeof input.priceSol !== "number" ||
+			!Number.isFinite(input.priceSol) ||
+			input.priceSol <= 0
+		) {
 			return fail("INVALID_PRICE_SOL", "A SOL pack needs a SOL price above 0.");
 		}
 	}
-	if (input.stripePriceId !== null && (typeof input.stripePriceId !== "string" || input.stripePriceId.length > 200)) {
+	if (
+		input.stripePriceId !== null &&
+		(typeof input.stripePriceId !== "string" || input.stripePriceId.length > 200)
+	) {
 		return fail("INVALID_STRIPE_PRICE", "Stripe price id is not valid.");
 	}
 	return {
@@ -111,8 +131,10 @@ export function checkCreditPackage(input: CreditPackageInput): Check<CreditPacka
 	};
 }
 
-const optionalNonNegative = (v: unknown) => v === undefined || v === null || (typeof v === "number" && Number.isFinite(v) && v >= 0);
-const optionalNonNegativeInt = (v: unknown) => v === undefined || v === null || (typeof v === "number" && Number.isInteger(v) && v >= 0);
+const optionalNonNegative = (v: unknown) =>
+	v === undefined || v === null || (typeof v === "number" && Number.isFinite(v) && v >= 0);
+const optionalNonNegativeInt = (v: unknown) =>
+	v === undefined || v === null || (typeof v === "number" && Number.isInteger(v) && v >= 0);
 
 /** Light sanity checks on a plan edit (only the fields present). */
 export function checkProductFields(body: Record<string, unknown>, creating: boolean): Check<null> {
@@ -122,10 +144,12 @@ export function checkProductFields(body: Record<string, unknown>, creating: bool
 		}
 	}
 	for (const f of ["price", "priceSol", "monthlyCostLimit"]) {
-		if (!optionalNonNegative(body[f])) return fail("INVALID_FIELD", `${f} must be a number 0 or above.`);
+		if (!optionalNonNegative(body[f]))
+			return fail("INVALID_FIELD", `${f} must be a number 0 or above.`);
 	}
 	for (const f of ["monthlyImageLimit", "dailyImageLimit", "bonusCredits", "creditRefillAmount"]) {
-		if (!optionalNonNegativeInt(body[f])) return fail("INVALID_FIELD", `${f} must be a whole number 0 or above.`);
+		if (!optionalNonNegativeInt(body[f]))
+			return fail("INVALID_FIELD", `${f} must be a whole number 0 or above.`);
 	}
 	if (body.topoffIntervalHours !== undefined) {
 		const h = body.topoffIntervalHours;
@@ -134,7 +158,10 @@ export function checkProductFields(body: Record<string, unknown>, creating: bool
 		}
 	}
 	if (body.allowedModels !== undefined && body.allowedModels !== null) {
-		if (!Array.isArray(body.allowedModels) || !body.allowedModels.every((m) => typeof m === "string")) {
+		if (
+			!Array.isArray(body.allowedModels) ||
+			!body.allowedModels.every((m) => typeof m === "string")
+		) {
 			return fail("INVALID_FIELD", "allowedModels must be a list of model ids or null.");
 		}
 	}

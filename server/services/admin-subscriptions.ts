@@ -11,7 +11,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { getDb } from "../db";
-import { DAY_MS, DAYS_PER_MONTH, dbTimeMs, isoOrNull } from "./admin-time";
+import { DAYS_PER_MONTH, DAY_MS, dbTimeMs, isoOrNull } from "./admin-time";
 import { assignSubscription } from "./usage";
 
 export type SubscriptionSource = "stripe" | "sol" | "admin" | "free" | "boost";
@@ -50,12 +50,19 @@ export interface SubscriptionRecord {
 
 const ENTITLED = new Set(["active", "trialing"]);
 /** Stripe states after which a subscription no longer bills. */
-const STRIPE_ENDED = new Set(["canceled", "incomplete", "incomplete_expired", "unpaid", "superseded", "expired"]);
+const STRIPE_ENDED = new Set([
+	"canceled",
+	"incomplete",
+	"incomplete_expired",
+	"unpaid",
+	"superseded",
+	"expired",
+]);
 
 function latestSolPriceUsd(db: Database): number | null {
-	const row = db.prepare("SELECT price_usd FROM sol_price_snapshots ORDER BY captured_at DESC LIMIT 1").get() as
-		| { price_usd: number }
-		| undefined;
+	const row = db
+		.prepare("SELECT price_usd FROM sol_price_snapshots ORDER BY captured_at DESC LIMIT 1")
+		.get() as { price_usd: number } | undefined;
 	return row?.price_usd ?? null;
 }
 
@@ -79,7 +86,9 @@ export function loadSubscriptionRecords(db: Database = getDb()): SubscriptionRec
 
 	const solPrice = latestSolPriceUsd(db);
 	const solEvents = db
-		.prepare("SELECT user_id, amount_cents, created_at FROM revenue_events WHERE event_type = 'sol_subscription'")
+		.prepare(
+			"SELECT user_id, amount_cents, created_at FROM revenue_events WHERE event_type = 'sol_subscription'",
+		)
 		.all() as Array<{ user_id: string; amount_cents: number; created_at: string }>;
 	/** The SOL revenue event booked for this payment: same user, nearest within 10 minutes. */
 	const solRevenueCents = (userId: string, paidAt: string | null): number | null => {
@@ -107,7 +116,10 @@ export function loadSubscriptionRecords(db: Database = getDb()): SubscriptionRec
 			monthlyValueCents = Math.round((r.product_price ?? 0) * 100);
 		} else if (source === "sol") {
 			const paidCents =
-				solRevenueCents(r.user_id, r.sol_paid_at) ?? (solPrice !== null && r.sol_amount_sol !== null ? Math.round(r.sol_amount_sol * solPrice * 100) : 0);
+				solRevenueCents(r.user_id, r.sol_paid_at) ??
+				(solPrice !== null && r.sol_amount_sol !== null
+					? Math.round(r.sol_amount_sol * solPrice * 100)
+					: 0);
 			// The paid period: current_period_end is the 30-day end even if the row was later
 			// superseded early (which shortens ends_at but not what the user paid for).
 			const start = dbTimeMs(r.starts_at);
@@ -160,7 +172,10 @@ export interface PaidSnapshot {
 }
 
 /** Paid subscribers and MRR at an instant (defaults to now, which also checks status). */
-export function paidSnapshot(at: Date = new Date(), records = loadSubscriptionRecords()): PaidSnapshot {
+export function paidSnapshot(
+	at: Date = new Date(),
+	records = loadSubscriptionRecords(),
+): PaidSnapshot {
 	const t = at.getTime();
 	const live = Math.abs(Date.now() - t) < 60_000 || t > Date.now();
 	// One paid row per user (the newest wins if history overlaps).
@@ -187,7 +202,9 @@ export function paidSnapshot(at: Date = new Date(), records = loadSubscriptionRe
 		paidSubscribers: byUser.size,
 		stripeMrrCents: stripe,
 		solMrrCents: sol,
-		byPlan: Array.from(plans.values()).sort((a, b) => b.mrrCents - a.mrrCents || b.subscribers - a.subscribers),
+		byPlan: Array.from(plans.values()).sort(
+			(a, b) => b.mrrCents - a.mrrCents || b.subscribers - a.subscribers,
+		),
 	};
 }
 
@@ -257,10 +274,17 @@ export function listCurrentSubscriptions(db: Database = getDb()): SubscriptionLi
 		const boost = boostByUser.get(u.id);
 		const paid = rec ? isPaidAt(rec, now, true) : false;
 		const expiredByTime = rec?.endsAt ? Date.parse(rec.endsAt) <= now : false;
-		const status = !rec ? "active" : expiredByTime && ENTITLED.has(rec.status) ? "expired" : rec.status;
+		const status = !rec
+			? "active"
+			: expiredByTime && ENTITLED.has(rec.status)
+				? "expired"
+				: rec.status;
 		const periodEnd = rec?.currentPeriodEnd ? Date.parse(rec.currentPeriodEnd) : null;
 		const stale =
-			rec?.source === "stripe" && ENTITLED.has(rec.status) && periodEnd !== null && periodEnd < now - 3 * DAY_MS;
+			rec?.source === "stripe" &&
+			ENTITLED.has(rec.status) &&
+			periodEnd !== null &&
+			periodEnd < now - 3 * DAY_MS;
 		const base: SubscriptionListItem = {
 			userId: u.id,
 			username: u.username,
@@ -313,25 +337,32 @@ export function expireEndedSubscriptions(db: Database = getDb()): number {
 	if (rows.length === 0) return 0;
 
 	const free = db
-		.prepare("SELECT id FROM subscription_products WHERE name = 'Free' AND is_active = 1 ORDER BY created_at ASC LIMIT 1")
+		.prepare(
+			"SELECT id FROM subscription_products WHERE name = 'Free' AND is_active = 1 ORDER BY created_at ASC LIMIT 1",
+		)
 		.get() as { id: string } | undefined;
 
 	let expired = 0;
 	for (const row of rows) {
 		db.transaction(() => {
 			const res = db
-				.prepare("UPDATE user_subscriptions SET status = 'expired' WHERE id = ? AND status IN ('active', 'trialing')")
+				.prepare(
+					"UPDATE user_subscriptions SET status = 'expired' WHERE id = ? AND status IN ('active', 'trialing')",
+				)
 				.run(row.id);
 			if (res.changes !== 1) return;
 			expired++;
 			const stillActive = db
-				.prepare("SELECT 1 FROM user_subscriptions WHERE user_id = ? AND status IN ('active', 'trialing')")
+				.prepare(
+					"SELECT 1 FROM user_subscriptions WHERE user_id = ? AND status IN ('active', 'trialing')",
+				)
 				.get(row.user_id);
 			if (!stillActive && free) {
 				assignSubscription(row.user_id, free.id, { grantBonus: false });
 			}
 		})();
 	}
-	if (expired > 0) console.log(`[subscriptions] Expired ${expired} ended non-Stripe subscription(s)`);
+	if (expired > 0)
+		console.log(`[subscriptions] Expired ${expired} ended non-Stripe subscription(s)`);
 	return expired;
 }
