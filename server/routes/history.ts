@@ -10,6 +10,15 @@ interface HistoryQuery {
 	limit?: string;
 	trash?: string;
 	archived?: string;
+	/** Case-insensitive substring of the prompt. */
+	q?: string;
+	/** Exact model id. */
+	model?: string;
+}
+
+/** Escape LIKE wildcards so a search for "100%" means the text, not a pattern. */
+function likePattern(text: string): string {
+	return `%${text.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 }
 
 interface HistoryParams {
@@ -66,21 +75,44 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 				condition = "deleted_at IS NULL AND archived_at IS NULL AND purged_at IS NULL";
 			}
 
+			const userId = requireUserId(request);
+			// Optional search + model filter (the gallery's search box and model menu).
+			const filters: string[] = [];
+			const filterArgs: string[] = [];
+			const q = typeof request.query.q === "string" ? request.query.q.trim().slice(0, 200) : "";
+			if (q) {
+				filters.push("prompt LIKE ? ESCAPE '\\'");
+				filterArgs.push(likePattern(q));
+			}
+			const model = typeof request.query.model === "string" ? request.query.model.trim() : "";
+			if (model) {
+				filters.push("model = ?");
+				filterArgs.push(model);
+			}
+			const where = [condition, ...filters].join(" AND ");
+
 			const countResult = db
-				.prepare(`SELECT COUNT(*) as count FROM generations WHERE user_id = ? AND ${condition}`)
-				.get(requireUserId(request)) as { count: number };
+				.prepare(`SELECT COUNT(*) as count FROM generations WHERE user_id = ? AND ${where}`)
+				.get(userId, ...filterArgs) as { count: number };
 			const total = countResult.count;
 
 			const rows = db
 				.prepare(
 					`
 				SELECT * FROM generations
-				WHERE user_id = ? AND ${condition}
+				WHERE user_id = ? AND ${where}
 				ORDER BY created_at DESC
 				LIMIT ? OFFSET ?
 			`,
 				)
-				.all(requireUserId(request), limit, offset) as DbRow[];
+				.all(userId, ...filterArgs, limit, offset) as DbRow[];
+
+			// Models this view contains (for the filter menu), whatever the current filter.
+			const models = (
+				db
+					.prepare(`SELECT DISTINCT model FROM generations WHERE user_id = ? AND ${condition} ORDER BY model`)
+					.all(userId) as { model: string }[]
+			).map((r) => r.model);
 
 			const generations: (Generation & {
 				cost?: number;
@@ -113,10 +145,11 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 			// Calculate total cost (includes ALL generations including purged for accurate tracking)
 			const totalCostResult = db
 				.prepare("SELECT SUM(cost) as total FROM generations WHERE user_id = ?")
-				.get(requireUserId(request)) as { total: number | null };
+				.get(userId) as { total: number | null };
 
 			return {
 				generations,
+				models,
 				total,
 				page,
 				limit,

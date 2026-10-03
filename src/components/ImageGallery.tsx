@@ -1,44 +1,99 @@
-import { useEffect, useRef, useState } from "react";
+import { modelName } from "@/components/billing/plans";
+import { Laurel } from "@/components/brand/Laurel";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useAuth } from "@/contexts/AuthContext";
+import { cn } from "@/lib/utils";
+import { SearchIcon, XIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import { API_BASE } from "../config";
-import type { Generation, QueuedGeneration, Upload } from "../types";
-import { GenerationProgressBar } from "./GenerationProgressBar";
-import { IconCheck, IconClose, IconPlus, IconRestore, IconTrash, IconArchive } from "./Icons";
+import type { Generation, HistoryResponse, QueuedGeneration, Upload } from "../types";
+import { ConfirmDialog } from "./viewer/ConfirmDialog";
+import { ImageViewer } from "./viewer/ImageViewer";
+import {
+	type ImageActionCosts,
+	type ImageTool,
+	TRASH_RETENTION_DAYS,
+	type ViewerImage,
+	absoluteUrl,
+	asGeneration,
+	cssAspect,
+	imagesOf,
+	parseDate,
+	trashWithUndo,
+	uploadImage,
+} from "./viewer/media";
 
-interface ImageGalleryProps {
+type View = "images" | "uploads" | "archive" | "trash";
+
+export interface ImageGalleryProps {
+	/** The app's loaded history (shown until the gallery's own fetch lands, and used as a refresh signal). */
 	generations: Generation[];
 	uploads?: Upload[];
 	queuedItems?: QueuedGeneration[];
-	onTrash?: (id: string) => void;
-	onRestore?: (id: string) => void;
-	onDelete?: (id: string) => void;
-	onArchive?: (id: string) => void;
-	onUnarchive?: (id: string) => void;
-	onArchiveUpload?: (id: string) => void;
-	onUnarchiveUpload?: (id: string) => void;
-	onDeleteUpload?: (id: string) => void;
+	onTrash?: (id: string) => unknown;
+	onRestore?: (id: string) => unknown;
+	onDelete?: (id: string) => unknown;
+	onArchive?: (id: string) => unknown;
+	onUnarchive?: (id: string) => unknown;
+	onArchiveUpload?: (id: string) => unknown;
+	onUnarchiveUpload?: (id: string) => unknown;
+	onDeleteUpload?: (id: string) => unknown;
 	onDismissQueueItem?: (id: string) => void;
+	/** Toggle an image in the prompt bar's references ("Edit" in the viewer). */
 	onAddToInputs?: (imageUrl: string) => void;
 	selectedInputUrls?: string[];
+	/** Legacy paging props; the gallery now pages its own results. */
 	onLoadMore?: () => void;
 	hasMore?: boolean;
 	loading?: boolean;
+	/** Open on Trash / Archive instead of all images. */
 	showTrash?: boolean;
 	showArchived?: boolean;
+
+	// ---- Phase 4 (all optional) ----
+	onVariations?: (gen: Generation) => void;
+	onVaryImage?: (imageUrl: string, prompt: string) => void;
+	onUpscale?: (gen: Generation) => void;
+	onTool?: (image: ViewerImage, tool: ImageTool) => void;
+	/** "Edit": use as the reference for the next prompt (defaults to onAddToInputs). */
+	onUseAsReference?: (image: ViewerImage) => void;
+	onReusePrompt?: (prompt: string) => void;
+	actionCosts?: ImageActionCosts;
 }
 
-function getTimeRemaining(deletedAt: string): string {
-	const deletedTime = new Date(deletedAt).getTime();
-	const expiresAt = deletedTime + 60 * 60 * 1000; // 1 hour after deletion
-	const now = Date.now();
-	const remaining = expiresAt - now;
+const PAGE = 40;
 
-	if (remaining <= 0) return "Deleting soon...";
-
-	const minutes = Math.floor(remaining / (60 * 1000));
-	if (minutes < 1) return "Less than 1 min";
-	return `${minutes} min`;
+function daysLeft(deletedAt: string | undefined): number | null {
+	const d = parseDate(deletedAt);
+	if (!d) return null;
+	const left = TRASH_RETENTION_DAYS - (Date.now() - d.getTime()) / 86_400_000;
+	return Math.max(0, Math.ceil(left));
 }
 
+function useDebounced<T>(value: T, ms: number): T {
+	const [v, setV] = useState(value);
+	useEffect(() => {
+		const t = setTimeout(() => setV(value), ms);
+		return () => clearTimeout(t);
+	}, [value, ms]);
+	return v;
+}
+
+/**
+ * Every image: a uniform grid with search and a model filter, plus Uploads, Archive and Trash.
+ * Moving to Trash offers Undo; Trash explains how long it keeps things.
+ */
 export function ImageGallery({
 	generations,
 	uploads = [],
@@ -54,574 +109,489 @@ export function ImageGallery({
 	onDismissQueueItem,
 	onAddToInputs,
 	selectedInputUrls = [],
-	onLoadMore,
-	hasMore,
-	loading,
 	showTrash = false,
 	showArchived = false,
+	onVariations,
+	onVaryImage,
+	onUpscale,
+	onTool,
+	onUseAsReference,
+	onReusePrompt,
+	actionCosts,
 }: ImageGalleryProps) {
-	const [selectedImage, setSelectedImage] = useState<Generation | null>(null);
-	const [selectedUpload, setSelectedUpload] = useState<Upload | null>(null);
-	const sentinelRef = useRef<HTMLDivElement>(null);
+	const { token } = useAuth();
+	const [view, setView] = useState<View>(showTrash ? "trash" : showArchived ? "archive" : "images");
+	const [query, setQuery] = useState("");
+	const [model, setModel] = useState<string>("all");
+	const q = useDebounced(query.trim(), 300);
 
-	// Infinite scroll using IntersectionObserver
-	useEffect(() => {
-		if (!hasMore || loading || !onLoadMore) return;
+	const [items, setItems] = useState<Generation[] | null>(null);
+	const [total, setTotal] = useState(0);
+	const [models, setModels] = useState<string[]>([]);
+	const [page, setPage] = useState(1);
+	const [fetching, setFetching] = useState(false);
+	const [archivedUploads, setArchivedUploads] = useState<Upload[]>([]);
+	const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+	const [confirm, setConfirm] = useState<ViewerImage | null>(null);
+	const requestId = useRef(0);
 
-		const observer = new IntersectionObserver(
-			(entries) => {
-				if (entries[0].isIntersecting && hasMore && !loading) {
-					onLoadMore();
-				}
-			},
-			{ threshold: 0.1, rootMargin: "100px" }
-		);
+	const api = useCallback(
+		async (method: string, path: string, body?: unknown) => {
+			if (!token) return false;
+			const res = await fetch(`${API_BASE}${path}`, {
+				method,
+				headers: {
+					Authorization: `Bearer ${token}`,
+					...(body ? { "Content-Type": "application/json" } : {}),
+				},
+				body: body ? JSON.stringify(body) : undefined,
+			}).catch(() => null);
+			return !!res?.ok;
+		},
+		[token],
+	);
 
-		const sentinel = sentinelRef.current;
-		if (sentinel) {
-			observer.observe(sentinel);
-		}
-
-		return () => {
-			if (sentinel) {
-				observer.unobserve(sentinel);
+	const load = useCallback(
+		async (pageNo: number) => {
+			if (!token || view === "uploads") return;
+			const id = ++requestId.current;
+			setFetching(true);
+			const params = new URLSearchParams({
+				page: String(pageNo),
+				limit: String(PAGE),
+				trash: String(view === "trash"),
+				archived: String(view === "archive"),
+			});
+			if (q) params.set("q", q);
+			if (model !== "all") params.set("model", model);
+			try {
+				const res = await fetch(`${API_BASE}/api/history?${params}`, {
+					headers: { Authorization: `Bearer ${token}` },
+				});
+				if (!res.ok) throw new Error(String(res.status));
+				const data = (await res.json()) as HistoryResponse & { models?: string[] };
+				if (id !== requestId.current) return;
+				setItems((prev) =>
+					pageNo === 1 || !prev ? data.generations : [...prev, ...data.generations],
+				);
+				setTotal(data.total);
+				setModels(data.models ?? []);
+				setPage(pageNo);
+			} catch {
+				if (id === requestId.current)
+					toast.error("Couldn't load images. Check your connection and try again.");
+			} finally {
+				if (id === requestId.current) setFetching(false);
 			}
+		},
+		[token, view, q, model],
+	);
+
+	// Reload on view/filter change, and when the app's history changes (a new image landed).
+	const signal = generations[0]?.id ?? "";
+	// biome-ignore lint/correctness/useExhaustiveDependencies: `signal` is a deliberate refresh trigger
+	useEffect(() => {
+		load(1);
+	}, [load, signal]);
+
+	useEffect(() => {
+		if (view !== "archive" || !token) return;
+		fetch(`${API_BASE}/api/uploads?archived=true`, {
+			headers: { Authorization: `Bearer ${token}` },
+		})
+			.then((r) => (r.ok ? r.json() : { uploads: [] }))
+			.then((d: { uploads: Upload[] }) => setArchivedUploads(d.uploads ?? []))
+			.catch(() => setArchivedUploads([]));
+	}, [view, token]);
+
+	// Until the first fetch lands, the "images" view shows what the app already has.
+	const shown: Generation[] = items ?? (view === "images" ? generations : []);
+	const hasMore = items !== null && items.length < total;
+	const filtered = !!q || model !== "all";
+
+	const sentinel = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		const el = sentinel.current;
+		if (!el || !hasMore || fetching) return;
+		const io = new IntersectionObserver((entries) => entries[0]?.isIntersecting && load(page + 1), {
+			rootMargin: "400px",
+		});
+		io.observe(el);
+		return () => io.disconnect();
+	}, [hasMore, fetching, load, page]);
+
+	// The viewer walks every image in view, sets included.
+	const tileUploads = view === "uploads" ? uploads : view === "archive" ? archivedUploads : [];
+	const viewerImages = useMemo(
+		() => [...shown.flatMap(imagesOf), ...tileUploads.map(uploadImage)],
+		[shown, tileUploads],
+	);
+	const openAt = (key: string) => {
+		const i = viewerImages.findIndex((v) => v.key === key);
+		setViewerIndex(i >= 0 ? i : null);
+	};
+
+	const dropLocal = (id: string) => setItems((prev) => prev?.filter((g) => g.id !== id) ?? prev);
+	const refresh = () => load(1);
+
+	const trash = async (id: string) => {
+		const restore = async (rid: string) => {
+			if (onRestore) await onRestore(rid);
+			else await api("PATCH", `/api/history/${rid}`, { deleted: false });
+			refresh();
 		};
-	}, [hasMore, loading, onLoadMore]);
-
-	const hasQueuedItems = queuedItems.length > 0;
-	const hasGenerations = generations.length > 0;
-	const hasUploads = uploads.length > 0;
-
-	if (!hasQueuedItems && !hasGenerations && !hasUploads && !loading) {
-		return (
-			<div className="text-center py-8 text-gray-500">
-				{showTrash ? (
-					<p className="text-sm">Trash is empty</p>
-				) : showArchived ? (
-					<p className="text-sm">No archived images</p>
-				) : (
-					<p className="text-sm">No images yet</p>
-				)}
-			</div>
+		await trashWithUndo(
+			id,
+			async (tid) => {
+				dropLocal(tid);
+				if (onTrash) await onTrash(tid);
+				else await api("PATCH", `/api/history/${tid}`, { deleted: true });
+			},
+			restore,
 		);
-	}
+	};
+	const restore = async (id: string) => {
+		dropLocal(id);
+		if (onRestore) await onRestore(id);
+		else await api("PATCH", `/api/history/${id}`, { deleted: false });
+		toast.success("Restored");
+		refresh();
+	};
+	const archive = async (id: string, archived: boolean) => {
+		dropLocal(id);
+		const handler = archived ? onArchive : onUnarchive;
+		if (handler) await handler(id);
+		else await api("PATCH", `/api/history/${id}/archive`, { archived });
+		toast(archived ? "Moved to Archive" : "Moved back to your images", {
+			action: { label: "Undo", onClick: () => void archive(id, !archived) },
+		});
+		refresh();
+	};
+	const confirmDelete = async () => {
+		const image = confirm;
+		setConfirm(null);
+		setViewerIndex(null);
+		if (!image) return;
+		if (image.kind === "upload" && image.upload) {
+			const id = image.upload.id;
+			if (onDeleteUpload) await onDeleteUpload(id);
+			else await api("DELETE", `/api/uploads/${id}`);
+			setArchivedUploads((prev) => prev.filter((u) => u.id !== id));
+			toast.success("Upload deleted");
+			return;
+		}
+		if (image.generation) {
+			const id = image.generation.id;
+			dropLocal(id);
+			if (onDelete) await onDelete(id);
+			else await api("DELETE", `/api/history/${id}`);
+			toast.success("Deleted for good");
+			refresh();
+		}
+	};
+	const archiveUpload = async (id: string, archived: boolean) => {
+		const handler = archived ? onArchiveUpload : onUnarchiveUpload;
+		if (handler) await handler(id);
+		else await api("PATCH", `/api/uploads/${id}/archive`, { archived });
+		if (!archived) setArchivedUploads((prev) => prev.filter((u) => u.id !== id));
+		toast(archived ? "Upload archived" : "Upload moved back");
+	};
+
+	const useAsReference =
+		onUseAsReference ??
+		(onAddToInputs ? (image: ViewerImage) => onAddToInputs(image.url) : undefined);
+	const vary =
+		onVariations || onVaryImage
+			? (image: ViewerImage) => {
+					const gen = asGeneration(image);
+					if (!gen) return;
+					if (image.setSize && onVaryImage) onVaryImage(image.url, gen.prompt);
+					else if (onVariations) onVariations(gen);
+					else onVaryImage?.(image.url, gen.prompt);
+				}
+			: undefined;
+	const tool =
+		onTool ??
+		(onUpscale
+			? (image: ViewerImage, which: ImageTool) => {
+					const gen = asGeneration(image);
+					if (gen && which === "upscale") onUpscale(gen);
+				}
+			: undefined);
+
+	const pendingItems = view === "images" && !filtered ? queuedItems : [];
+	const empty = shown.length === 0 && tileUploads.length === 0 && pendingItems.length === 0;
+	const loadingFirst = items === null && fetching && shown.length === 0;
 
 	return (
-		<>
-			<div className="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-1.5">
-				{/* Queued/Generating items */}
-				{!showTrash &&
-					queuedItems.map((item) => (
-						<div
+		<div className="mx-auto flex w-full max-w-6xl flex-col gap-5">
+			<header className="flex flex-col gap-4">
+				<h1 className="font-display text-[1.75rem] leading-tight text-foreground sm:text-[2rem]">
+					Images
+				</h1>
+				<Tabs
+					value={view}
+					onValueChange={(v) => {
+						setView(v as View);
+						setItems(null);
+						setViewerIndex(null);
+					}}
+				>
+					<div className="-mx-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
+						<TabsList className="h-10 group-data-horizontal/tabs:h-10">
+							<TabsTrigger value="images" className="px-3">
+								All images
+							</TabsTrigger>
+							<TabsTrigger value="uploads" className="px-3">
+								Uploads
+							</TabsTrigger>
+							<TabsTrigger value="archive" className="px-3">
+								Archive
+							</TabsTrigger>
+							<TabsTrigger value="trash" className="px-3">
+								Trash
+							</TabsTrigger>
+						</TabsList>
+					</div>
+				</Tabs>
+
+				{view !== "uploads" && (
+					<div className="flex flex-col gap-2 sm:flex-row">
+						<div className="relative flex-1">
+							<SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+							<Input
+								type="search"
+								value={query}
+								onChange={(e) => setQuery(e.target.value)}
+								placeholder="Search your prompts"
+								aria-label="Search your prompts"
+								className="h-10 pr-9 pl-9"
+							/>
+							{query && (
+								<Button
+									variant="ghost"
+									size="icon-sm"
+									className="absolute top-1/2 right-1.5 -translate-y-1/2"
+									onClick={() => setQuery("")}
+									aria-label="Clear search"
+								>
+									<XIcon />
+								</Button>
+							)}
+						</div>
+						<Select value={model} onValueChange={(v) => setModel((v as string) ?? "all")}>
+							<SelectTrigger
+								className="h-10 w-full data-[size=default]:h-10 sm:w-56"
+								aria-label="Filter by model"
+							>
+								<SelectValue>
+									{(v: string) => (v === "all" ? "All models" : modelName(v))}
+								</SelectValue>
+							</SelectTrigger>
+							<SelectContent>
+								<SelectItem value="all">All models</SelectItem>
+								{models.map((m) => (
+									<SelectItem key={m} value={m}>
+										{modelName(m)}
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
+					</div>
+				)}
+
+				{view === "trash" && (
+					<p className="max-w-prose text-sm text-muted-foreground">
+						Images stay in Trash for {TRASH_RETENTION_DAYS} days, then they're deleted for good.
+						Restore one to put it back with your images.
+					</p>
+				)}
+				{view === "archive" && (
+					<p className="max-w-prose text-sm text-muted-foreground">
+						Archived images are out of the way but kept. They don't count toward anything and never
+						expire.
+					</p>
+				)}
+			</header>
+
+			{loadingFirst ? (
+				<div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+					{Array.from({ length: 10 }, (_, i) => (
+						// biome-ignore lint/suspicious/noArrayIndexKey: static placeholders
+						<Skeleton key={i} className="aspect-square rounded-xl" />
+					))}
+				</div>
+			) : empty ? (
+				<div className="flex min-h-[30vh] flex-col items-center justify-center gap-1 text-center">
+					<p className="font-medium text-foreground">
+						{filtered
+							? "No images match"
+							: view === "trash"
+								? "Trash is empty"
+								: view === "archive"
+									? "Nothing archived"
+									: view === "uploads"
+										? "No uploads yet"
+										: "No images yet"}
+					</p>
+					<p className="max-w-xs text-sm text-muted-foreground">
+						{filtered
+							? "Try other words, or clear the model filter."
+							: view === "uploads"
+								? "Images you upload as references show up here."
+								: view === "images"
+									? "Describe an image in the prompt bar to make your first one."
+									: ""}
+					</p>
+				</div>
+			) : (
+				<ul
+					className="m-0 grid list-none grid-cols-2 gap-2 p-0 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5"
+					aria-label="Images"
+				>
+					{pendingItems.map((item) => (
+						<li
 							key={item.id}
-							className={`group relative aspect-square rounded overflow-hidden cyber-card ${
-								item.status === "failed" ? "border-red-500/50" : item.status === "generating" ? "pulse-glow" : ""
-							}`}
+							className="relative aspect-square overflow-hidden rounded-xl bg-muted"
 						>
-							{/* Placeholder content */}
-							<div className="absolute inset-0 flex flex-col items-center justify-center p-2">
-								{item.status === "queued" && (
-									<span className="text-xs text-gray-500">queued</span>
-								)}
-								{item.status === "generating" && (
-									<div className="flex flex-col items-center w-full px-2">
-										<div className="w-6 h-6 mb-2 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin" />
-										<span className="text-xs text-cyan-400 mb-2">generating</span>
-										{item.startedAt && (
-											<GenerationProgressBar
-												startedAt={item.startedAt}
-												estimatedDuration={item.estimatedDuration || 30}
-												status={item.status}
-											/>
-										)}
-									</div>
-								)}
-								{item.status === "failed" && (
-									<span className="text-xs text-red-400">failed</span>
-								)}
-							</div>
-
-							{/* Prompt overlay */}
-							<div className="absolute bottom-0 left-0 right-0 p-1.5 bg-gradient-to-t from-black/90 to-transparent">
-								<p className="text-[10px] text-white/70 line-clamp-1">{item.prompt}</p>
-							</div>
-
-							{/* Dismiss button for failed items */}
-							{item.status === "failed" && onDismissQueueItem && (
-								<button
-									type="button"
-									onClick={() => onDismissQueueItem(item.id)}
-									className="absolute top-1 right-1 p-1 bg-gray-800/80 rounded hover:bg-red-900/80 transition-colors"
-									title="Dismiss"
+							{item.status === "failed" ? (
+								<div className="flex h-full flex-col items-center justify-center gap-2 p-3 text-center">
+									<p className="text-sm font-medium text-foreground">This one didn't finish</p>
+									{onDismissQueueItem && (
+										<Button size="sm" variant="ghost" onClick={() => onDismissQueueItem(item.id)}>
+											Dismiss
+										</Button>
+									)}
+								</div>
+							) : (
+								<div
+									className="grid h-full place-items-center"
+									style={{ aspectRatio: cssAspect(item.aspectRatio) }}
 								>
-									<IconClose className="w-3 h-3" />
-								</button>
+									<Laurel
+										progress={item.status === "generating" ? 0.5 : 0}
+										className="w-1/2"
+										label="Rendering"
+									/>
+								</div>
 							)}
-						</div>
+						</li>
 					))}
-
-				{/* Actual generations */}
-				{generations.map((gen) => {
-					const isTrashed = !!gen.deletedAt;
-
-					return (
-						<div
-							key={gen.id}
-							role="button"
-							tabIndex={0}
-							className={`group relative aspect-square rounded overflow-hidden cyber-card cursor-pointer hover:neon-border transition-all ${
-								isTrashed ? "opacity-50" : ""
-							}`}
-							onClick={() => setSelectedImage(gen)}
-							onKeyDown={(e) => e.key === "Enter" && setSelectedImage(gen)}
-						>
-							<img
-								src={`${API_BASE}${gen.imageUrl}`}
-								alt={gen.prompt}
-								className={`w-full h-full object-cover transition-transform group-hover:scale-105 ${
-									isTrashed ? "grayscale" : ""
-								}`}
-								loading="lazy"
-							/>
-
-							{/* Add to inputs button */}
-							{onAddToInputs && !isTrashed && (
+					{shown.map((gen) => {
+						const set = imagesOf(gen);
+						const first = set[0];
+						if (!first) return null;
+						const left = view === "trash" ? daysLeft(gen.deletedAt) : null;
+						const isRef = set.some((img) => selectedInputUrls.includes(img.url));
+						return (
+							<li key={gen.id} className="relative">
 								<button
 									type="button"
-									onClick={(e) => { e.stopPropagation(); onAddToInputs(gen.imageUrl || ""); }}
-									className={`absolute top-1 left-1 p-1 rounded transition-all ${
-										selectedInputUrls.includes(gen.imageUrl || "")
-											? "bg-cyan-500 opacity-100"
-											: "bg-gray-800/80 opacity-0 group-hover:opacity-100 hover:bg-cyan-600"
-									}`}
-									title={selectedInputUrls.includes(gen.imageUrl || "") ? "Remove from inputs" : "Add to inputs"}
+									onClick={() => openAt(first.key)}
+									className={cn(
+										"group block aspect-square w-full overflow-hidden rounded-xl bg-muted outline-2 outline-offset-2 outline-transparent focus-visible:outline-ring",
+										isRef && "outline-verdigris",
+									)}
+									aria-label={`Open: ${gen.prompt}`}
 								>
-									{selectedInputUrls.includes(gen.imageUrl || "") ? (
-									<IconCheck className="w-3 h-3" />
-								) : (
-									<IconPlus className="w-3 h-3" />
-								)}
+									<img
+										src={absoluteUrl(first.url)}
+										alt=""
+										loading="lazy"
+										className={cn(
+											"h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]",
+											view === "trash" && "opacity-70 grayscale",
+										)}
+									/>
 								</button>
-							)}
-
-							{/* Trash indicator */}
-							{isTrashed && (
-								<div className="absolute top-1 left-1 px-1 py-0.5 bg-red-900/80 rounded text-[10px]">
-									{getTimeRemaining(gen.deletedAt as string)}
-								</div>
-							)}
-
-							<div className="absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-0">
-								<div className="absolute bottom-0 left-0 right-0 p-1.5">
-									<p className="text-[10px] text-white line-clamp-2">{gen.prompt}</p>
-								</div>
-							</div>
-
-							{/* Action buttons */}
-							<div className="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity z-10">
-								{isTrashed ? (
-									<>
-										{onRestore && (
-											<button
-												type="button"
-												onClick={(e) => { e.stopPropagation(); onRestore(gen.id); }}
-												className="p-1 bg-cyan-600/80 rounded hover:bg-cyan-500"
-												title="Restore"
-											>
-												<IconRestore className="w-3 h-3" />
-											</button>
-										)}
-										{onDelete && (
-											<button
-												type="button"
-												onClick={(e) => { e.stopPropagation(); onDelete(gen.id); }}
-												className="p-1 bg-red-600/80 rounded hover:bg-red-500"
-												title="Delete permanently"
-											>
-												<IconClose className="w-3 h-3" />
-											</button>
-										)}
-									</>
-								) : showArchived ? (
-									onUnarchive && (
-										<button
-											type="button"
-											onClick={(e) => { e.stopPropagation(); onUnarchive(gen.id); }}
-											className="p-1 bg-cyan-600/80 rounded hover:bg-cyan-500"
-											title="Unarchive"
-										>
-											<IconRestore className="w-3 h-3" />
-										</button>
-									)
-								) : (
-									<>
-										{onArchive && (
-											<button
-												type="button"
-												onClick={(e) => { e.stopPropagation(); onArchive(gen.id); }}
-												className="p-1 bg-gray-800/80 rounded hover:bg-yellow-600/80"
-												title="Archive"
-											>
-												<IconArchive className="w-3 h-3" />
-											</button>
-										)}
-										{onTrash && (
-											<button
-												type="button"
-												onClick={(e) => { e.stopPropagation(); onTrash(gen.id); }}
-												className="p-1 bg-gray-800/80 rounded hover:bg-pink-600/80"
-												title="Trash"
-											>
-												<IconTrash className="w-3 h-3" />
-											</button>
-										)}
-									</>
+								{set.length > 1 && (
+									<span className="pointer-events-none absolute top-2 right-2 rounded-full bg-card/90 px-2 py-0.5 text-xs font-medium text-foreground tabular-nums">
+										{set.length}
+									</span>
 								)}
-							</div>
-						</div>
-					);
-				})}
-
-				{/* Uploads section - display after generations */}
-				{!showTrash && uploads.map((upload) => (
-						<div
-							key={`upload-${upload.id}`}
-							role="button"
-							tabIndex={0}
-							className="group relative aspect-square rounded overflow-hidden cyber-card cursor-pointer hover:neon-border transition-all"
-							onClick={() => setSelectedUpload(upload)}
-							onKeyDown={(e) => e.key === "Enter" && setSelectedUpload(upload)}
-						>
-							<img
-								src={`${API_BASE}${upload.imageUrl}`}
-								alt={upload.originalName}
-								className="w-full h-full object-cover transition-transform group-hover:scale-105"
-								loading="lazy"
-							/>
-
-							{/* Upload badge */}
-							<div className="absolute top-1 left-1 px-1 py-0.5 bg-purple-600/80 rounded text-[10px]">
+								{left !== null && (
+									<span className="pointer-events-none absolute bottom-2 left-2 rounded-full bg-card/90 px-2 py-0.5 text-xs text-foreground">
+										{left === 0 ? "Deleting soon" : left === 1 ? "1 day left" : `${left} days left`}
+									</span>
+								)}
+								{isRef && (
+									<span className="pointer-events-none absolute bottom-2 left-2 rounded-full bg-verdigris px-2 py-0.5 text-xs font-medium text-background">
+										Reference
+									</span>
+								)}
+							</li>
+						);
+					})}
+					{tileUploads.map((upload) => (
+						<li key={upload.id} className="relative">
+							<button
+								type="button"
+								onClick={() => openAt(`upload:${upload.id}`)}
+								className={cn(
+									"block aspect-square w-full overflow-hidden rounded-xl bg-muted outline-2 outline-offset-2 outline-transparent focus-visible:outline-ring",
+									selectedInputUrls.includes(upload.imageUrl) && "outline-verdigris",
+								)}
+								aria-label={`Open upload: ${upload.originalName}`}
+							>
+								<img
+									src={absoluteUrl(upload.imageUrl)}
+									alt=""
+									loading="lazy"
+									className="h-full w-full object-cover"
+								/>
+							</button>
+							<span className="pointer-events-none absolute top-2 left-2 rounded-full bg-card/90 px-2 py-0.5 text-xs text-foreground">
 								Upload
-							</div>
-
-							{/* Add to inputs button */}
-							{onAddToInputs && (
-								<button
-									type="button"
-									onClick={(e) => { e.stopPropagation(); onAddToInputs(upload.imageUrl); }}
-									className={`absolute bottom-1 left-1 p-1 rounded transition-all ${
-										selectedInputUrls.includes(upload.imageUrl)
-											? "bg-cyan-500 opacity-100"
-											: "bg-gray-800/80 opacity-0 group-hover:opacity-100 hover:bg-cyan-600"
-									}`}
-									title={selectedInputUrls.includes(upload.imageUrl) ? "Remove from inputs" : "Add to inputs"}
-								>
-									{selectedInputUrls.includes(upload.imageUrl) ? (
-										<IconCheck className="w-3 h-3" />
-									) : (
-										<IconPlus className="w-3 h-3" />
-									)}
-								</button>
-							)}
-
-							<div className="absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-0">
-								<div className="absolute bottom-0 left-0 right-0 p-1.5">
-									<p className="text-[10px] text-white line-clamp-2">{upload.originalName}</p>
-								</div>
-							</div>
-
-							{/* Action buttons */}
-							<div className="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity z-10">
-								{showArchived ? (
-									onUnarchiveUpload && (
-										<button
-											type="button"
-											onClick={(e) => { e.stopPropagation(); onUnarchiveUpload(upload.id); }}
-											className="p-1 bg-cyan-600/80 rounded hover:bg-cyan-500"
-											title="Unarchive"
-										>
-											<IconRestore className="w-3 h-3" />
-										</button>
-									)
-								) : (
-									<>
-										{onArchiveUpload && (
-											<button
-												type="button"
-												onClick={(e) => { e.stopPropagation(); onArchiveUpload(upload.id); }}
-												className="p-1 bg-gray-800/80 rounded hover:bg-yellow-600/80"
-												title="Archive"
-											>
-												<IconArchive className="w-3 h-3" />
-											</button>
-										)}
-										{onDeleteUpload && (
-											<button
-												type="button"
-												onClick={(e) => { e.stopPropagation(); onDeleteUpload(upload.id); }}
-												className="p-1 bg-gray-800/80 rounded hover:bg-pink-600/80"
-												title="Delete"
-											>
-												<IconTrash className="w-3 h-3" />
-											</button>
-										)}
-									</>
-								)}
-							</div>
-						</div>
+							</span>
+						</li>
 					))}
-			</div>
+				</ul>
+			)}
 
-			{/* Infinite scroll sentinel */}
 			{hasMore && (
-				<div ref={sentinelRef} className="flex justify-center py-6 col-span-full">
-					{loading && (
-						<div className="flex items-center gap-2 text-[var(--text-secondary)]">
-							<div className="w-4 h-4 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
-							<span className="text-xs mono">Loading more...</span>
-						</div>
-					)}
+				<div ref={sentinel} className="flex justify-center py-6">
+					{fetching && <span className="text-sm text-muted-foreground">Loading more…</span>}
 				</div>
 			)}
 
-			{/* Lightbox Modal */}
-			{selectedImage && (
-				<div
-					className="fixed inset-0 bg-black/90 z-50 overflow-y-auto"
-					onClick={() => setSelectedImage(null)}
-					onKeyDown={(e) => e.key === "Escape" && setSelectedImage(null)}
-				>
-					{/* Close button - fixed position */}
-					<button
-						type="button"
-						onClick={() => setSelectedImage(null)}
-						className="fixed top-4 right-4 z-[60] p-2 bg-gray-800/80 hover:bg-gray-700 rounded-full transition-colors"
-						title="Close"
-					>
-						<IconClose className="w-6 h-6" />
-					</button>
-					<div className="min-h-full flex items-center justify-center p-4 py-12">
-						<div
-							className="max-w-4xl w-full bg-gray-900 rounded-lg overflow-hidden"
-							onClick={(e) => e.stopPropagation()}
-							onKeyDown={() => {}}
-						>
-							<img
-								src={`${API_BASE}${selectedImage.imageUrl}`}
-								alt={selectedImage.prompt}
-								className={`w-full object-contain ${selectedImage.deletedAt ? "grayscale opacity-60" : ""}`}
-							/>
-							<div className="p-4">
-								<p className="text-white mb-2">{selectedImage.prompt}</p>
-								{selectedImage.deletedAt && (
-									<p className="text-red-400 text-sm mb-2">
-										In trash - deletes in {getTimeRemaining(selectedImage.deletedAt)}
-									</p>
-								)}
-								<div className="flex items-center justify-between text-sm text-gray-400">
-									<span>{selectedImage.model}</span>
-									<span>{new Date(selectedImage.createdAt).toLocaleString()}</span>
-								</div>
-								<div className="flex flex-wrap gap-2 mt-4">
-									<a
-										href={`${API_BASE}${selectedImage.imageUrl}`}
-										download
-										className="px-4 py-2 cyber-button rounded-lg text-sm"
-									>
-										Download
-									</a>
-									{onAddToInputs && !selectedImage.deletedAt && (
-										<button
-											type="button"
-											onClick={() => onAddToInputs(selectedImage.imageUrl || "")}
-											className={`px-4 py-2 rounded-lg text-sm transition-colors ${
-												selectedInputUrls.includes(selectedImage.imageUrl || "")
-													? "bg-cyan-600 hover:bg-cyan-500"
-													: "bg-gray-600 hover:bg-cyan-600"
-											}`}
-										>
-											{selectedInputUrls.includes(selectedImage.imageUrl || "") ? "Added" : "Add to Inputs"}
-										</button>
-									)}
-									{selectedImage.deletedAt ? (
-										<>
-											{onRestore && (
-												<button
-													type="button"
-													onClick={() => {
-														onRestore(selectedImage.id);
-														setSelectedImage(null);
-													}}
-													className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg text-sm transition-colors"
-												>
-													Restore
-												</button>
-											)}
-											{onDelete && (
-												<button
-													type="button"
-													onClick={() => {
-														onDelete(selectedImage.id);
-														setSelectedImage(null);
-													}}
-													className="px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-sm transition-colors"
-												>
-													Delete Now
-												</button>
-											)}
-										</>
-									) : showArchived ? (
-										onUnarchive && (
-											<button
-												type="button"
-												onClick={() => {
-													onUnarchive(selectedImage.id);
-													setSelectedImage(null);
-												}}
-												className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm transition-colors"
-											>
-												Unarchive
-											</button>
-										)
-									) : (
-										<>
-											{onArchive && (
-												<button
-													type="button"
-													onClick={() => {
-														onArchive(selectedImage.id);
-														setSelectedImage(null);
-													}}
-													className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-lg text-sm transition-colors"
-												>
-													Archive
-												</button>
-											)}
-											{onTrash && (
-												<button
-													type="button"
-													onClick={() => {
-														onTrash(selectedImage.id);
-														setSelectedImage(null);
-													}}
-													className="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded-lg text-sm transition-colors"
-												>
-													Move to Trash
-												</button>
-											)}
-										</>
-									)}
-								</div>
-							</div>
-						</div>
-					</div>
-				</div>
-			)}
+			<ImageViewer
+				images={viewerImages}
+				index={viewerIndex}
+				onIndexChange={setViewerIndex}
+				onVary={view === "trash" ? undefined : vary}
+				onTool={view === "trash" ? undefined : tool}
+				onUseAsReference={view === "trash" ? undefined : useAsReference}
+				referenceUrls={selectedInputUrls}
+				onReusePrompt={onReusePrompt ? (prompt) => onReusePrompt(prompt) : undefined}
+				costs={actionCosts}
+				onTrash={(image) => {
+					if (image.kind === "upload") setConfirm(image);
+					else if (image.generation) void trash(image.generation.id);
+				}}
+				onRestore={(image) => image.generation && void restore(image.generation.id)}
+				onDelete={(image) => setConfirm(image)}
+				onArchive={(image) => {
+					if (image.kind === "upload" && image.upload) void archiveUpload(image.upload.id, true);
+					else if (image.generation) void archive(image.generation.id, true);
+				}}
+				onUnarchive={(image) => {
+					if (image.kind === "upload" && image.upload) void archiveUpload(image.upload.id, false);
+					else if (image.generation) void archive(image.generation.id, false);
+				}}
+			/>
 
-			{/* Upload Lightbox Modal */}
-			{selectedUpload && (
-				<div
-					className="fixed inset-0 bg-black/90 z-50 overflow-y-auto"
-					onClick={() => setSelectedUpload(null)}
-					onKeyDown={(e) => e.key === "Escape" && setSelectedUpload(null)}
-				>
-					{/* Close button - fixed position */}
-					<button
-						type="button"
-						onClick={() => setSelectedUpload(null)}
-						className="fixed top-4 right-4 z-[60] p-2 bg-gray-800/80 hover:bg-gray-700 rounded-full transition-colors"
-						title="Close"
-					>
-						<IconClose className="w-6 h-6" />
-					</button>
-					<div className="min-h-full flex items-center justify-center p-4 py-12">
-						<div
-							className="max-w-4xl w-full bg-gray-900 rounded-lg overflow-hidden"
-							onClick={(e) => e.stopPropagation()}
-							onKeyDown={() => {}}
-						>
-							<img
-								src={`${API_BASE}${selectedUpload.imageUrl}`}
-								alt={selectedUpload.originalName}
-								className="w-full object-contain"
-							/>
-							<div className="p-4">
-								<p className="text-white mb-2">{selectedUpload.originalName}</p>
-								<div className="flex items-center justify-between text-sm text-gray-400 mb-4">
-									<span className="px-2 py-0.5 bg-purple-600/40 rounded text-purple-300">Uploaded</span>
-									{selectedUpload.createdAt && (
-										<span>{new Date(selectedUpload.createdAt).toLocaleString()}</span>
-									)}
-								</div>
-								<div className="flex flex-wrap gap-2">
-									<a
-										href={`${API_BASE}${selectedUpload.imageUrl}`}
-										download
-										className="px-4 py-2 cyber-button rounded-lg text-sm"
-									>
-										Download
-									</a>
-									{onAddToInputs && (
-										<button
-											type="button"
-											onClick={() => onAddToInputs(selectedUpload.imageUrl)}
-											className={`px-4 py-2 rounded-lg text-sm transition-colors ${
-												selectedInputUrls.includes(selectedUpload.imageUrl)
-													? "bg-cyan-600 hover:bg-cyan-500"
-													: "bg-gray-600 hover:bg-cyan-600"
-											}`}
-										>
-											{selectedInputUrls.includes(selectedUpload.imageUrl) ? "Added" : "Add to Inputs"}
-										</button>
-									)}
-									{showArchived ? (
-										onUnarchiveUpload && (
-											<button
-												type="button"
-												onClick={() => {
-													onUnarchiveUpload(selectedUpload.id);
-													setSelectedUpload(null);
-												}}
-												className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm transition-colors"
-											>
-												Unarchive
-											</button>
-										)
-									) : (
-										<>
-											{onArchiveUpload && (
-												<button
-													type="button"
-													onClick={() => {
-														onArchiveUpload(selectedUpload.id);
-														setSelectedUpload(null);
-													}}
-													className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-lg text-sm transition-colors"
-												>
-													Archive
-												</button>
-											)}
-											{onDeleteUpload && (
-												<button
-													type="button"
-													onClick={() => {
-														onDeleteUpload(selectedUpload.id);
-														setSelectedUpload(null);
-													}}
-													className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm transition-colors"
-												>
-													Delete
-												</button>
-											)}
-										</>
-									)}
-								</div>
-							</div>
-						</div>
-					</div>
-				</div>
-			)}
-		</>
+			<ConfirmDialog
+				open={confirm !== null}
+				onOpenChange={(o) => !o && setConfirm(null)}
+				title={confirm?.kind === "upload" ? "Delete this upload?" : "Delete this image for good?"}
+				description={
+					confirm?.kind === "upload"
+						? "The file is removed right away. Images you already made from it stay."
+						: "It's removed from Trash and can't be restored. Share links to it stop working."
+				}
+				confirmLabel={confirm?.kind === "upload" ? "Delete upload" : "Delete forever"}
+				onConfirm={() => void confirmDelete()}
+			/>
+		</div>
 	);
 }

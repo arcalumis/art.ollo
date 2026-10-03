@@ -1,9 +1,18 @@
+import { Button } from "@/components/ui/button";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
+import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
+import { CheckIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../config";
 import type { Upload } from "../types";
-import { Button } from "./Button";
-import { IconCheck } from "./Icons";
-import { Modal } from "./Modal";
 
 interface ImagePickerProps {
 	token: string;
@@ -14,10 +23,7 @@ interface ImagePickerProps {
 	maxImages?: number;
 }
 
-interface UploadsResponse {
-	uploads: Upload[];
-}
-
+/** Pick reference images from your uploads. */
 export function ImagePicker({
 	token,
 	isOpen,
@@ -28,18 +34,21 @@ export function ImagePicker({
 }: ImagePickerProps) {
 	const [uploads, setUploads] = useState<Upload[]>([]);
 	const [loading, setLoading] = useState(false);
+	const [failed, setFailed] = useState(false);
 	const [selected, setSelected] = useState<Set<string>>(new Set(selectedUrls));
 
 	const fetchUploads = useCallback(async () => {
 		setLoading(true);
+		setFailed(false);
 		try {
 			const response = await fetch(`${API_BASE}/api/uploads?trash=false`, {
 				headers: { Authorization: `Bearer ${token}` },
 			});
-			const data = (await response.json()) as UploadsResponse;
+			if (!response.ok) throw new Error(String(response.status));
+			const data = (await response.json()) as { uploads: Upload[] };
 			setUploads(data.uploads);
-		} catch (err) {
-			console.error("Failed to fetch uploads:", err);
+		} catch {
+			setFailed(true);
 		} finally {
 			setLoading(false);
 		}
@@ -52,79 +61,96 @@ export function ImagePicker({
 		}
 	}, [isOpen, fetchUploads, selectedUrls]);
 
-	const toggleSelection = (url: string) => {
-		const newSelected = new Set(selected);
-		if (newSelected.has(url)) {
-			newSelected.delete(url);
-		} else if (newSelected.size < maxImages) {
-			newSelected.add(url);
-		}
-		setSelected(newSelected);
+	const toggle = (url: string) => {
+		setSelected((prev) => {
+			const next = new Set(prev);
+			if (next.has(url)) next.delete(url);
+			else if (next.size < maxImages) next.add(url);
+			return next;
+		});
 	};
-
-	const handleConfirm = () => {
-		onSelect(Array.from(selected));
-		onClose();
-	};
-
-	const items = uploads.map((u) => ({ id: u.id, url: u.imageUrl, label: u.originalName }));
 
 	return (
-		<Modal
-			isOpen={isOpen}
-			onClose={onClose}
-			title="Upload Library"
-			size="lg"
-			footer={
-				<div className="flex items-center justify-between">
-					<span className="text-xs text-gray-400">{selected.size} / {maxImages} selected</span>
-					<div className="flex gap-2">
-						<Button variant="secondary" onClick={onClose}>Cancel</Button>
-						<Button variant="primary" onClick={handleConfirm}>Add Selected</Button>
-					</div>
-				</div>
-			}
-		>
-			{loading ? (
-				<div className="flex items-center justify-center h-24">
-					<span className="text-gray-400 text-sm">Loading...</span>
-				</div>
-			) : items.length === 0 ? (
-				<div className="flex items-center justify-center h-24">
-					<span className="text-gray-500 text-xs">No uploaded images yet</span>
-				</div>
-			) : (
-				<div className="grid grid-cols-4 md:grid-cols-5 gap-2">
-					{items.map((item) => {
-						const isSelected = selected.has(item.url);
-						const canSelect = isSelected || selected.size < maxImages;
+		<Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+			<DialogContent className="flex max-h-[85dvh] flex-col sm:max-w-2xl">
+				<DialogHeader>
+					<DialogTitle className="font-sans text-lg font-semibold">Your uploads</DialogTitle>
+					<DialogDescription>
+						Pick up to {maxImages} images to use as references. {selected.size} selected.
+					</DialogDescription>
+				</DialogHeader>
 
-						return (
-							<button
-								key={item.id}
-								type="button"
-								onClick={() => canSelect && toggleSelection(item.url)}
-								disabled={!canSelect}
-								className={`relative aspect-square rounded overflow-hidden cyber-card ${
-									!canSelect ? "opacity-40 cursor-not-allowed" : "cursor-pointer hover:neon-border"
-								} ${isSelected ? "ring-2 ring-cyan-500" : ""}`}
-							>
-								<img
-									src={`${API_BASE}${item.url}`}
-									alt={item.label}
-									className="w-full h-full object-cover"
-									loading="lazy"
-								/>
-								{isSelected && (
-									<div className="absolute top-1 right-1 w-4 h-4 bg-cyan-500 rounded-full flex items-center justify-center">
-										<IconCheck className="w-2.5 h-2.5 text-white" />
-									</div>
-								)}
-							</button>
-						);
-					})}
+				<div className="-mx-4 min-h-0 flex-1 overflow-y-auto px-4">
+					{loading ? (
+						<div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+							{Array.from({ length: 10 }, (_, i) => (
+								// biome-ignore lint/suspicious/noArrayIndexKey: static placeholders
+								<Skeleton key={i} className="aspect-square rounded-xl" />
+							))}
+						</div>
+					) : failed ? (
+						<div className="flex flex-col items-center gap-3 py-10 text-center">
+							<p className="text-sm text-muted-foreground">Couldn't load your uploads.</p>
+							<Button variant="outline" onClick={fetchUploads}>
+								Try again
+							</Button>
+						</div>
+					) : uploads.length === 0 ? (
+						<p className="py-10 text-center text-sm text-muted-foreground">
+							No uploads yet. Drop an image on the prompt bar to add one.
+						</p>
+					) : (
+						<ul className="m-0 grid list-none grid-cols-3 gap-2 p-0 sm:grid-cols-5">
+							{uploads.map((u) => {
+								const isSelected = selected.has(u.imageUrl);
+								const canSelect = isSelected || selected.size < maxImages;
+								return (
+									<li key={u.id}>
+										<button
+											type="button"
+											onClick={() => canSelect && toggle(u.imageUrl)}
+											disabled={!canSelect}
+											aria-pressed={isSelected}
+											aria-label={u.originalName}
+											className={cn(
+												"relative block aspect-square w-full overflow-hidden rounded-xl bg-muted outline-2 outline-offset-2 outline-transparent focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40",
+												isSelected && "outline-verdigris",
+											)}
+										>
+											<img
+												src={`${API_BASE}${u.imageUrl}`}
+												alt=""
+												loading="lazy"
+												className="h-full w-full object-cover"
+											/>
+											{isSelected && (
+												<span className="absolute top-1.5 right-1.5 grid size-6 place-items-center rounded-full bg-verdigris text-background">
+													<CheckIcon className="size-3.5" />
+												</span>
+											)}
+										</button>
+									</li>
+								);
+							})}
+						</ul>
+					)}
 				</div>
-			)}
-		</Modal>
+
+				<DialogFooter>
+					<Button variant="outline" onClick={onClose}>
+						Cancel
+					</Button>
+					<Button
+						variant="secondary"
+						onClick={() => {
+							onSelect(Array.from(selected));
+							onClose();
+						}}
+					>
+						{selected.size === 1 ? "Use 1 image" : `Use ${selected.size} images`}
+					</Button>
+				</DialogFooter>
+			</DialogContent>
+		</Dialog>
 	);
 }

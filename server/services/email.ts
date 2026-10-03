@@ -372,6 +372,29 @@ export async function sendLowCreditsEmail(to: string, data: { balance: number })
 	});
 }
 
+/**
+ * Confirm a change of sign-in email. Sent to the NEW address; nothing changes until the link is
+ * opened. The caller reserves the send (reserveEmailSend) first.
+ */
+export async function sendEmailChangeEmail(to: string, username: string, token: string): Promise<SendResult> {
+	const url = `${APP_URL}/settings?confirmEmail=${token}`;
+	return sendEmail({
+		to,
+		subject: "Confirm your new ollo.art email",
+		devLink: url,
+		html: plainLayout({
+			heading: "Confirm your new email",
+			paragraphs: [
+				`Hi ${escapeHtml(username)}, you asked to use this address to sign in to ollo.art.`,
+				"Open the link below to confirm it. Until you do, your old address stays in place. The link expires in 1 hour.",
+			],
+			buttonUrl: url,
+			buttonLabel: "Confirm new email",
+			footer: "If you didn't ask for this, ignore this email and nothing will change.",
+		}),
+	});
+}
+
 function userEmail(userId: string): string | null {
 	const row = getDb().prepare("SELECT email FROM users WHERE id = ?").get(userId) as
 		| { email: string | null }

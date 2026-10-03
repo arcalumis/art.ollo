@@ -19,6 +19,8 @@ import { stripeWebhookRoutes } from "./routes/stripe-webhooks";
 import { uploadsRoutes } from "./routes/uploads";
 import { userRoutes } from "./routes/user";
 import { threadRoutes } from "./routes/threads";
+import { shareRoutes } from "./routes/share";
+import { accountRoutes } from "./routes/account";
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -158,6 +160,8 @@ export async function buildApp(opts: { logger?: boolean } = {}): Promise<Fastify
 	await fastify.register(solanaRpcRoutes);
 	await fastify.register(stripeWebhookRoutes);
 	await fastify.register(threadRoutes);
+	await fastify.register(shareRoutes);
+	await fastify.register(accountRoutes);
 
 	// Health check
 	fastify.get("/api/health", async () => ({

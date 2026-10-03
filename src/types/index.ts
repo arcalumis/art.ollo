@@ -304,6 +304,10 @@ export interface QueuedGeneration {
 	startedAt?: string;
 	estimatedDuration?: number;
 	threadId?: string;
+	/** The requested aspect ratio ("4:3"), so the in-progress tile holds the final shape. */
+	aspectRatio?: string;
+	/** Outputs requested (4 for variation sets). */
+	numOutputs?: number;
 }
 
 // Thread types

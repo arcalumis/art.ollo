@@ -1003,4 +1003,38 @@ function runPhase1BMigrations(db: Database): void {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`);
+
+	// ---- Phase 4F migrations ----
+	// Public share links: one live (unrevoked) slug per generation; revoked rows are kept so an
+	// old slug can never be reissued to a different image.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS share_links (
+			slug TEXT PRIMARY KEY,
+			generation_id TEXT NOT NULL REFERENCES generations(id),
+			user_id TEXT NOT NULL REFERENCES users(id),
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			revoked_at DATETIME DEFAULT NULL
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_share_links_live
+			ON share_links(generation_id) WHERE revoked_at IS NULL;
+		CREATE INDEX IF NOT EXISTS idx_share_links_user ON share_links(user_id);
+	`);
+	// Email change: the link goes to the NEW address; the row carries the address to switch to.
+	// (email_tokens has a CHECK on its type, so these live in their own table.)
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS email_change_tokens (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			new_email TEXT NOT NULL,
+			token_hash TEXT UNIQUE NOT NULL,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME DEFAULT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_email_change_tokens_user ON email_change_tokens(user_id);
+	`);
+	// Account deletion is a soft delete: the row stays for financial records.
+	if (!hasColumn(db, "users", "deleted_at")) {
+		db.exec("ALTER TABLE users ADD COLUMN deleted_at DATETIME DEFAULT NULL");
+	}
 }

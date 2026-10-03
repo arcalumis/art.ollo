@@ -15,7 +15,13 @@ function runStep(name: string, fn: () => void): void {
 }
 
 /**
- * Purge generations trashed more than an hour ago: delete their image files
+ * How long a trashed generation or upload can be restored before it is purged for good.
+ * The gallery's Trash view states this retention, so keep the copy in step if it changes.
+ */
+export const TRASH_RETENTION_DAYS = 30;
+
+/**
+ * Purge generations trashed more than TRASH_RETENTION_DAYS ago: delete their image files
  * (primary + grid images) and mark the row purged_at. Rows are kept for cost
  * tracking; history/threads/gallery queries already exclude purged rows.
  * Returns the number of rows purged.
@@ -27,9 +33,9 @@ export function purgeTrashedGenerations(): number {
 			`SELECT id, image_path, parameters FROM generations
 			 WHERE deleted_at IS NOT NULL
 			 AND purged_at IS NULL
-			 AND deleted_at < datetime('now', '-1 hour')`,
+			 AND deleted_at < datetime('now', ?)`,
 		)
-		.all() as { id: string; image_path: string | null; parameters: string | null }[];
+		.all(`-${TRASH_RETENTION_DAYS} days`) as { id: string; image_path: string | null; parameters: string | null }[];
 
 	const markPurged = db.prepare("UPDATE generations SET purged_at = datetime('now') WHERE id = ?");
 	let purged = 0;
@@ -45,16 +51,16 @@ export function purgeTrashedGenerations(): number {
 	return purged;
 }
 
-/** Hard-delete uploads trashed more than an hour ago (uploads carry no cost data). */
+/** Hard-delete uploads trashed more than TRASH_RETENTION_DAYS ago (uploads carry no cost data). */
 export function purgeTrashedUploads(): number {
 	const db = getDb();
 	const rows = db
 		.prepare(
 			`SELECT id, filename FROM uploads
 			 WHERE deleted_at IS NOT NULL
-			 AND deleted_at < datetime('now', '-1 hour')`,
+			 AND deleted_at < datetime('now', ?)`,
 		)
-		.all() as { id: string; filename: string | null }[];
+		.all(`-${TRASH_RETENTION_DAYS} days`) as { id: string; filename: string | null }[];
 
 	const del = db.prepare("DELETE FROM uploads WHERE id = ?");
 	let purged = 0;
