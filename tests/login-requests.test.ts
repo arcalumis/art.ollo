@@ -529,3 +529,25 @@ describe("device summary", () => {
 		expect(summarizeUserAgent("curl/8.0")).toBe("Unknown browser");
 	});
 });
+
+describe("device A polling schedule", () => {
+	test("every 2s for a minute, then every 5s, stopping after the link expires", async () => {
+		const { nextPollDelay } = await import("../src/hooks/useLoginRequestPoll");
+		expect(nextPollDelay(0)).toBe(2000);
+		expect(nextPollDelay(59_000)).toBe(2000);
+		expect(nextPollDelay(61_000)).toBe(5000);
+		expect(nextPollDelay(15 * 60_000)).toBe(5000);
+		expect(nextPollDelay(16 * 60_000)).toBeNull();
+	});
+
+	test("poll results map to what the inbox step shows", async () => {
+		const { waitStateFor } = await import("../src/hooks/useLoginRequestPoll");
+		expect(waitStateFor({ status: "pending" }, false)).toBeNull();
+		expect(waitStateFor({ status: "retry" }, false)).toBeNull();
+		expect(waitStateFor({ status: "denied", reason: "denied" }, false)).toBe("denied");
+		expect(waitStateFor({ status: "denied", reason: "elsewhere" }, false)).toBe("elsewhere");
+		expect(waitStateFor({ status: "expired" }, false)).toBe("expired");
+		expect(waitStateFor({ status: "consumed" }, true)).toBe("approved");
+		expect(waitStateFor({ status: "consumed" }, false)).toBe("used");
+	});
+});
