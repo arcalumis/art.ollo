@@ -276,7 +276,12 @@ export function PendingStep({
 					<span aria-hidden="true"> · </span>
 					<span>{modelName(item.model)}</span>
 					<span aria-hidden="true"> · </span>
-					<span className={cn("tabular-nums", view.active && "text-verdigris")}>
+					<span
+						className={cn(
+							"inline-block whitespace-nowrap tabular-nums",
+							view.active && "text-verdigris",
+						)}
+					>
 						{view.label}
 					</span>
 				</p>
