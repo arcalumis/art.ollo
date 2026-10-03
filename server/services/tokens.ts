@@ -126,6 +126,13 @@ export function consumeSignupToken(token: string): { email: string; rememberMe: 
 	return record ? { email: record.email, rememberMe: record.remember_me === 1 } : null;
 }
 
+/** Non-consuming check that a sign-up token is unused and unexpired. */
+export function peekSignupToken(token: string): boolean {
+	return !!getDb()
+		.prepare("SELECT 1 FROM signup_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?")
+		.get(hashToken(token), nowIso());
+}
+
 export function cleanupExpiredTokens(): number {
 	const db = getDb();
 	const now = nowIso();

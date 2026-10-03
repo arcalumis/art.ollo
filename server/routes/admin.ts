@@ -162,7 +162,7 @@ async function sendSignInLink(
 		rememberMe: false,
 		expiresInMinutes: MAGIC_LINK_EXPIRY_MINUTES,
 	});
-	const result = await sendMagicLinkEmail(user.email, user.username, token, false);
+	const result = await sendMagicLinkEmail(user.email, user.username, { token }, false);
 	if (!result.success) {
 		return {
 			ok: false,

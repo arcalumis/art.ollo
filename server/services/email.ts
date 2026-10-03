@@ -229,37 +229,59 @@ export async function sendWelcomeEmail(email: string, username: string): Promise
 	});
 }
 
-function magicLinkUrl(token: string, rememberMe: boolean): string {
-	return `${APP_URL}/auth/magic-link?token=${token}&rememberMe=${rememberMe}`;
+/** What a sign-in or sign-up email links to. `requestId` ties it to the device that asked. */
+export interface AuthLink {
+	token: string;
+	requestId?: string;
+	/** Summary of the device that asked, e.g. "Safari on iPhone". Never the raw user agent. */
+	device?: string;
+}
+
+function magicLinkUrl(link: AuthLink, rememberMe: boolean): string {
+	const rid = link.requestId ? `&rid=${encodeURIComponent(link.requestId)}` : "";
+	return `${APP_URL}/auth/magic-link?token=${link.token}${rid}&rememberMe=${rememberMe}`;
+}
+
+const NOT_YOU = "If you didn't just try to sign in to ollo, ignore this email.";
+
+/** "It can sign in the device where you asked (Safari on iPhone)." */
+function deviceSentence(link: AuthLink): string {
+	if (!link.requestId) return "";
+	const where = link.device ? ` (${escapeHtml(link.device)})` : "";
+	return ` Open it on any device: it can sign you in right there, or sign in the device where you asked${where}.`;
 }
 
 export async function sendMagicLinkEmail(
 	email: string,
 	username: string,
-	token: string,
+	link: AuthLink,
 	rememberMe: boolean,
 ): Promise<SendResult> {
-	const url = magicLinkUrl(token, rememberMe);
+	const url = magicLinkUrl(link, rememberMe);
 	return sendEmail({
 		to: email,
 		subject: "Your sign-in link for ollo.art",
 		devLink: url,
 		html: layout({
 			gradient: MAGIC_GRADIENT,
-			title: "Sign In to ollo.art",
+			title: "Sign in to ollo.art",
 			greeting: `Hi <strong>${escapeHtml(username)}</strong>,`,
-			body: "Click the button below to sign in to your account. This link will expire in 15 minutes.",
+			body: `Use the button below to sign in. The link works once and expires in 15 minutes.${deviceSentence(link)}`,
 			buttonUrl: url,
-			buttonLabel: "Sign In Now",
-			footer: "If you didn't request this link, you can safely ignore this email.",
+			buttonLabel: "Sign in",
+			footer: NOT_YOU,
 			showRawLink: true,
 		}),
 	});
 }
 
 /** Sent when someone requests a link for an email with no account: clicking it creates the account. */
-export async function sendSignupLinkEmail(email: string, token: string, rememberMe: boolean): Promise<SendResult> {
-	const url = magicLinkUrl(token, rememberMe);
+export async function sendSignupLinkEmail(
+	email: string,
+	link: AuthLink,
+	rememberMe: boolean,
+): Promise<SendResult> {
+	const url = magicLinkUrl(link, rememberMe);
 	return sendEmail({
 		to: email,
 		subject: "Create your ollo.art account",
@@ -268,10 +290,10 @@ export async function sendSignupLinkEmail(email: string, token: string, remember
 			gradient: MAGIC_GRADIENT,
 			title: "Welcome to ollo.art",
 			greeting: "Hi there,",
-			body: "Click the button below to create your ollo.art account and sign in. This link will expire in 15 minutes.",
+			body: `Use the button below to create your ollo.art account and sign in. The link works once and expires in 15 minutes.${deviceSentence(link)}`,
 			buttonUrl: url,
-			buttonLabel: "Create My Account",
-			footer: "If you didn't request this, you can safely ignore this email. No account will be created.",
+			buttonLabel: "Create my account",
+			footer: `${NOT_YOU} No account will be created.`,
 			showRawLink: true,
 		}),
 	});

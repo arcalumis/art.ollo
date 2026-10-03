@@ -18,8 +18,22 @@ import {
 	createEmailToken,
 	createSignupToken,
 	invalidateUserTokens,
+	peekSignupToken,
 	peekToken,
 } from "../services/tokens";
+import {
+	findPendingRequestForLink,
+	findRequestForPoller,
+	markApproved,
+	markConsumedByToken,
+	markDenied,
+	mintLoginRequest,
+	refreshExpiry,
+	saveLoginRequest,
+	summarizeUserAgent,
+	supersedeRequest,
+	takeApproval,
+} from "../services/login-requests";
 import { assignDefaultSubscription } from "../services/usage";
 
 const isProduction = process.env.NODE_ENV === "production";
@@ -155,6 +169,18 @@ interface EmailLoginBody {
 interface MagicLinkBody {
 	email: string;
 	rememberMe?: boolean;
+	/** "Send another link": the request this one replaces (it stops being approvable). */
+	replaces?: { requestId?: unknown; pollSecret?: unknown };
+}
+
+interface LinkActionBody {
+	requestId?: unknown;
+	token?: unknown;
+}
+
+interface PollBody {
+	requestId?: unknown;
+	pollSecret?: unknown;
 }
 
 interface ForgotPasswordBody {
@@ -265,6 +291,97 @@ function issueSession(user: Pick<UserRow, "id" | "username" | "is_admin" | "toke
 }
 
 const DEACTIVATED = { error: "This account has been deactivated" } as const;
+
+// ==================== Link tokens (sign-in and sign-up) ====================
+
+type ConsumedLink =
+	| { kind: "magic_link"; userId: string; rememberMe: boolean }
+	| { kind: "signup"; email: string; rememberMe: boolean };
+
+/** Spend an emailed sign-in or sign-up token (atomic, single use). Null when invalid, used or expired. */
+function consumeLinkToken(token: string): ConsumedLink | null {
+	const signIn = consumeToken(token, "magic_link");
+	if (signIn.valid && signIn.userId) return { kind: "magic_link", userId: signIn.userId, rememberMe: !!signIn.rememberMe };
+	const signup = consumeSignupToken(token);
+	if (signup) return { kind: "signup", email: signup.email, rememberMe: signup.rememberMe };
+	return null;
+}
+
+/**
+ * The account a spent link signs in to. A sign-up link creates the account on first use
+ * (Free plan + INITIAL_CREDITS); a second sign-up link for the same email reuses it.
+ * Call inside a transaction.
+ */
+function resolveLinkUser(
+	link: ConsumedLink,
+): { user: UserRow; isNewUser: boolean; rememberMe: boolean; kind: ConsumedLink["kind"] } | null {
+	const db = getDb();
+	if (link.kind === "magic_link") {
+		const user = db.prepare("SELECT * FROM users WHERE id = ?").get(link.userId) as UserRow | undefined;
+		return user ? { user, isNewUser: false, rememberMe: link.rememberMe, kind: link.kind } : null;
+	}
+	const existing = db.prepare("SELECT * FROM users WHERE email = ?").get(link.email) as UserRow | undefined;
+	if (existing) return { user: existing, isNewUser: false, rememberMe: link.rememberMe, kind: link.kind };
+
+	const id = crypto.randomUUID();
+	db.prepare(`
+		INSERT INTO users (id, username, password_hash, email, is_admin, is_active)
+		VALUES (?, ?, ?, ?, 0, 1)
+	`).run(id, deriveUsername(link.email), unusablePasswordHash(), link.email);
+	// Free subscription + INITIAL_CREDITS (credit_type 'initial')
+	assignDefaultSubscription(id);
+	const user = db.prepare("SELECT * FROM users WHERE id = ?").get(id) as UserRow;
+	return { user, isNewUser: true, rememberMe: link.rememberMe, kind: link.kind };
+}
+
+/** Whether the link token behind a login request is still unused and unexpired (read-only). */
+function linkTokenIsLive(row: { token_kind: string | null }, token: string): boolean {
+	if (row.token_kind === "magic_link") return peekToken(token, "magic_link").valid;
+	if (row.token_kind === "signup") return peekSignupToken(token);
+	return false;
+}
+
+/** Thrown inside a transaction to roll back when a request changed under us. */
+class LinkRace extends Error {}
+
+const LINK_EXPIRED = { error: "Invalid or expired link", code: "LINK_EXPIRED" } as const;
+
+/**
+ * Per-request poll budget, on top of the per-IP route limit. Device A polls every 2-5s, so 40
+ * a minute leaves room for a second tab; the 32-byte secret is the real protection.
+ */
+const pollLimiter = (() => {
+	const WINDOW_MS = 60_000;
+	const MAX = 40;
+	const hits = new Map<string, number[]>();
+	return {
+		allow(key: string): boolean {
+			const now = Date.now();
+			if (hits.size > 10_000) {
+				for (const [k, times] of hits) if ((times.at(-1) ?? 0) < now - WINDOW_MS) hits.delete(k);
+			}
+			const recent = (hits.get(key) ?? []).filter((t) => t > now - WINDOW_MS);
+			if (recent.length >= MAX) {
+				hits.set(key, recent);
+				return false;
+			}
+			recent.push(now);
+			hits.set(key, recent);
+			return true;
+		},
+		reset(): void {
+			hits.clear();
+		},
+	};
+})();
+
+/** Tests only. */
+export function resetPollLimiter(): void {
+	pollLimiter.reset();
+}
+
+const pollRateLimit = { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } };
+const linkInfoRateLimit = { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } };
 
 // Strict per-IP rate limit for auth endpoints (meaningful now that trustProxy resolves real client IPs)
 const authRateLimit = {
@@ -407,42 +524,62 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
 			return reply.status(400).send({ error: "A valid email address is required" });
 		}
 
+		// Every outcome gets a login request (same shape for every address). Only one backed by a
+		// sent link can ever be approved.
+		const replaces = request.body?.replaces;
+		if (replaces && typeof replaces === "object") supersedeRequest(replaces.requestId, replaces.pollSecret);
+		const loginRequest = mintLoginRequest();
+		const respond = () => ({ ...GENERIC_LINK_RESPONSE, ...loginRequest });
+		const save = (token: string | null, tokenKind: "magic_link" | "signup" | null) =>
+			saveLoginRequest(loginRequest, {
+				email,
+				token,
+				tokenKind,
+				userAgent: request.headers["user-agent"],
+				rememberMe,
+				expiresInMinutes: MAGIC_LINK_EXPIRY_MINUTES,
+			});
+
 		const user = getDb()
 			.prepare("SELECT id, username, email, is_active FROM users WHERE email = ?")
 			.get(email) as Pick<UserRow, "id" | "username" | "email" | "is_active"> | undefined;
 
 		if (user && !isActive(user)) {
-			return GENERIC_LINK_RESPONSE;
+			save(null, null);
+			return respond();
 		}
 
 		const kind = user ? "magic_link" : "signup";
 		if (!reserveEmailSend(email, kind, request.ip)) {
-			return GENERIC_LINK_RESPONSE;
+			save(null, null);
+			return respond();
 		}
 
-		const result = user
-			? await sendMagicLinkEmail(
-					email,
-					user.username,
-					createEmailToken({
-						userId: user.id,
-						type: "magic_link",
-						rememberMe,
-						expiresInMinutes: MAGIC_LINK_EXPIRY_MINUTES,
-					}),
+		const token = user
+			? createEmailToken({
+					userId: user.id,
+					type: "magic_link",
 					rememberMe,
-				)
-			: await sendSignupLinkEmail(email, createSignupToken(email, rememberMe, MAGIC_LINK_EXPIRY_MINUTES), rememberMe);
+					expiresInMinutes: MAGIC_LINK_EXPIRY_MINUTES,
+				})
+			: createSignupToken(email, rememberMe, MAGIC_LINK_EXPIRY_MINUTES);
+		save(token, kind);
+
+		const link = { token, requestId: loginRequest.requestId, device: summarizeUserAgent(request.headers["user-agent"]) };
+		const result = user
+			? await sendMagicLinkEmail(email, user.username, link, rememberMe)
+			: await sendSignupLinkEmail(email, link, rememberMe);
 
 		if (!result.success) {
 			request.log.error({ kind, err: result.error }, "Auth email send failed");
 			return sendEmailUnavailable(reply);
 		}
 
-		return GENERIC_LINK_RESPONSE;
+		return respond();
 	});
 
-	// Verify a magic link (sign-in) or sign-up link
+	// Verify a magic link (sign-in) or sign-up link: the same-device path, and links sent
+	// before cross-device sign-in existed.
 	fastify.get<{ Querystring: { token: string } }>("/api/auth/magic-link/verify", async (request, reply) => {
 		const { token } = request.query;
 
@@ -451,40 +588,137 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
 		}
 
 		const db = getDb();
-
-		// Existing account sign-in link
-		const signIn = consumeToken(token, "magic_link");
-		if (signIn.valid && signIn.userId) {
-			const user = db.prepare("SELECT * FROM users WHERE id = ?").get(signIn.userId) as UserRow | undefined;
-			if (!user) return reply.status(401).send({ error: "Invalid or expired link" });
-			if (!isActive(user)) return reply.status(401).send(DEACTIVATED);
-			return issueSession(user, signIn.rememberMe);
-		}
-
-		// Sign-up link: create the account on first click
-		const signup = consumeSignupToken(token);
-		if (!signup) {
-			return reply.status(401).send({ error: "Invalid or expired link" });
-		}
-
 		const outcome = db.transaction(() => {
-			const existing = db.prepare("SELECT * FROM users WHERE email = ?").get(signup.email) as UserRow | undefined;
-			if (existing) return { user: existing, isNewUser: false };
-
-			const id = crypto.randomUUID();
-			db.prepare(`
-				INSERT INTO users (id, username, password_hash, email, is_admin, is_active)
-				VALUES (?, ?, ?, ?, 0, 1)
-			`).run(id, deriveUsername(signup.email), unusablePasswordHash(), signup.email);
-			// Free subscription + INITIAL_CREDITS (credit_type 'initial')
-			assignDefaultSubscription(id);
-			return { user: db.prepare("SELECT * FROM users WHERE id = ?").get(id) as UserRow, isNewUser: true };
+			const consumed = consumeLinkToken(token);
+			if (!consumed) return null;
+			// Opened where it was requested: the login request is done.
+			markConsumedByToken(token);
+			return resolveLinkUser(consumed);
 		})();
 
+		if (!outcome) return reply.status(401).send({ error: "Invalid or expired link" });
 		if (!isActive(outcome.user)) return reply.status(401).send(DEACTIVATED);
 		if (outcome.isNewUser) request.log.info({ userId: outcome.user.id }, "New account created via sign-up link");
 
-		return { ...issueSession(outcome.user, signup.rememberMe), isNewUser: outcome.isNewUser };
+		const session = issueSession(outcome.user, outcome.rememberMe);
+		return outcome.kind === "signup" ? { ...session, isNewUser: outcome.isNewUser } : session;
+	});
+
+	// ==================== Cross-device sign-in ====================
+	// The emailed link carries rid=<requestId>. Opened on another device, the page asks first:
+	// nothing changes until the person clicks, so link scanners and previews approve nothing.
+
+	/** Read-only: what the approval page shows. Requires the (unused, unexpired) link token. */
+	fastify.get<{ Querystring: { rid?: string; token?: string } }>(
+		"/api/auth/login-request/info",
+		linkInfoRateLimit,
+		async (request, reply) => {
+			const row = findPendingRequestForLink(request.query.rid, request.query.token);
+			if (!row || !linkTokenIsLive(row, request.query.token as string)) {
+				return reply.status(404).send({ error: "Invalid or expired link", code: "LINK_EXPIRED" });
+			}
+			return { status: row.status, device: row.user_agent_summary, code: row.code, expiresAt: row.expires_at };
+		},
+	);
+
+	/** "Sign in on that device": spends the link and lets device A collect a session. */
+	fastify.post<{ Body: LinkActionBody }>("/api/auth/login-request/approve", authRateLimit, async (request, reply) => {
+		const { requestId, token } = request.body ?? {};
+		const db = getDb();
+		const result = db.transaction(() => {
+			const row = findPendingRequestForLink(requestId, token);
+			if (!row) return { error: "expired" as const };
+			const consumed = consumeLinkToken(token as string);
+			if (!consumed) return { error: "expired" as const };
+			const outcome = resolveLinkUser(consumed);
+			if (!outcome) return { error: "expired" as const };
+			if (!isActive(outcome.user)) {
+				markDenied(row.id, "denied");
+				return { error: "inactive" as const };
+			}
+			if (!markApproved(row.id, outcome.user.id, outcome.isNewUser, outcome.rememberMe)) {
+				throw new LinkRace();
+			}
+			return { ok: true as const, isNewUser: outcome.isNewUser, userId: outcome.user.id };
+		});
+
+		let outcome: ReturnType<typeof result>;
+		try {
+			outcome = result();
+		} catch (err) {
+			if (err instanceof LinkRace) return reply.status(401).send(LINK_EXPIRED);
+			throw err;
+		}
+		if ("error" in outcome) {
+			return reply.status(401).send(outcome.error === "inactive" ? DEACTIVATED : LINK_EXPIRED);
+		}
+		if (outcome.isNewUser) request.log.info({ userId: outcome.userId }, "New account created via cross-device approval");
+		return { success: true };
+	});
+
+	/** "Sign in here instead": spends the link and signs in this browser; device A stops waiting. */
+	fastify.post<{ Body: LinkActionBody }>("/api/auth/login-request/here", authRateLimit, async (request, reply) => {
+		const { requestId, token } = request.body ?? {};
+		const db = getDb();
+		const outcome = db.transaction(() => {
+			const row = findPendingRequestForLink(requestId, token);
+			if (!row) return null;
+			const consumed = consumeLinkToken(token as string);
+			if (!consumed) return null;
+			markDenied(row.id, "elsewhere");
+			return resolveLinkUser(consumed);
+		})();
+
+		if (!outcome) return reply.status(401).send(LINK_EXPIRED);
+		if (!isActive(outcome.user)) return reply.status(401).send(DEACTIVATED);
+		if (outcome.isNewUser) request.log.info({ userId: outcome.user.id }, "New account created via sign-up link");
+		return { ...issueSession(outcome.user, outcome.rememberMe), isNewUser: outcome.isNewUser };
+	});
+
+	/** "I didn't ask for this": spends the link without signing anyone in. */
+	fastify.post<{ Body: LinkActionBody }>("/api/auth/login-request/deny", authRateLimit, async (request, reply) => {
+		const { requestId, token } = request.body ?? {};
+		const db = getDb();
+		const ok = db.transaction(() => {
+			const row = findPendingRequestForLink(requestId, token);
+			if (!row || !consumeLinkToken(token as string)) return false;
+			return markDenied(row.id, "denied");
+		})();
+		if (!ok) return reply.status(401).send(LINK_EXPIRED);
+		return { success: true };
+	});
+
+	/**
+	 * Device A polls here. On approval it receives { token, user } exactly once (approved ->
+	 * consumed in one conditional UPDATE); every later poll sees "consumed" and no token.
+	 */
+	fastify.post<{ Body: PollBody }>("/api/auth/login-request/status", pollRateLimit, async (request, reply) => {
+		const { requestId, pollSecret } = request.body ?? {};
+		if (typeof requestId !== "string" || !pollLimiter.allow(requestId)) {
+			return reply.status(429).send({ error: "Too many requests", code: "RATE_LIMITED" });
+		}
+		const row = findRequestForPoller(requestId, pollSecret);
+		if (!row) return reply.status(404).send({ error: "Sign-in request not found", code: "REQUEST_NOT_FOUND" });
+
+		const status = refreshExpiry(row);
+		if (status === "denied") return { status, reason: row.denied_reason ?? "denied" };
+		if (status !== "approved") return { status };
+
+		const approval = takeApproval(row.id);
+		if (!approval) {
+			// Collected by a concurrent poll, or left uncollected past the grace period.
+			const now = getDb().prepare("SELECT status FROM login_requests WHERE id = ?").get(row.id) as
+				| { status: string }
+				| undefined;
+			if (now?.status === "approved") {
+				getDb().prepare("UPDATE login_requests SET status = 'expired' WHERE id = ? AND status = 'approved'").run(row.id);
+				return { status: "expired" };
+			}
+			return { status: now?.status ?? "expired" };
+		}
+		const user = getDb().prepare("SELECT * FROM users WHERE id = ?").get(approval.userId) as UserRow | undefined;
+		if (!user || !isActive(user)) return { status: "denied", reason: "denied" };
+		return { status: "approved", ...issueSession(user, approval.rememberMe), isNewUser: approval.isNewUser };
 	});
 
 	// Request password reset. Unknown emails get a sign-up link instead, so the request costs
@@ -519,7 +753,7 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
 						expiresInMinutes: PASSWORD_RESET_EXPIRY_MINUTES,
 					}),
 				)
-			: await sendSignupLinkEmail(email, createSignupToken(email, false, MAGIC_LINK_EXPIRY_MINUTES), false);
+			: await sendSignupLinkEmail(email, { token: createSignupToken(email, false, MAGIC_LINK_EXPIRY_MINUTES) }, false);
 
 		if (!result.success) {
 			request.log.error({ kind, err: result.error }, "Auth email send failed");
