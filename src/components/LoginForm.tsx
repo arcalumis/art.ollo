@@ -4,18 +4,27 @@ import { useAuth } from "../contexts/AuthContext";
 import { SolanaWalletButton } from "./SolanaWalletButton";
 import treasureCrowRight from "../assets/treasure_crow_right.png";
 
-type Step = "email" | "options" | "password" | "magic-link-sent" | "forgot-password" | "forgot-password-sent" | "wallet-signing" | "wallet-username";
+type Step = "email" | "password" | "magic-link-sent" | "forgot-password" | "forgot-password-sent" | "wallet-signing" | "wallet-username";
+
+const RESEND_COOLDOWN_SECONDS = 60;
 
 export function LoginForm() {
-	const { checkEmail, loginWithEmail, requestMagicLink, requestPasswordReset, login, requestWalletChallenge, verifyWalletSignature } = useAuth();
+	const { loginWithEmail, requestMagicLink, requestPasswordReset, login, requestWalletChallenge, verifyWalletSignature } = useAuth();
 	const { publicKey, signMessage, connected, disconnect } = useWallet();
 	const [step, setStep] = useState<Step>("email");
 	const [email, setEmail] = useState("");
 	const [password, setPassword] = useState("");
 	const [rememberMe, setRememberMe] = useState(false);
-	const [hasPassword, setHasPassword] = useState(false);
 	const [error, setError] = useState("");
 	const [loading, setLoading] = useState(false);
+	const [resendIn, setResendIn] = useState(0);
+
+	// Countdown before "Resend" is enabled on the check-your-inbox screen
+	useEffect(() => {
+		if (resendIn <= 0) return;
+		const t = setTimeout(() => setResendIn((s) => s - 1), 1000);
+		return () => clearTimeout(t);
+	}, [resendIn]);
 
 	// For legacy username login
 	const [useLegacyLogin, setUseLegacyLogin] = useState(false);
@@ -41,39 +50,21 @@ export function LoginForm() {
 		}
 	}, [connected, step, loading]);
 
-	const handleEmailSubmit = async (e: React.FormEvent) => {
-		e.preventDefault();
+	// Email is the primary path for everyone: existing accounts get a sign-in link, new emails
+	// get a "create your account" link. The screen is the same either way.
+	const handleMagicLink = async (e?: React.FormEvent) => {
+		e?.preventDefault();
 		setError("");
 		setLoading(true);
 
-		const result = await checkEmail(email);
+		const result = await requestMagicLink(email, rememberMe);
 		setLoading(false);
 
-		if (!result) {
-			setError("Unable to check email. Please try again.");
-			return;
-		}
-
-		if (!result.exists) {
-			setError("No account found with this email address");
-			return;
-		}
-
-		setHasPassword(result.hasPassword);
-		setStep("options");
-	};
-
-	const handleMagicLink = async () => {
-		setError("");
-		setLoading(true);
-
-		const success = await requestMagicLink(email, rememberMe);
-		setLoading(false);
-
-		if (success) {
+		if (result.success) {
 			setStep("magic-link-sent");
+			setResendIn(RESEND_COOLDOWN_SECONDS);
 		} else {
-			setError("Failed to send magic link. Please try again.");
+			setError(result.error || "Failed to send sign-in link. Please try again.");
 		}
 	};
 
@@ -328,7 +319,7 @@ export function LoginForm() {
 
 					{/* Step 1: Email Input */}
 					{step === "email" && (
-						<form onSubmit={handleEmailSubmit} className="space-y-4">
+						<form onSubmit={handleMagicLink} className="space-y-4">
 							<div>
 								<label htmlFor="email" className="block text-xs font-medium mb-1 text-gray-400">
 									Email address
@@ -346,6 +337,19 @@ export function LoginForm() {
 								/>
 							</div>
 
+							<div className="flex items-center gap-2">
+								<input
+									id="rememberMe"
+									type="checkbox"
+									checked={rememberMe}
+									onChange={(e) => setRememberMe(e.target.checked)}
+									className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-cyan-500 focus:ring-cyan-500"
+								/>
+								<label htmlFor="rememberMe" className="text-xs text-gray-400">
+									Remember me for 30 days
+								</label>
+							</div>
+
 							{error && (
 								<div className="p-2 bg-red-900/30 border border-red-500/30 rounded">
 									<p className="text-red-400 text-xs">{error}</p>
@@ -353,8 +357,9 @@ export function LoginForm() {
 							)}
 
 							<button type="submit" disabled={loading} className="cyber-button w-full py-2.5 rounded font-medium text-white text-sm">
-								{loading ? "Checking..." : "Continue"}
+								{loading ? "Sending..." : "Email me a sign-in link"}
 							</button>
+							<p className="text-xs text-gray-500 text-center">New here? The same link creates your account.</p>
 
 							<div className="relative my-4">
 								<div className="absolute inset-0 flex items-center">
@@ -392,75 +397,45 @@ export function LoginForm() {
 								</div>
 							)}
 
-							<button
-								type="button"
-								onClick={() => setUseLegacyLogin(true)}
-								className="w-full text-xs text-gray-500 hover:text-cyan-400 transition-colors"
-							>
-								Use username instead
-							</button>
-						</form>
-					)}
-
-					{/* Step 2: Login Options */}
-					{step === "options" && (
-						<div className="space-y-4">
-							<div className="text-center mb-4">
-								<p className="text-sm text-gray-400">Signing in as</p>
-								<p className="text-cyan-400 font-medium">{email}</p>
-							</div>
-
-							<div className="flex items-center gap-2 mb-4">
-								<input
-									id="rememberMe"
-									type="checkbox"
-									checked={rememberMe}
-									onChange={(e) => setRememberMe(e.target.checked)}
-									className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-cyan-500 focus:ring-cyan-500"
-								/>
-								<label htmlFor="rememberMe" className="text-xs text-gray-400">
-									Remember me for 30 days
-								</label>
-							</div>
-
-							{error && (
-								<div className="p-2 bg-red-900/30 border border-red-500/30 rounded">
-									<p className="text-red-400 text-xs">{error}</p>
-								</div>
-							)}
-
-							<button
-								type="button"
-								onClick={handleMagicLink}
-								disabled={loading}
-								className="cyber-button w-full py-2.5 rounded font-medium text-white text-sm"
-							>
-								{loading ? "Sending..." : "Send me a magic link"}
-							</button>
-
-							{hasPassword && (
+							<div className="flex justify-between text-xs">
 								<button
 									type="button"
-									onClick={() => setStep("password")}
-									disabled={loading}
-									className="w-full py-2.5 rounded font-medium text-sm cyber-card hover:neon-border transition-all"
+									onClick={() => {
+										setError("");
+										setStep("password");
+									}}
+									className="text-gray-500 hover:text-cyan-400 transition-colors"
 								>
-									Enter my password
+									Sign in with password
 								</button>
-							)}
-
-							<button type="button" onClick={resetToEmail} className="w-full text-xs text-gray-500 hover:text-cyan-400 transition-colors">
-								Use a different email
-							</button>
-						</div>
+								<button
+									type="button"
+									onClick={() => setUseLegacyLogin(true)}
+									className="text-gray-500 hover:text-cyan-400 transition-colors"
+								>
+									Use username instead
+								</button>
+							</div>
+						</form>
 					)}
 
 					{/* Step 3: Password Entry */}
 					{step === "password" && (
 						<form onSubmit={handlePasswordSubmit} className="space-y-4">
-							<div className="text-center mb-4">
-								<p className="text-sm text-gray-400">Signing in as</p>
-								<p className="text-cyan-400 font-medium">{email}</p>
+							<div>
+								<label htmlFor="passwordEmail" className="block text-xs font-medium mb-1 text-gray-400">
+									Email address
+								</label>
+								<input
+									id="passwordEmail"
+									type="email"
+									value={email}
+									onChange={(e) => setEmail(e.target.value)}
+									className="cyber-input w-full px-3 py-2 rounded text-white text-sm"
+									placeholder="you@example.com"
+									required
+									disabled={loading}
+								/>
 							</div>
 
 							<div>
@@ -503,7 +478,7 @@ export function LoginForm() {
 							</button>
 
 							<div className="flex justify-between text-xs">
-								<button type="button" onClick={() => setStep("options")} className="text-gray-500 hover:text-cyan-400 transition-colors">
+								<button type="button" onClick={resetToEmail} className="text-gray-500 hover:text-cyan-400 transition-colors">
 									Back
 								</button>
 								<button
@@ -530,19 +505,25 @@ export function LoginForm() {
 									/>
 								</svg>
 							</div>
-							<h2 className="text-lg font-medium text-white">Check your email</h2>
+							<h2 className="text-lg font-medium text-white">Check your inbox</h2>
 							<p className="text-sm text-gray-400">
-								We sent a login link to <span className="text-cyan-400">{email}</span>
+								We sent a sign-in link to <span className="text-cyan-400">{email}</span>
 							</p>
 							<p className="text-xs text-gray-500">The link will expire in 15 minutes</p>
 
+							{error && (
+								<div className="p-2 bg-red-900/30 border border-red-500/30 rounded">
+									<p className="text-red-400 text-xs">{error}</p>
+								</div>
+							)}
+
 							<button
 								type="button"
-								onClick={handleMagicLink}
-								disabled={loading}
-								className="w-full py-2 text-sm text-gray-400 hover:text-cyan-400 transition-colors"
+								onClick={() => handleMagicLink()}
+								disabled={loading || resendIn > 0}
+								className="w-full py-2 text-sm text-gray-400 hover:text-cyan-400 transition-colors disabled:opacity-50"
 							>
-								{loading ? "Sending..." : "Didn't get it? Resend"}
+								{loading ? "Sending..." : resendIn > 0 ? `Didn't get it? Resend in ${resendIn}s` : "Didn't get it? Resend"}
 							</button>
 
 							<button type="button" onClick={resetToEmail} className="w-full text-xs text-gray-500 hover:text-cyan-400 transition-colors">
