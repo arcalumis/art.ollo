@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { API_BASE } from "../config";
 import type { Generation, GenerationImage, QueuedGeneration } from "../types";
+import { GenerationErrorNotice } from "./billing/GenerationErrorNotice";
 import { GenerationProgressBar } from "./GenerationProgressBar";
 import { IconDownload, IconRemix, IconRotate, IconTrash, IconUpscale, IconVariations, IconZoom } from "./Icons";
 import { Lightbox } from "./Lightbox";
@@ -154,11 +155,7 @@ export function ChatMessage({
 					</div>
 				</div>
 			) : isFailed ? (
-				<div className="cyber-card rounded-lg p-4 max-w-md border-l-2 border-l-[var(--accent-alt)]">
-					<span className="text-sm text-[var(--accent-alt)]">
-						Generation failed: {generation.error || "Unknown error"}
-					</span>
-				</div>
+				<GenerationErrorNotice item={generation} className="max-w-md" />
 			) : hasMultipleImages ? (
 				// 4-up grid for variations
 				<div className="max-w-md">

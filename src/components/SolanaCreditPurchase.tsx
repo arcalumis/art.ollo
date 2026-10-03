@@ -11,11 +11,30 @@ import {
 	type SolanaTransaction,
 	useSolanaBilling,
 } from "../hooks/useSolanaBilling";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { SolanaWalletButton } from "./SolanaWalletButton";
 
 type PurchaseStep = "select" | "confirm" | "signing" | "verifying" | "success" | "error";
 
-export function SolanaCreditPurchase() {
+interface SolanaCreditPurchaseProps {
+	/** Called after a verified purchase, with the credits added. */
+	onPurchaseComplete?: (credits: number) => void;
+	/** Hide payment history (used inside the paywall sheet). */
+	compact?: boolean;
+}
+
+/** Wallet errors are noisy; keep the message human and short. */
+function friendlySolError(message: string | null): string {
+	if (!message) return "The payment didn't go through. Nothing was charged.";
+	if (/reject|denied|cancel/i.test(message)) return "The wallet request was declined. Nothing was charged.";
+	if (/insufficient|balance/i.test(message)) return "Your wallet doesn't have enough SOL for this pack and the network fee.";
+	if (/verify|confirm|timeout/i.test(message))
+		return "We couldn't confirm the payment yet. If SOL left your wallet, your credits arrive once it confirms. Contact support if they don't.";
+	return "The payment didn't go through. Try again, or pay by card instead.";
+}
+
+export function SolanaCreditPurchase({ onPurchaseComplete, compact = false }: SolanaCreditPurchaseProps = {}) {
 	const { connection } = useConnection();
 	const { publicKey, sendTransaction, connected } = useWallet();
 	const {
@@ -119,8 +138,10 @@ export function SolanaCreditPurchase() {
 			const result = await verifyPayment(payment.paymentId, signature);
 
 			if (result.success) {
-				setCreditsReceived(result.credits || selectedPackage.credits);
+				const added = result.credits || selectedPackage.credits;
+				setCreditsReceived(added);
 				setStep("success");
+				onPurchaseComplete?.(added);
 
 				// Refresh transaction history
 				const txHistory = await getTransactions();
@@ -146,6 +167,7 @@ export function SolanaCreditPurchase() {
 		getTransactions,
 		clearError,
 		error,
+		onPurchaseComplete,
 	]);
 
 	const resetPurchase = useCallback(() => {
@@ -164,202 +186,113 @@ export function SolanaCreditPurchase() {
 		});
 	};
 
-	if (!status?.enabled) {
-		return (
-			<div className="cyber-card p-4 text-center">
-				<p className="text-gray-400">Solana payments are not configured.</p>
-			</div>
-		);
+	if (status === null) {
+		return <Skeleton className="h-24 w-full rounded-2xl" />;
+	}
+
+	if (!status.enabled) {
+		return <p className="text-sm text-muted-foreground">Paying with SOL isn't available right now.</p>;
 	}
 
 	return (
-		<div className="space-y-6">
-			{/* Wallet Connection */}
-			<div className="cyber-card p-4">
-				<div className="flex items-center justify-between">
-					<div>
-						<h3 className="text-sm font-semibold text-white">Solana Wallet</h3>
-						<p className="text-xs text-gray-400">
-							{connected
-								? "Connected - ready to purchase"
-								: "Connect your wallet to buy credits"}
-						</p>
-					</div>
-					<SolanaWalletButton />
-				</div>
-				{status.network === "devnet" && (
-					<p className="mt-2 text-xs text-yellow-400">
-						Using Devnet - for testing only
+		<div className="flex flex-col gap-4">
+			<div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border p-4">
+				<div className="min-w-0">
+					<p className="text-sm font-medium text-foreground">Solana wallet</p>
+					<p className="text-xs text-muted-foreground">
+						{connected ? "Connected. Pick a pack below." : "Connect a wallet to pay with SOL."}
 					</p>
-				)}
+					{status.network === "devnet" && <p className="mt-1 text-xs text-muted-foreground">Devnet: test payments only.</p>}
+				</div>
+				<SolanaWalletButton />
 			</div>
 
-			{/* Purchase Flow */}
-			{connected && (
-				<>
-					{step === "select" && (
-						<div className="cyber-card p-4">
-							<h3 className="text-sm font-semibold text-white mb-3">
-								Credit Packages
-							</h3>
-							<div className="grid md:grid-cols-3 gap-4">
-								{packages.map((pkg) => (
-									<div
-										key={pkg.id}
-										className="p-4 rounded-lg border border-gray-700 hover:border-purple-500/50 transition-all"
-									>
-										<h4 className="text-lg font-bold text-white">{pkg.name}</h4>
-										<p className="text-2xl font-bold text-purple-400 mt-1">
-											{pkg.priceSol} SOL
-										</p>
-										<p className="text-sm text-gray-400 mt-1">
-											{pkg.credits} credits
-										</p>
-										<p className="text-xs text-gray-500 mt-1">
-											{(pkg.priceSol / pkg.credits).toFixed(4)} SOL/credit
-										</p>
-										<button
-											type="button"
-											onClick={() => handlePurchase(pkg)}
-											disabled={loading}
-											className="mt-4 w-full cyber-button text-xs py-2 bg-purple-600 hover:bg-purple-500"
-										>
-											Buy with SOL
-										</button>
-									</div>
-								))}
+			{connected && step === "select" && (
+				<ul className="flex flex-col gap-2">
+					{packages.map((pkg) => (
+						<li key={pkg.id} className="flex items-center justify-between gap-3 rounded-xl bg-muted px-4 py-3">
+							<div className="min-w-0">
+								<p className="text-sm font-medium text-foreground">{pkg.credits} credits</p>
+								<p className="text-xs text-muted-foreground">{pkg.priceSol} SOL</p>
 							</div>
-						</div>
-					)}
-
-					{step === "confirm" && selectedPackage && (
-						<div className="cyber-card p-4">
-							<h3 className="text-sm font-semibold text-white mb-3">
-								Confirm Purchase
-							</h3>
-							<div className="space-y-3">
-								<div className="flex justify-between text-sm">
-									<span className="text-gray-400">Package</span>
-									<span className="text-white">{selectedPackage.name}</span>
-								</div>
-								<div className="flex justify-between text-sm">
-									<span className="text-gray-400">Credits</span>
-									<span className="text-white">{selectedPackage.credits}</span>
-								</div>
-								<div className="flex justify-between text-sm">
-									<span className="text-gray-400">Amount</span>
-									<span className="text-purple-400 font-bold">
-										{selectedPackage.priceSol} SOL
-									</span>
-								</div>
-								<div className="pt-3 border-t border-gray-700 flex gap-3">
-									<button
-										type="button"
-										onClick={resetPurchase}
-										className="flex-1 cyber-button text-xs py-2"
-									>
-										Cancel
-									</button>
-									<button
-										type="button"
-										onClick={confirmPurchase}
-										disabled={loading}
-										className="flex-1 cyber-button text-xs py-2 bg-purple-600 hover:bg-purple-500"
-									>
-										Confirm & Sign
-									</button>
-								</div>
-							</div>
-						</div>
-					)}
-
-					{(step === "signing" || step === "verifying") && (
-						<div className="cyber-card p-4 text-center">
-							<div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-purple-500 mx-auto mb-4" />
-							<p className="text-white font-semibold">
-								{step === "signing"
-									? "Please sign the transaction in your wallet..."
-									: "Verifying transaction..."}
-							</p>
-							<p className="text-xs text-gray-400 mt-2">
-								{step === "signing"
-									? "A popup should appear from your wallet"
-									: "Waiting for blockchain confirmation"}
-							</p>
-						</div>
-					)}
-
-					{step === "success" && (
-						<div className="cyber-card p-4 text-center">
-							<div className="text-green-400 text-4xl mb-4">&#10003;</div>
-							<p className="text-white font-semibold">Purchase Successful!</p>
-							<p className="text-purple-400 text-lg mt-2">
-								+{creditsReceived} credits
-							</p>
-							<div className="mt-4">
-								<a
-									href="/"
-									className="cyber-button text-xs py-2 px-6 bg-purple-600 hover:bg-purple-500 inline-block"
-								>
-									Start Creating
-								</a>
-							</div>
-						</div>
-					)}
-
-					{step === "error" && (
-						<div className="cyber-card p-4 text-center">
-							<div className="text-red-400 text-4xl mb-4">✕</div>
-							<p className="text-white font-semibold">Purchase Failed</p>
-							<p className="text-red-400 text-sm mt-2">
-								{purchaseError || error || "Unknown error"}
-							</p>
-							<button
-								type="button"
-								onClick={resetPurchase}
-								className="mt-4 cyber-button text-xs py-2 px-6"
-							>
-								Try Again
-							</button>
-						</div>
-					)}
-				</>
+							<Button variant="outline" size="sm" onClick={() => handlePurchase(pkg)} disabled={loading}>
+								Choose
+							</Button>
+						</li>
+					))}
+				</ul>
 			)}
 
-			{/* Transaction History */}
-			{transactions.length > 0 && (
-				<div className="cyber-card p-4">
-					<h3 className="text-sm font-semibold text-white mb-3">
-						SOL Payment History
-					</h3>
-					<div className="space-y-2">
+			{connected && step === "confirm" && selectedPackage && (
+				<div className="flex flex-col gap-3 rounded-2xl border border-border p-4">
+					<dl className="grid grid-cols-2 gap-y-2 text-sm">
+						<dt className="text-muted-foreground">Credits</dt>
+						<dd className="text-right tabular-nums text-foreground">{selectedPackage.credits}</dd>
+						<dt className="text-muted-foreground">You pay</dt>
+						<dd className="text-right tabular-nums text-foreground">{selectedPackage.priceSol} SOL</dd>
+					</dl>
+					<div className="flex gap-2">
+						<Button variant="ghost" className="flex-1" onClick={resetPurchase}>
+							Back
+						</Button>
+						<Button className="flex-1" onClick={confirmPurchase} disabled={loading}>
+							Sign in wallet
+						</Button>
+					</div>
+				</div>
+			)}
+
+			{connected && (step === "signing" || step === "verifying") && (
+				<div className="rounded-2xl border border-border p-4" aria-live="polite">
+					<p className="text-sm font-medium text-foreground">
+						{step === "signing" ? "Approve the payment in your wallet." : "Confirming the payment on Solana."}
+					</p>
+					<p className="mt-1 text-xs text-muted-foreground">
+						{step === "signing" ? "Your wallet opens a window for this." : "This usually takes under a minute."}
+					</p>
+				</div>
+			)}
+
+			{connected && step === "success" && (
+				<div className="rounded-2xl border border-border p-4" aria-live="polite">
+					<p className="text-sm font-medium text-verdigris">{creditsReceived} credits added</p>
+					<p className="mt-1 text-xs text-muted-foreground">They're ready to use now.</p>
+				</div>
+			)}
+
+			{connected && step === "error" && (
+				<div className="flex flex-col gap-3 rounded-2xl border border-border p-4" role="alert">
+					<p className="text-sm text-destructive">{friendlySolError(purchaseError || error)}</p>
+					<Button variant="outline" size="sm" className="self-start" onClick={resetPurchase}>
+						Try again
+					</Button>
+				</div>
+			)}
+
+			{!compact && transactions.length > 0 && (
+				<div>
+					<p className="mb-2 text-sm font-medium text-foreground">SOL payments</p>
+					<ul className="divide-y divide-border">
 						{transactions.map((tx) => (
-							<div
-								key={tx.id}
-								className="flex items-center justify-between p-2 bg-black/30 rounded text-sm"
-							>
+							<li key={tx.id} className="flex items-center justify-between gap-3 py-2 text-sm">
 								<div>
-									<p className="text-white">+{tx.credits} credits</p>
-									<p className="text-[10px] text-gray-500">
-										{formatDate(tx.date)}
-									</p>
+									<p className="text-foreground">+{tx.credits} credits</p>
+									<p className="text-xs text-muted-foreground">{formatDate(tx.date)}</p>
 								</div>
 								<div className="text-right">
-									<span className="text-purple-400 font-medium">
-										{tx.amountSol} SOL
-									</span>
+									<p className="tabular-nums text-foreground">{tx.amountSol} SOL</p>
 									<a
 										href={`https://solscan.io/tx/${tx.signature}${status.network === "devnet" ? "?cluster=devnet" : ""}`}
 										target="_blank"
 										rel="noopener noreferrer"
-										className="block text-[10px] text-gray-500 hover:text-cyan-400"
+										className="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
 									>
 										View on Solscan
 									</a>
 								</div>
-							</div>
+							</li>
 						))}
-					</div>
+					</ul>
 				</div>
 			)}
 		</div>

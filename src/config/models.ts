@@ -21,6 +21,11 @@ export interface ModelConfig {
 		type: "per_image" | "per_megapixel";
 		baseCost: number;
 		displayCost: string;
+		/**
+		 * Fallback only. The server is the source of truth for credit costs (admin
+		 * overrides apply): use `creditCost` from /api/models or
+		 * /api/models/credit-costs, and `fallbackCreditCost()` while those load.
+		 */
 		creditCost: number;
 	};
 	bestFor: string[];
@@ -328,6 +333,14 @@ export const MODELS_CONFIG: ModelConfig[] = [
  */
 export function getModelConfig(modelId: string): ModelConfig | undefined {
 	return MODELS_CONFIG.find((m) => m.id === modelId);
+}
+
+/**
+ * Per-image credit cost to show before the server's number has loaded. Mirrors
+ * the server default (2) for unknown models.
+ */
+export function fallbackCreditCost(modelId: string): number {
+	return getModelConfig(modelId)?.pricing.creditCost ?? 2;
 }
 
 /**

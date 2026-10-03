@@ -1,16 +1,29 @@
+import type { QueuedGeneration } from "../types";
+import { GenerationErrorNotice } from "./billing/GenerationErrorNotice";
+
 interface GenerationStatusProps {
-	loading?: boolean;
-	error: string | null;
+	/**
+	 * Failed generations the current view doesn't already show (the gallery, or
+	 * another series). Each gets its own specific message with Retry/Dismiss.
+	 */
+	failures: QueuedGeneration[];
 }
 
-export function GenerationStatus({ error }: GenerationStatusProps) {
-	if (!error) return null;
+export function GenerationStatus({ failures }: GenerationStatusProps) {
+	if (failures.length === 0) return null;
 
+	// Newest first; more than two stacked notices would crowd out the prompt bar.
+	const shown = failures.slice(0, 2);
 	return (
-		<div className="w-full">
-			<div className="p-4 bg-red-900/30 rounded-lg border border-red-500/30">
-				<p className="text-red-200">{error}</p>
-			</div>
+		<div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
+			{shown.map((item) => (
+				<GenerationErrorNotice key={item.id} item={item} showPrompt />
+			))}
+			{failures.length > shown.length && (
+				<p className="text-xs text-muted-foreground">
+					{failures.length - shown.length} more didn't finish. Open their series to retry.
+				</p>
+			)}
 		</div>
 	);
 }

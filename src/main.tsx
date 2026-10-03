@@ -7,6 +7,7 @@ import { SolanaWalletProvider } from "./contexts/SolanaWalletContext";
 import { API_BASE } from "./config";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { PaywallProvider } from "./contexts/PaywallContext";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Root element not found");
@@ -27,7 +28,9 @@ createRoot(root).render(
 		<ThemeProvider>
 			<SolanaWalletProvider network={solanaNetwork} rpcUrl={solanaRpcUrl}>
 				<TooltipProvider>
-					<App />
+					<PaywallProvider>
+						<App />
+					</PaywallProvider>
 					<Toaster position="bottom-center" />
 				</TooltipProvider>
 			</SolanaWalletProvider>

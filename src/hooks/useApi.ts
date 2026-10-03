@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../config";
-import type { GenerateRequest, GenerateResponse, HistoryResponse, ModelsResponse, Thread, ThreadsResponse } from "../types";
+import type { GenerateErrorCode, GenerateRequest, GenerateResponse, HistoryResponse, ModelsResponse, Thread, ThreadsResponse } from "../types";
 
 function getAuthHeaders(token: string | null, includeContentType = true): HeadersInit {
 	const headers: HeadersInit = {};
@@ -13,14 +13,33 @@ function getAuthHeaders(token: string | null, includeContentType = true): Header
 	return headers;
 }
 
+/** Map a non-JSON or code-less failure onto a code the UI knows how to explain. */
+function fallbackErrorCode(status: number): GenerateErrorCode {
+	if (status === 401) return "UNAUTHORIZED";
+	if (status === 402) return "INSUFFICIENT_CREDITS";
+	if (status === 429) return "RATE_LIMITED";
+	if (status === 504) return "GENERATION_TIMEOUT";
+	return "GENERATION_FAILED";
+}
+
+/**
+ * POST /api/generate. Never throws: a failure comes back as a `status: "failed"`
+ * response carrying a `code`, so callers branch on the code (paywall, retry,
+ * settings) instead of showing server text.
+ */
 export function useGenerate(token: string | null) {
 	const [loading, setLoading] = useState(false);
-	const [error, setError] = useState<string | null>(null);
+	const [error, setError] = useState<GenerateErrorCode | null>(null);
 
 	const generate = useCallback(
-		async (request: GenerateRequest): Promise<GenerateResponse | null> => {
+		async (request: GenerateRequest): Promise<GenerateResponse> => {
 			setLoading(true);
 			setError(null);
+
+			const failed = (code: GenerateErrorCode, extra: Partial<GenerateResponse> = {}): GenerateResponse => {
+				setError(code);
+				return { id: "", status: "failed", code, ...extra };
+			};
 
 			try {
 				const response = await fetch(`${API_BASE}/api/generate`, {
@@ -29,17 +48,19 @@ export function useGenerate(token: string | null) {
 					body: JSON.stringify(request),
 				});
 
-				const data = await response.json();
+				const data = (await response.json().catch(() => null)) as Partial<GenerateResponse> | null;
 
-				if (!response.ok) {
-					throw new Error(data.error || "Generation failed");
+				if (!response.ok || !data || data.status === "failed") {
+					return failed(data?.code ?? fallbackErrorCode(response.status), {
+						error: data?.error,
+						creditCost: data?.creditCost,
+						availableCredits: data?.availableCredits,
+					});
 				}
 
 				return data as GenerateResponse;
 			} catch (err) {
-				const message = err instanceof Error ? err.message : "Generation failed";
-				setError(message);
-				return null;
+				return failed("NETWORK_ERROR", { error: err instanceof Error ? err.message : String(err) });
 			} finally {
 				setLoading(false);
 			}
