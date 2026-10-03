@@ -1,93 +1,48 @@
-import { useEffect } from "react";
-import { refillCadence } from "@/components/billing/plans";
-import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { useAuth } from "../contexts/AuthContext";
-import { useUserCredits, useUserSubscription, useUserUsage } from "../hooks/useUserSettings";
+import {
+	Sheet,
+	SheetContent,
+	SheetDescription,
+	SheetHeader,
+	SheetTitle,
+} from "@/components/ui/sheet";
+import { AccountSettings } from "@/pages/Settings";
+import { Link } from "react-router-dom";
 
 interface UserSettingsProps {
 	isOpen: boolean;
 	onClose: () => void;
+	/** Kept for compatibility; the plan section links to /billing itself. */
 	onOpenBilling?: () => void;
 	onRelaunchTutorial?: () => void;
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+/**
+ * Settings in a side sheet: the same sections as the /settings page (AccountSettings), so the
+ * two can never disagree. Once the app routes to /settings this can be dropped.
+ */
+export function UserSettings({ isOpen, onClose }: UserSettingsProps) {
 	return (
-		<div className="flex items-baseline justify-between gap-4 py-2.5 text-sm">
-			<span className="text-muted-foreground">{label}</span>
-			<span className="text-right text-foreground">{children}</span>
-		</div>
-	);
-}
-
-/** Account settings. The finish (Night/Plaster) lives in the ThemeSwitcher menu, not here. */
-export function UserSettings({ isOpen, onClose, onOpenBilling, onRelaunchTutorial }: UserSettingsProps) {
-	const { token, user } = useAuth();
-	const { subscription, fetchSubscription } = useUserSubscription(token);
-	const { usage, fetchUsage } = useUserUsage(token);
-	const { credits, fetchCredits } = useUserCredits(token);
-
-	useEffect(() => {
-		if (isOpen) {
-			fetchSubscription();
-			fetchUsage();
-			fetchCredits();
-		}
-	}, [isOpen, fetchSubscription, fetchUsage, fetchCredits]);
-
-	const plan = subscription?.subscription ?? null;
-	const balance = credits?.credits ?? usage?.availableCredits ?? null;
-	// Cadence comes from the plan itself: Free refills monthly, not daily.
-	const refillAmount = plan?.creditRefillAmount ?? usage?.creditRefillAmount ?? 0;
-	const refill = refillAmount > 0 ? `${refillAmount} credits ${refillCadence(plan?.topoffIntervalHours)}` : "None";
-
-	return (
-		<Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-			<DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-md">
-				<DialogHeader>
-					<DialogTitle className="font-sans text-lg font-semibold">Account</DialogTitle>
-					{user && <DialogDescription>Signed in as {user.username}</DialogDescription>}
-				</DialogHeader>
-
-				<section aria-label="Plan and credits" className="divide-y divide-border">
-					<Row label="Plan">
-						{plan ? (
-							<>
-								{plan.name}
-								{plan.price > 0 ? <span className="text-muted-foreground">, ${plan.price} a month</span> : null}
-							</>
-						) : (
-							"Free"
-						)}
-					</Row>
-					<Row label="Balance">{balance === null ? "–" : `${balance} credits`}</Row>
-					<Row label="Top-up">{refill}</Row>
-					<Row label="Images this month">{usage?.usage.imageCount ?? 0}</Row>
-				</section>
-
-				<Button
-					variant="outline"
-					className="w-full"
-					onClick={() => {
-						onClose();
-						onOpenBilling?.();
-					}}
-				>
-					Billing and credits
-				</Button>
-
-				{onRelaunchTutorial && (
-					<section aria-label="Tutorial" className="flex flex-col gap-2 border-t border-border pt-4">
-						<p className="text-sm text-muted-foreground">
-							Walk through making a character, composing a scene and using reference images.
-						</p>
-						<Button variant="ghost" className="self-start" onClick={onRelaunchTutorial}>
-							Replay the tutorial
-						</Button>
-					</section>
-				)}
-			</DialogContent>
-		</Dialog>
+		<Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>
+			<SheetContent
+				side="right"
+				className="w-full gap-0 overflow-y-auto sm:max-w-xl data-[side=right]:sm:max-w-xl"
+			>
+				<SheetHeader className="px-4 pt-4 pb-2 sm:px-6">
+					<SheetTitle className="font-display text-2xl font-normal">Settings</SheetTitle>
+					<SheetDescription>
+						<Link
+							to="/settings"
+							onClick={onClose}
+							className="text-foreground underline underline-offset-4 hover:text-verdigris"
+						>
+							Open as a page
+						</Link>
+					</SheetDescription>
+				</SheetHeader>
+				<div className="px-4 pb-8 sm:px-6 [&_section]:md:grid-cols-1 [&_section]:md:gap-4">
+					<AccountSettings onNavigateAway={onClose} />
+				</div>
+			</SheetContent>
+		</Sheet>
 	);
 }
