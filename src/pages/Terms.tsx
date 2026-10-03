@@ -172,8 +172,9 @@ export function Terms() {
 
 			<h2>12. Law and contact</h2>
 			<p>
-				These terms are governed by the laws of the United States and of the state in which{" "}
-				{LEGAL.entity} is organized, without regard to conflict-of-law rules. Questions about these
+				These terms are governed by the laws of the State of {LEGAL.governingState} and of the United
+				States, without regard to conflict-of-law rules. {LEGAL.entity} is a{" "}
+				{LEGAL.governingState} limited liability company. Questions about these
 				terms: <ContactEmail />.
 			</p>
 		</LegalPage>
