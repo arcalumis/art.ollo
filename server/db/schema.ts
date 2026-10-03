@@ -768,4 +768,185 @@ export function initializeSchema(db: Database): void {
 		CREATE INDEX IF NOT EXISTS idx_solana_sub_tx_signature ON solana_subscription_transactions(transaction_signature);
 		CREATE INDEX IF NOT EXISTS idx_solana_sub_tx_status ON solana_subscription_transactions(status);
 	`);
+
+	// ---- Phase 1B migrations ----
+	// All idempotent: they run at every boot against the live DB.
+	runPhase1BMigrations(db);
+}
+
+// ---- Phase 1B migrations (definitions) ----
+
+function hasColumn(db: Database, table: string, column: string): boolean {
+	const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+	return cols.some((c) => c.name === column);
+}
+
+/** Parse SQLite CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS", UTC) or ISO strings to epoch ms. */
+export function parseDbTime(value: string | null | undefined): number | null {
+	if (!value) return null;
+	const iso = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
+	const t = Date.parse(iso);
+	return Number.isNaN(t) ? null : t;
+}
+
+/**
+ * Keep exactly one status='active' user_subscriptions row per user. Preference order:
+ * currently in effect (ends_at NULL or future) > has stripe_subscription_id > non-Free
+ * product > most recent. Losers are marked 'superseded' (never deleted).
+ * Returns the number of rows superseded.
+ */
+export function dedupeActiveSubscriptions(db: Database): number {
+	const dupUsers = db
+		.prepare(
+			"SELECT user_id FROM user_subscriptions WHERE status = 'active' GROUP BY user_id HAVING COUNT(*) > 1",
+		)
+		.all() as Array<{ user_id: string }>;
+	if (dupUsers.length === 0) return 0;
+
+	const now = Date.now();
+	let superseded = 0;
+	const supersede = db.prepare(
+		"UPDATE user_subscriptions SET status = 'superseded', ends_at = COALESCE(ends_at, datetime('now')) WHERE id = ?",
+	);
+	db.transaction(() => {
+		for (const { user_id } of dupUsers) {
+			const rows = db
+				.prepare(`
+					SELECT us.id, us.stripe_subscription_id, us.ends_at, us.created_at, sp.name AS product_name
+					FROM user_subscriptions us
+					LEFT JOIN subscription_products sp ON sp.id = us.product_id
+					WHERE us.user_id = ? AND us.status = 'active'
+				`)
+				.all(user_id) as Array<{
+				id: string;
+				stripe_subscription_id: string | null;
+				ends_at: string | null;
+				created_at: string | null;
+				product_name: string | null;
+			}>;
+			const score = (r: (typeof rows)[number]) => {
+				const ends = parseDbTime(r.ends_at);
+				return [
+					ends === null || ends > now ? 1 : 0,
+					r.stripe_subscription_id ? 1 : 0,
+					r.product_name && r.product_name !== "Free" ? 1 : 0,
+					parseDbTime(r.created_at) ?? 0,
+				];
+			};
+			rows.sort((a, b) => {
+				const sa = score(a);
+				const sb = score(b);
+				for (let i = 0; i < sa.length; i++) {
+					if (sa[i] !== sb[i]) return sb[i] - sa[i];
+				}
+				return 0;
+			});
+			for (const loser of rows.slice(1)) {
+				supersede.run(loser.id);
+				superseded++;
+			}
+		}
+	})();
+	console.log(`[migration] Superseded ${superseded} duplicate active subscription rows for ${dupUsers.length} users`);
+	return superseded;
+}
+
+function runPhase1BMigrations(db: Database): void {
+	// The original `ALTER TABLE users ADD COLUMN wallet_address TEXT UNIQUE` always fails (SQLite
+	// can't add UNIQUE columns) and the error is swallowed, so fresh databases had no wallet
+	// column at all. The live DB has it plus a hand-made idx_users_wallet; mirror that here.
+	if (!hasColumn(db, "users", "wallet_address")) {
+		db.exec("ALTER TABLE users ADD COLUMN wallet_address TEXT");
+	}
+	db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_address)");
+
+	// Session revocation: JWTs carry a `tv` claim that must match users.token_version.
+	if (!hasColumn(db, "users", "token_version")) {
+		db.exec("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0");
+	}
+
+	// Normalize emails to trim+lowercase, but only if that cannot create duplicates.
+	const emailCollisions = db
+		.prepare(
+			"SELECT lower(trim(email)) AS e, COUNT(*) AS n FROM users WHERE email IS NOT NULL AND trim(email) <> '' GROUP BY e HAVING n > 1",
+		)
+		.all() as Array<{ e: string; n: number }>;
+	if (emailCollisions.length > 0) {
+		console.warn(
+			`[migration] Skipping email lowercase + unique index: ${emailCollisions.length} case-insensitive email collisions need manual review`,
+		);
+	} else {
+		db.exec("UPDATE users SET email = NULL WHERE email IS NOT NULL AND trim(email) = ''");
+		db.exec("UPDATE users SET email = lower(trim(email)) WHERE email IS NOT NULL AND email <> lower(trim(email))");
+		db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email) WHERE email IS NOT NULL");
+	}
+
+	// Email tokens are stored as SHA-256 hashes. Legacy plaintext rows (token_hash NULL) are invalidated.
+	if (!hasColumn(db, "email_tokens", "token_hash")) {
+		db.exec("ALTER TABLE email_tokens ADD COLUMN token_hash TEXT");
+	}
+	db.exec("CREATE INDEX IF NOT EXISTS idx_email_tokens_token_hash ON email_tokens(token_hash)");
+	db.exec("UPDATE email_tokens SET used_at = datetime('now') WHERE token_hash IS NULL AND used_at IS NULL");
+
+	// Sign-up links for emails that don't have an account yet (no user_id to reference).
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS signup_tokens (
+			id TEXT PRIMARY KEY,
+			email TEXT NOT NULL,
+			token_hash TEXT UNIQUE NOT NULL,
+			remember_me INTEGER DEFAULT 0,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME DEFAULT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_signup_tokens_expires ON signup_tokens(expires_at);
+	`);
+
+	// Outbound auth email log for flood protection (per-recipient + global caps).
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS email_send_log (
+			id TEXT PRIMARY KEY,
+			recipient TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			ip TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_email_send_log_recipient ON email_send_log(recipient, created_at);
+		CREATE INDEX IF NOT EXISTS idx_email_send_log_created ON email_send_log(created_at);
+	`);
+
+	// Track whether a subscription row's welcome bonus was granted, so a Stripe subscription that
+	// starts 'incomplete' gets its bonus exactly once when it becomes active. Existing rows were
+	// already paid out under the old logic, so they are backfilled as granted.
+	if (!hasColumn(db, "user_subscriptions", "bonus_granted")) {
+		db.exec("ALTER TABLE user_subscriptions ADD COLUMN bonus_granted INTEGER NOT NULL DEFAULT 0");
+		db.exec("UPDATE user_subscriptions SET bonus_granted = 1");
+	}
+
+	// One active subscription per user.
+	db.exec("UPDATE user_subscriptions SET status = 'active' WHERE status IS NULL");
+	dedupeActiveSubscriptions(db);
+	db.exec(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_user_subscriptions_one_active ON user_subscriptions(user_id) WHERE status = 'active'",
+	);
+	db.exec(
+		"CREATE INDEX IF NOT EXISTS idx_user_subscriptions_stripe_id ON user_subscriptions(stripe_subscription_id)",
+	);
+
+	// A Solana signature can be claimed once across credit purchases AND subscriptions.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS solana_claimed_signatures (
+			signature TEXT PRIMARY KEY,
+			kind TEXT NOT NULL,
+			payment_id TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		INSERT OR IGNORE INTO solana_claimed_signatures (signature, kind, payment_id, user_id)
+			SELECT transaction_signature, 'credits', id, user_id FROM solana_transactions
+			WHERE status = 'completed' AND transaction_signature NOT LIKE 'pending_%';
+		INSERT OR IGNORE INTO solana_claimed_signatures (signature, kind, payment_id, user_id)
+			SELECT transaction_signature, 'subscription', id, user_id FROM solana_subscription_transactions
+			WHERE status = 'completed' AND transaction_signature NOT LIKE 'pending_%';
+	`);
 }
