@@ -1119,4 +1119,14 @@ function runPhase1BMigrations(db: Database): void {
 	if (!hasColumn(db, "users", "deleted_at")) {
 		db.exec("ALTER TABLE users ADD COLUMN deleted_at DATETIME DEFAULT NULL");
 	}
+
+	// ---- Review fixes migrations ----
+	// Solana Pay reference key per payment request: the verifier requires it in the transaction's
+	// account keys, binding the on-chain transfer to exactly one pending payment.
+	for (const table of ["solana_transactions", "solana_subscription_transactions"]) {
+		if (!hasColumn(db, table, "reference")) {
+			db.exec(`ALTER TABLE ${table} ADD COLUMN reference TEXT DEFAULT NULL`);
+		}
+		db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_reference ON ${table}(reference) WHERE reference IS NOT NULL`);
+	}
 }

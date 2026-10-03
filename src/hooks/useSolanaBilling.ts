@@ -2,6 +2,8 @@ import { useCallback, useState } from "react";
 import { API_BASE } from "../config";
 import { useAuth } from "../contexts/AuthContext";
 
+export { buildPaymentTransaction } from "../lib/solanaPay";
+
 export interface SolanaCreditPackage {
 	id: string;
 	name: string;
@@ -28,6 +30,8 @@ export interface SolanaStatus {
 export interface InitiatePaymentResponse {
 	paymentId: string;
 	recipientWallet: string;
+	/** Solana Pay reference key; must ride on the transfer or the server can't verify it. */
+	reference: string;
 	amountLamports: number;
 	amountSol: number;
 	credits: number;
@@ -51,6 +55,8 @@ export interface SolanaSubscriptionProduct {
 export interface InitiateSubscriptionResponse {
 	paymentId: string;
 	recipientWallet: string;
+	/** Solana Pay reference key; must ride on the transfer or the server can't verify it. */
+	reference: string;
 	amountLamports: number;
 	amountSol: number;
 	productName: string;

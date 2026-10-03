@@ -1,14 +1,10 @@
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import {
-	PublicKey,
-	SystemProgram,
-	Transaction,
-} from "@solana/web3.js";
 import { useCallback, useEffect, useState } from "react";
 import {
 	type SolanaCreditPackage,
 	type SolanaStatus,
 	type SolanaTransaction,
+	buildPaymentTransaction,
 	useSolanaBilling,
 } from "../hooks/useSolanaBilling";
 import { Button } from "@/components/ui/button";
@@ -111,14 +107,7 @@ export function SolanaCreditPurchase({ onPurchaseComplete, compact = false }: So
 			}
 
 			// 2. Build and send transaction
-			const treasuryPubkey = new PublicKey(payment.recipientWallet);
-			const transaction = new Transaction().add(
-				SystemProgram.transfer({
-					fromPubkey: publicKey,
-					toPubkey: treasuryPubkey,
-					lamports: payment.amountLamports,
-				}),
-			);
+			const transaction = buildPaymentTransaction(publicKey, payment);
 
 			const { blockhash } = await connection.getLatestBlockhash("finalized");
 			transaction.recentBlockhash = blockhash;
