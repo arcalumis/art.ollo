@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
+import { requireUserId } from "../services/request-user";
+import { deleteGenerationFiles } from "../services/storage";
 
 interface ProjectMetadata {
 	aspectRatio?: string;
@@ -64,7 +64,7 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 		{ preHandler: authMiddleware },
 		async (request) => {
 			const db = getDb();
-			const userId = request.user?.userId;
+			const userId = requireUserId(request);
 
 			const rows = db.prepare(`
 				SELECT
@@ -106,7 +106,7 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 		{ preHandler: authMiddleware },
 		async (request) => {
 			const db = getDb();
-			const userId = request.user?.userId;
+			const userId = requireUserId(request);
 			const { title, projectMetadata } = request.body;
 
 			const threadId = crypto.randomUUID();
@@ -135,7 +135,7 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 		{ preHandler: authMiddleware },
 		async (request, reply) => {
 			const db = getDb();
-			const userId = request.user?.userId;
+			const userId = requireUserId(request);
 			const { id } = request.params;
 
 			const thread = db.prepare(`
@@ -207,7 +207,7 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 		{ preHandler: authMiddleware },
 		async (request, reply) => {
 			const db = getDb();
-			const userId = request.user?.userId;
+			const userId = requireUserId(request);
 			const { id } = request.params;
 			const { title, projectMetadata } = request.body;
 
@@ -254,7 +254,7 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 		{ preHandler: authMiddleware },
 		async (request, reply) => {
 			const db = getDb();
-			const userId = request.user?.userId;
+			const userId = requireUserId(request);
 			const { id } = request.params;
 			const { deletePhotos } = request.query;
 
@@ -270,23 +270,13 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 			if (deletePhotos === "true") {
 				// Get all image paths from generations in this thread
 				const generations = db.prepare(`
-					SELECT id, image_path FROM generations
-					WHERE thread_id = ? AND purged_at IS NULL
-				`).all(id) as { id: string; image_path: string }[];
+					SELECT id, image_path, parameters FROM generations
+					WHERE thread_id = ? AND user_id = ? AND purged_at IS NULL
+				`).all(id, userId) as { id: string; image_path: string | null; parameters: string | null }[];
 
-				// Delete image files from disk
-				const dataDir = process.env.DATA_DIR || "./data";
+				// Delete image files from disk (primary + grid images)
 				for (const gen of generations) {
-					if (gen.image_path) {
-						const imagePath = path.join(dataDir, "images", gen.image_path);
-						try {
-							if (fs.existsSync(imagePath)) {
-								fs.unlinkSync(imagePath);
-							}
-						} catch (err) {
-							console.error(`Failed to delete image ${imagePath}:`, err);
-						}
-					}
+					deleteGenerationFiles(gen.image_path, gen.parameters);
 				}
 
 				// Purge all generations (mark as permanently deleted but keep record for cost tracking)
@@ -320,7 +310,7 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 		{ preHandler: authMiddleware },
 		async (request, reply) => {
 			const db = getDb();
-			const userId = request.user?.userId;
+			const userId = requireUserId(request);
 			const { id } = request.params;
 
 			const thread = db.prepare(
@@ -346,7 +336,7 @@ export async function threadRoutes(fastify: FastifyInstance): Promise<void> {
 		{ preHandler: authMiddleware },
 		async (request, reply) => {
 			const db = getDb();
-			const userId = request.user?.userId;
+			const userId = requireUserId(request);
 			const { id } = request.params;
 
 			const thread = db.prepare(

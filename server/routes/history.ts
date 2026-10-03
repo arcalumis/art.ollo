@@ -1,9 +1,9 @@
-import fs from "node:fs";
-import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import type { Generation } from "../../src/types";
 import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
+import { requireUserId } from "../services/request-user";
+import { deleteGenerationFiles } from "../services/storage";
 
 interface HistoryQuery {
 	page?: string;
@@ -68,7 +68,7 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 
 			const countResult = db
 				.prepare(`SELECT COUNT(*) as count FROM generations WHERE user_id = ? AND ${condition}`)
-				.get(request.user?.userId) as { count: number };
+				.get(requireUserId(request)) as { count: number };
 			const total = countResult.count;
 
 			const rows = db
@@ -80,7 +80,7 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 				LIMIT ? OFFSET ?
 			`,
 				)
-				.all(request.user?.userId, limit, offset) as DbRow[];
+				.all(requireUserId(request), limit, offset) as DbRow[];
 
 			const generations: (Generation & {
 				cost?: number;
@@ -113,7 +113,7 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 			// Calculate total cost (includes ALL generations including purged for accurate tracking)
 			const totalCostResult = db
 				.prepare("SELECT SUM(cost) as total FROM generations WHERE user_id = ?")
-				.get(request.user?.userId) as { total: number | null };
+				.get(requireUserId(request)) as { total: number | null };
 
 			return {
 				generations,
@@ -137,7 +137,7 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 			// Verify ownership
 			const row = db
 				.prepare("SELECT id FROM generations WHERE id = ? AND user_id = ?")
-				.get(id, request.user?.userId) as { id: string } | undefined;
+				.get(id, requireUserId(request)) as { id: string } | undefined;
 
 			if (!row) {
 				return reply.status(404).send({ error: "Generation not found" });
@@ -167,7 +167,7 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 			// Verify ownership
 			const row = db
 				.prepare("SELECT id FROM generations WHERE id = ? AND user_id = ?")
-				.get(id, request.user?.userId) as { id: string } | undefined;
+				.get(id, requireUserId(request)) as { id: string } | undefined;
 
 			if (!row) {
 				return reply.status(404).send({ error: "Generation not found" });
@@ -195,7 +195,7 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 			// Verify ownership
 			const row = db
 				.prepare("SELECT id FROM uploads WHERE id = ? AND user_id = ?")
-				.get(id, request.user?.userId) as { id: string } | undefined;
+				.get(id, requireUserId(request)) as { id: string } | undefined;
 
 			if (!row) {
 				return reply.status(404).send({ error: "Upload not found" });
@@ -222,18 +222,15 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 			const db = getDb();
 			// Only allow deleting own images
 			const row = db
-				.prepare("SELECT image_path FROM generations WHERE id = ? AND user_id = ?")
-				.get(id, request.user?.userId) as { image_path: string } | undefined;
+				.prepare("SELECT image_path, parameters FROM generations WHERE id = ? AND user_id = ?")
+				.get(id, requireUserId(request)) as { image_path: string | null; parameters: string | null } | undefined;
 
 			if (!row) {
 				return reply.status(404).send({ error: "Generation not found" });
 			}
 
-			// Delete the image file
-			const imagePath = path.join(process.cwd(), "generated-images", row.image_path);
-			if (fs.existsSync(imagePath)) {
-				fs.unlinkSync(imagePath);
-			}
+			// Delete the image files (primary + any grid images)
+			deleteGenerationFiles(row.image_path, row.parameters);
 
 			// Mark as purged (keeps record for cost tracking)
 			db.prepare("UPDATE generations SET purged_at = datetime('now') WHERE id = ?").run(id);

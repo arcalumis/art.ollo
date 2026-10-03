@@ -4,8 +4,8 @@ import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
-
-const UPLOADS_DIR = path.join(process.cwd(), "uploads");
+import { requireUserId } from "../services/request-user";
+import { getUploadsDir, unlinkInside } from "../services/storage";
 
 // Allowed image extensions and MIME types
 const ALLOWED_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"]);
@@ -61,8 +61,8 @@ interface ArchiveBody {
 
 export async function uploadsRoutes(fastify: FastifyInstance): Promise<void> {
 	// Ensure uploads directory exists
-	if (!fs.existsSync(UPLOADS_DIR)) {
-		fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+	if (!fs.existsSync(getUploadsDir())) {
+		fs.mkdirSync(getUploadsDir(), { recursive: true });
 	}
 
 	// Upload image (with strict validation)
@@ -100,14 +100,14 @@ export async function uploadsRoutes(fastify: FastifyInstance): Promise<void> {
 		const id = crypto.randomUUID();
 		// Use validated extension (normalized to lowercase)
 		const filename = `${id}${ext}`;
-		const filePath = path.join(UPLOADS_DIR, filename);
+		const filePath = path.join(getUploadsDir(), filename);
 
 		fs.writeFileSync(filePath, buffer);
 
 		const db = getDb();
 		db.prepare(
 			"INSERT INTO uploads (id, user_id, filename, original_name) VALUES (?, ?, ?, ?)",
-		).run(id, request.user?.userId, filename, data.filename);
+		).run(id, requireUserId(request), filename, data.filename);
 
 		return {
 			id,
@@ -139,7 +139,7 @@ export async function uploadsRoutes(fastify: FastifyInstance): Promise<void> {
 				.prepare(
 					`SELECT * FROM uploads WHERE user_id = ? AND ${condition} ORDER BY created_at DESC`,
 				)
-				.all(request.user?.userId) as UploadRow[];
+				.all(requireUserId(request)) as UploadRow[];
 
 			return {
 				uploads: rows.map((row) => ({
@@ -167,7 +167,7 @@ export async function uploadsRoutes(fastify: FastifyInstance): Promise<void> {
 			const db = getDb();
 			const row = db
 				.prepare("SELECT id FROM uploads WHERE id = ? AND user_id = ?")
-				.get(id, request.user?.userId) as { id: string } | undefined;
+				.get(id, requireUserId(request)) as { id: string } | undefined;
 
 			if (!row) {
 				return reply.status(404).send({ error: "Upload not found" });
@@ -193,17 +193,14 @@ export async function uploadsRoutes(fastify: FastifyInstance): Promise<void> {
 
 			const row = db
 				.prepare("SELECT * FROM uploads WHERE id = ? AND user_id = ?")
-				.get(id, request.user?.userId) as UploadRow | undefined;
+				.get(id, requireUserId(request)) as UploadRow | undefined;
 
 			if (!row) {
 				return reply.status(404).send({ error: "Upload not found" });
 			}
 
 			// Delete file
-			const filePath = path.join(UPLOADS_DIR, row.filename);
-			if (fs.existsSync(filePath)) {
-				fs.unlinkSync(filePath);
-			}
+			unlinkInside(getUploadsDir(), row.filename);
 
 			// Delete record
 			db.prepare("DELETE FROM uploads WHERE id = ?").run(id);
