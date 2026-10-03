@@ -291,20 +291,23 @@ describe("solana subscriptions", () => {
 describe("open endpoints", () => {
 	test("rpc proxy refuses methods outside the allowlist without calling upstream", async () => {
 		const app = await getApp();
+		const user = createUser();
 		const calls = fetchSpy.mock.calls.length;
-		const res = await app.inject({
-			method: "POST",
-			url: "/api/solana/rpc",
-			headers: { "x-forwarded-for": "203.0.113.90" },
-			payload: { jsonrpc: "2.0", id: 1, method: "getProgramAccounts", params: [] },
-		});
-		expect(res.statusCode).toBe(403);
+		for (const method of ["getProgramAccounts", "getBalance", "getAccountInfo", "simulateTransaction"]) {
+			const res = await app.inject({
+				method: "POST",
+				url: "/api/solana/rpc",
+				headers: { ...authHeader(user), "x-forwarded-for": "203.0.113.90" },
+				payload: { jsonrpc: "2.0", id: 1, method, params: [] },
+			});
+			expect(res.statusCode).toBe(403);
+		}
 		const batch = await app.inject({
 			method: "POST",
 			url: "/api/solana/rpc",
-			headers: { "x-forwarded-for": "203.0.113.90" },
+			headers: { ...authHeader(user), "x-forwarded-for": "203.0.113.90" },
 			payload: [
-				{ jsonrpc: "2.0", id: 1, method: "getBalance", params: [] },
+				{ jsonrpc: "2.0", id: 1, method: "getLatestBlockhash", params: [] },
 				{ jsonrpc: "2.0", id: 2, method: "requestAirdrop", params: [] },
 			],
 		});
@@ -312,18 +315,40 @@ describe("open endpoints", () => {
 		expect(fetchSpy.mock.calls.length).toBe(calls);
 	});
 
+	test("rpc proxy requires a session and caps batches at 3", async () => {
+		const app = await getApp();
+		const calls = fetchSpy.mock.calls.length;
+		const anon = await app.inject({
+			method: "POST",
+			url: "/api/solana/rpc",
+			headers: { "x-forwarded-for": "203.0.113.92" },
+			payload: { jsonrpc: "2.0", id: 1, method: "getLatestBlockhash", params: [] },
+		});
+		expect(anon.statusCode).toBe(401);
+		const big = await app.inject({
+			method: "POST",
+			url: "/api/solana/rpc",
+			headers: { ...authHeader(createUser()), "x-forwarded-for": "203.0.113.92" },
+			payload: Array.from({ length: 4 }, (_, i) => ({ jsonrpc: "2.0", id: i, method: "getLatestBlockhash", params: [] })),
+		});
+		expect(big.statusCode).toBe(400);
+		expect(fetchSpy.mock.calls.length).toBe(calls);
+	});
+
 	test("rpc proxy forwards allowlisted methods", async () => {
 		const app = await getApp();
 		fetchSpy.mockImplementationOnce((async () =>
-			new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { value: 5 } }), { status: 200 })) as unknown as typeof fetch);
+			new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { value: { blockhash: "abc" } } }), {
+				status: 200,
+			})) as unknown as typeof fetch);
 		const res = await app.inject({
 			method: "POST",
 			url: "/api/solana/rpc",
-			headers: { "x-forwarded-for": "203.0.113.91" },
-			payload: { jsonrpc: "2.0", id: 1, method: "getBalance", params: ["x"] },
+			headers: { ...authHeader(createUser()), "x-forwarded-for": "203.0.113.91" },
+			payload: { jsonrpc: "2.0", id: 1, method: "getLatestBlockhash", params: [] },
 		});
 		expect(res.statusCode).toBe(200);
-		expect(res.json().result.value).toBe(5);
+		expect(res.json().result.value.blockhash).toBe("abc");
 	});
 
 	test("solana cleanup is admin-only", async () => {
