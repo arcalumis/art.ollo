@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import type { Plan } from "../src/components/billing/api";
-import { purchasablePlans } from "../src/components/billing/api";
 import { describeGenerationError, opensPaywall } from "../src/components/billing/generationErrors";
-import { approxImages, cheapestPlanWithModel, nextPlanUp, refillCadence } from "../src/components/billing/plans";
+import {
+	approxImages,
+	cheapestPlanWithModel,
+	nextPlanUp,
+	type Plan,
+	purchasablePlans,
+	refillCadence,
+} from "../src/components/billing/plans";
 import type { GenerateErrorCode } from "../src/types";
 
 function plan(name: string, price: number, extra: Partial<Plan> = {}): Plan {

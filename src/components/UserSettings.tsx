@@ -46,7 +46,7 @@ export function UserSettings({ isOpen, onClose, onOpenBilling, onRelaunchTutoria
 		<Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
 			<DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-md">
 				<DialogHeader>
-					<DialogTitle>Account</DialogTitle>
+					<DialogTitle className="font-sans text-lg font-semibold">Account</DialogTitle>
 					{user && <DialogDescription>Signed in as {user.username}</DialogDescription>}
 				</DialogHeader>
 

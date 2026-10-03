@@ -126,7 +126,7 @@ export function PaywallSheet() {
 								<ArrowLeftIcon />
 							</Button>
 							<div>
-								<SheetTitle className="text-lg">Pay with SOL</SheetTitle>
+								<SheetTitle className="font-sans text-lg font-semibold">Pay with SOL</SheetTitle>
 								<SheetDescription>{detail}</SheetDescription>
 							</div>
 						</SheetHeader>
@@ -143,7 +143,7 @@ export function PaywallSheet() {
 				) : (
 					<>
 						<SheetHeader className="pr-12">
-							<SheetTitle className="text-lg">{title}</SheetTitle>
+							<SheetTitle className="font-sans text-lg font-semibold">{title}</SheetTitle>
 							<SheetDescription>{detail}</SheetDescription>
 						</SheetHeader>
 

@@ -102,8 +102,10 @@ export function useModels() {
 		setLoading(true);
 		try {
 			const response = await fetch(`${API_BASE}/api/models`);
+			// A 429/500 body has no `models`; keep the last good list instead of crashing on undefined.
+			if (!response.ok) return;
 			const data = (await response.json()) as ModelsResponse;
-			setModels(data.models);
+			if (Array.isArray(data.models)) setModels(data.models);
 		} catch (err) {
 			console.error("Failed to fetch models:", err);
 		} finally {

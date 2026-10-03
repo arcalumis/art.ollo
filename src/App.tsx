@@ -775,7 +775,14 @@ function MainApp() {
 							numOutputs={outputsPerGenerate}
 							balance={balance}
 							usesOwnKey={!!apiKeyInfo?.hasKey}
-							onNeedCredits={(needed) => paywall.open({ reason: "insufficient_credits", needed, balance })}
+							onNeedCredits={(needed) =>
+								// The low-balance hint opens it before the balance is actually short.
+								paywall.open(
+									balance !== null && balance >= needed
+										? { reason: "low_balance", balance }
+										: { reason: "insufficient_credits", needed, balance },
+								)
+							}
 							onLockedModel={(modelId) => paywall.open({ reason: "model_not_allowed", modelId })}
 						/>
 					</>

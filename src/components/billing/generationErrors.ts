@@ -1,4 +1,4 @@
-import type { GenerateErrorCode } from "@/types";
+import type { GenerateErrorCode } from "../../types";
 
 export type ErrorAction = "retry" | "topUp" | "upgrade" | "settings";
 

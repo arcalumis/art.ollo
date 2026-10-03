@@ -348,7 +348,7 @@ export function Billing({ embedded = false, onBack }: BillingProps) {
 									))}
 								</div>
 								{solanaEnabled && (
-									<div className="rounded-2xl border border-border p-4">
+									<div className="rounded-2xl border border-border p-4 empty:hidden">
 										<SolanaSubscriptionPurchase onPurchaseComplete={onSolPurchase} />
 									</div>
 								)}

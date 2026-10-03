@@ -1,5 +1,48 @@
-import { getModelConfig } from "@/config/models";
-import type { Plan } from "./api";
+// Pure helpers (no DOM): also imported by the bun tests.
+import { getModelConfig } from "../../config/models";
+
+/** A subscription plan as /api/billing/products returns it. */
+export interface Plan {
+	id: string;
+	name: string;
+	description: string | null;
+	creditRefillAmount: number;
+	topoffIntervalHours: number;
+	bonusCredits: number;
+	price: number;
+	priceSol: number | null;
+	availableForUsd: boolean;
+	availableForSol: boolean;
+	stripePriceId: string | null;
+	allowedModels: string[] | null;
+}
+
+export interface FreePlan {
+	id: string;
+	name: string;
+	creditRefillAmount: number;
+	topoffIntervalHours: number;
+	allowedModels: string[] | null;
+}
+
+export interface CreditPack {
+	id: string;
+	name: string;
+	credits: number;
+	priceCents: number;
+	stripePriceId: string;
+}
+
+export interface CreditCosts {
+	defaultModel: string;
+	costs: Record<string, number>;
+}
+
+/** Paid plans a user can buy with a card, cheapest first. $0 test products are dropped. */
+export function purchasablePlans(plans: Plan[]): Plan[] {
+	return plans.filter((p) => p.availableForUsd && p.stripePriceId && p.price > 0).sort((a, b) => a.price - b.price);
+}
+
 
 /** The plan we point people at when there's no better signal. */
 export const RECOMMENDED_PLAN_NAME = "Creator";
