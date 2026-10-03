@@ -51,8 +51,11 @@ function makeClient(apiKey?: string) {
 				const b = fake.behavior;
 				await sleep("delayMs" in b && b.delayMs ? b.delayMs : 10);
 				const id = randomUUID();
-				const requested = typeof input.num_outputs === "number" ? input.num_outputs : 1;
-				predictions.set(id, { outputs: b.kind === "succeed" && b.outputs !== undefined ? b.outputs : requested });
+				const count = input.num_outputs ?? input.number_of_images ?? input.num_images;
+				const requested = typeof count === "number" ? count : 1;
+				predictions.set(id, {
+					outputs: b.kind === "succeed" && b.outputs !== undefined ? b.outputs : requested,
+				});
 				return { id, status: "starting" };
 			},
 			async get(id: string) {
@@ -64,7 +67,10 @@ function makeClient(apiKey?: string) {
 				return {
 					id,
 					status: "succeeded",
-					output: Array.from({ length: n }, (_, i) => `https://replicate.delivery/fake/${id}/out-${i}.png`),
+					output: Array.from(
+						{ length: n },
+						(_, i) => `https://replicate.delivery/fake/${id}/out-${i}.png`,
+					),
 					metrics: { predict_time: 1.5 },
 				};
 			},
@@ -91,8 +97,13 @@ export function installFakes(): { imagesDir: string; uploadsDir: string } {
 		fs.mkdirSync(process.env.OLLO_IMAGES_DIR, { recursive: true });
 		fs.mkdirSync(process.env.OLLO_UPLOADS_DIR, { recursive: true });
 		__testing.setClientFactory((apiKey) => makeClient(apiKey) as unknown as Replicate);
-		__testing.setFetch((async () =>
-			new Response(PNG_BYTES, { status: 200, headers: { "content-type": "image/png" } })) as unknown as typeof fetch);
+		__testing.setFetch(
+			(async () =>
+				new Response(PNG_BYTES, {
+					status: 200,
+					headers: { "content-type": "image/png" },
+				})) as unknown as typeof fetch,
+		);
 		__testing.setTiming({ pollIntervalMs: 5, timeoutMs: 2_000 });
 		installed = true;
 	}
@@ -117,7 +128,9 @@ export function seedUpload(userId: string): string {
 /** Give a user the Free subscription (optionally with a custom last top-off time). */
 export function assignFree(userId: string, lastTopoffSql: string | null = null): string {
 	const db = getDb();
-	const free = db.prepare("SELECT id FROM subscription_products WHERE name = 'Free'").get() as { id: string };
+	const free = db.prepare("SELECT id FROM subscription_products WHERE name = 'Free'").get() as {
+		id: string;
+	};
 	const subId = randomUUID();
 	db.prepare(
 		`INSERT INTO user_subscriptions (id, user_id, product_id, starts_at, last_credit_topoff_at)
@@ -128,7 +141,9 @@ export function assignFree(userId: string, lastTopoffSql: string | null = null):
 
 export function addLedger(userId: string, amount: number, creditType: string): void {
 	getDb()
-		.prepare("INSERT INTO user_credits (id, user_id, credit_type, amount, reason) VALUES (?, ?, ?, ?, ?)")
+		.prepare(
+			"INSERT INTO user_credits (id, user_id, credit_type, amount, reason) VALUES (?, ?, ?, ?, ?)",
+		)
 		.run(randomUUID(), userId, creditType, amount, "test");
 }
 

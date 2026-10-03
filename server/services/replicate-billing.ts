@@ -145,22 +145,25 @@ export async function reconcileGenerationCost(generationId: string): Promise<boo
 		return false;
 	}
 
-	// Fetch prediction details from Replicate
+	// Official models are billed per output / per megapixel, not per second: the
+	// catalog formula IS the billed price (it is the cost of record), so there is
+	// nothing to fetch. predict_time x hardware would understate it badly.
+	if (isPerOutputPriced(generation.model) && generation.cost !== null) {
+		const row = db.prepare("SELECT predict_time FROM generations WHERE id = ?").get(generationId) as
+			| { predict_time: number | null }
+			| undefined;
+		updatePlatformCostActual(generationId, generation.cost, row?.predict_time ?? 0);
+		return true;
+	}
+
+	// Only models billed by compute time are reconciled against Replicate.
 	const prediction = await getPredictionDetails(generation.replicate_id);
 
 	if (!prediction || !prediction.metrics?.predict_time) {
 		return false;
 	}
 
-	// Official models are billed per output/megapixel, not per second: their
-	// estimate is the billed price, and a predict_time-based figure would
-	// understate it by an order of magnitude.
-	const actualCost =
-		isPerOutputPriced(generation.model) && generation.cost !== null
-			? generation.cost
-			: estimateCost(generation.model, prediction.metrics.predict_time);
-
-	// Update the cost
+	const actualCost = estimateCost(generation.model, prediction.metrics.predict_time);
 	updatePlatformCostActual(generationId, actualCost, prediction.metrics.predict_time);
 
 	return true;
@@ -210,8 +213,8 @@ export async function reconcileAllCosts(limit = 100): Promise<{
 			errors++;
 		}
 
-		// Small delay to avoid rate limiting
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		// Small delay to avoid rate limiting (only when we actually called Replicate)
+		if (!isPerOutputPriced(gen.model)) await new Promise((resolve) => setTimeout(resolve, 100));
 	}
 
 	console.log(`Cost reconciliation: ${reconciled}/${processed} reconciled, ${errors} errors`);

@@ -811,6 +811,88 @@ export function initializeSchema(db: Database): void {
 	// ---- Phase 1B migrations ----
 	// All idempotent: they run at every boot against the live DB.
 	runPhase1BMigrations(db);
+
+	// ---- Phase 3.5 migrations ----
+	// New model lineup: move every restricted product's allowed_models onto it (once).
+	runOnce("3.5_allowed_models_lineup", () => migrateAllowedModelsToLineup(db));
+}
+
+// ---- Phase 3.5 migrations (definitions) ----
+
+/** Dropped model id -> the model that replaces it. */
+export const PHASE35_MODEL_REPLACEMENTS: Record<string, string> = {
+	"google/nano-banana-pro": "google/nano-banana-2",
+	"black-forest-labs/flux-schnell": "black-forest-labs/flux-2-klein-4b",
+	"black-forest-labs/flux-dev": "black-forest-labs/flux-2-dev",
+	"black-forest-labs/flux-1.1-pro": "black-forest-labs/flux-2-pro",
+	"black-forest-labs/flux-1.1-pro-ultra": "black-forest-labs/flux-2-pro",
+	"black-forest-labs/flux-kontext-pro": "prunaai/p-image-edit",
+	"black-forest-labs/flux-redux-schnell": "black-forest-labs/flux-2-dev",
+	"black-forest-labs/flux-redux-dev": "black-forest-labs/flux-2-dev",
+};
+
+/** Every model the old picker offered (a list with all of them meant "everything"). */
+const PHASE35_OLD_LINEUP = [...Object.keys(PHASE35_MODEL_REPLACEMENTS), "black-forest-labs/flux-2-dev", "black-forest-labs/flux-2-pro"];
+
+/** The new picker lineup. Tools (upscale, remove background) are on every plan and never listed. */
+export const PHASE35_LINEUP = [
+	"black-forest-labs/flux-2-klein-4b",
+	"black-forest-labs/flux-2-dev",
+	"google/nano-banana-2-lite",
+	"xai/grok-imagine-image-2",
+	"openai/gpt-image-2.5-flare",
+	"bytedance/seedream-5-pro",
+	"google/nano-banana-2",
+	"black-forest-labs/flux-2-pro",
+	"ideogram-ai/ideogram-4-5",
+	"recraft-ai/recraft-v4.1",
+	"recraft-ai/recraft-v4.1-svg",
+	"openai/gpt-image-2.5-sunburst",
+	"prunaai/p-image-edit",
+];
+const PHASE35_FAST_DRAFTS = ["black-forest-labs/flux-2-klein-4b", "black-forest-labs/flux-2-dev", "google/nano-banana-2-lite"];
+
+/**
+ * New allowed_models for one product (null = all models). Pure, for tests.
+ * - Dropped ids map to their replacements.
+ * - Free: + the fast-draft models.
+ * - Starter: every model, but no premium Max tiers (GPT Image xhigh, Nano Banana 2 4K,
+ *   Recraft Pro), which need an explicit "<model>:max" entry.
+ * - Creator / Pro, or any list that held every old model: all models (null).
+ * - Anything else: just the id mapping.
+ */
+export function phase35AllowedModels(name: string, allowed: string[]): string[] | null {
+	const mapped = allowed.map((id) => PHASE35_MODEL_REPLACEMENTS[id] ?? id);
+	const unique = (ids: string[]) => Array.from(new Set(ids));
+	if (name === "Creator" || name === "Pro") return null;
+	if (name === "Free") return unique([...mapped, ...PHASE35_FAST_DRAFTS]);
+	if (name === "Starter") return unique([...mapped, ...PHASE35_LINEUP]);
+	if (PHASE35_OLD_LINEUP.every((id) => allowed.includes(id))) return null;
+	return unique(mapped);
+}
+
+/** Rewrite every product whose allowed_models is a list. NULL (all models) is never touched. */
+export function migrateAllowedModelsToLineup(db: Database): number {
+	const rows = db
+		.prepare("SELECT id, name, allowed_models FROM subscription_products WHERE allowed_models IS NOT NULL")
+		.all() as { id: string; name: string; allowed_models: string }[];
+	let changed = 0;
+	for (const row of rows) {
+		let list: unknown;
+		try {
+			list = JSON.parse(row.allowed_models);
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(list) || !list.every((x) => typeof x === "string")) continue;
+		const next = phase35AllowedModels(row.name, list as string[]);
+		const json = next === null ? null : JSON.stringify(next);
+		if (json === row.allowed_models) continue;
+		db.prepare("UPDATE subscription_products SET allowed_models = ? WHERE id = ?").run(json, row.id);
+		console.log(`[migration] ${row.name}: allowed_models -> ${json ?? "NULL (all models)"}`);
+		changed++;
+	}
+	return changed;
 }
 
 // ---- Phase 1B migrations (definitions) ----

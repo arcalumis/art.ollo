@@ -1,39 +1,73 @@
 import crypto from "node:crypto";
 import { getDb } from "../db";
+import {
+	CATALOG,
+	type Tier,
+	catalogCredits,
+	getCatalogModel,
+	isTierAllowed,
+	resolveTier,
+} from "./model-catalog";
 
-export const MODEL_CREDIT_COSTS: Record<string, number> = {
-	"black-forest-labs/flux-schnell": 1,
-	"black-forest-labs/flux-2-dev": 2,
-	"black-forest-labs/flux-dev": 2,
-	"black-forest-labs/flux-redux-schnell": 2,
-	"black-forest-labs/flux-2-pro": 3,
-	"black-forest-labs/flux-1.1-pro": 3,
-	"black-forest-labs/flux-kontext-pro": 3,
-	"black-forest-labs/flux-1.1-pro-ultra": 4,
-	"black-forest-labs/flux-redux-dev": 5,
-	"google/nano-banana-pro": 10,
-};
+/**
+ * Formula credits per output at each model's default tier with no reference
+ * images (max(1, ceil(official cost x 42))). Derived from the catalog; kept as
+ * an export for older callers.
+ */
+export const MODEL_CREDIT_COSTS: Record<string, number> = Object.fromEntries(
+	CATALOG.map((m) => [m.id, catalogCredits(m, m.defaultTier, 0)]),
+);
 const DEFAULT_CREDIT_COST = 2;
 
-export function getModelCreditCost(modelId: string): number {
-	const db = getDb();
-	const row = db
-		.prepare("SELECT credit_cost FROM model_credit_costs WHERE model_id = ?")
-		.get(modelId) as { credit_cost: number } | undefined;
-	if (row) return row.credit_cost;
-	return MODEL_CREDIT_COSTS[modelId] ?? DEFAULT_CREDIT_COST;
+/**
+ * Credits for ONE output of `modelId` at `tier` with `refs` reference images.
+ *
+ * Admin overrides in model_credit_costs win: a `<model>:<tier>` row overrides
+ * that tier, a plain `<model>` row overrides every tier. Otherwise the catalog
+ * formula. Unknown models cost the default (2).
+ */
+export function getModelCreditCost(modelId: string, tier?: Tier, refs = 0): number {
+	return creditCostResolver()(modelId, tier, refs);
 }
 
-export function getAllModelCreditCosts(): { modelId: string; creditCost: number; isOverride: boolean }[] {
+/**
+ * Load the admin overrides once and return a getModelCreditCost-equivalent
+ * function (for callers pricing many model/tier/ref combinations at once).
+ */
+export function creditCostResolver(): (modelId: string, tier?: Tier, refs?: number) => number {
+	const rows = getDb().prepare("SELECT model_id, credit_cost FROM model_credit_costs").all() as {
+		model_id: string;
+		credit_cost: number;
+	}[];
+	const overrides = new Map(rows.map((r) => [r.model_id, r.credit_cost]));
+	return (modelId, tier, refs = 0) => {
+		const model = getCatalogModel(modelId);
+		const resolvedTier = model ? resolveTier(model, tier) : tier;
+		const override =
+			(resolvedTier !== undefined ? overrides.get(`${modelId}:${resolvedTier}`) : undefined) ??
+			overrides.get(modelId);
+		if (override !== undefined) return override;
+		if (!model || !resolvedTier) return DEFAULT_CREDIT_COST;
+		return catalogCredits(model, resolvedTier, refs);
+	};
+}
+
+export function getAllModelCreditCosts(): {
+	modelId: string;
+	creditCost: number;
+	isOverride: boolean;
+}[] {
 	const db = getDb();
-	const overrides = db
-		.prepare("SELECT model_id, credit_cost FROM model_credit_costs")
-		.all() as { model_id: string; credit_cost: number }[];
+	const overrides = db.prepare("SELECT model_id, credit_cost FROM model_credit_costs").all() as {
+		model_id: string;
+		credit_cost: number;
+	}[];
 	const overrideMap = new Map(overrides.map((r) => [r.model_id, r.credit_cost]));
 
 	// Merge all known models from the hardcoded map
+	// Every model ollo runs now, plus any id with an override row.
 	const allModelIds = new Set([
-		...Object.keys(MODEL_CREDIT_COSTS),
+		...CATALOG.filter((m) => !m.hidden).map((m) => m.id),
 		...overrideMap.keys(),
 	]);
 
@@ -58,9 +92,7 @@ export function setModelCreditCost(modelId: string, creditCost: number): void {
 
 export function deleteModelCreditCost(modelId: string): boolean {
 	const db = getDb();
-	const result = db
-		.prepare("DELETE FROM model_credit_costs WHERE model_id = ?")
-		.run(modelId);
+	const result = db.prepare("DELETE FROM model_credit_costs WHERE model_id = ?").run(modelId);
 	return result.changes > 0;
 }
 
@@ -170,14 +202,16 @@ export function recordDailyUsage(userId: string): void {
 		.get(userId, date) as { id: string } | undefined;
 
 	if (existing) {
-		db.prepare(
-			"UPDATE usage_daily SET image_count = image_count + 1 WHERE id = ?",
-		).run(existing.id);
+		db.prepare("UPDATE usage_daily SET image_count = image_count + 1 WHERE id = ?").run(
+			existing.id,
+		);
 	} else {
 		const id = crypto.randomUUID();
-		db.prepare(
-			"INSERT INTO usage_daily (id, user_id, date, image_count) VALUES (?, ?, ?, 1)",
-		).run(id, userId, date);
+		db.prepare("INSERT INTO usage_daily (id, user_id, date, image_count) VALUES (?, ?, ?, 1)").run(
+			id,
+			userId,
+			date,
+		);
 	}
 }
 
@@ -185,7 +219,10 @@ export function recordDailyUsage(userId: string): void {
  * Get user's usage history for the last N days
  * Returns an array of { date, imageCount } sorted by date ascending
  */
-export function getUserUsageHistory(userId: string, days = 30): { date: string; imageCount: number }[] {
+export function getUserUsageHistory(
+	userId: string,
+	days = 30,
+): { date: string; imageCount: number }[] {
 	const db = getDb();
 
 	// Get dates for the last N days
@@ -200,12 +237,12 @@ export function getUserUsageHistory(userId: string, days = 30): { date: string; 
 		.prepare(
 			`SELECT date, image_count FROM usage_daily
 			WHERE user_id = ? AND date >= ? AND date <= ?
-			ORDER BY date ASC`
+			ORDER BY date ASC`,
 		)
 		.all(userId, startDateStr, endDateStr) as { date: string; image_count: number }[];
 
 	// Create a map for quick lookup
-	const usageMap = new Map(usage.map(u => [u.date, u.image_count]));
+	const usageMap = new Map(usage.map((u) => [u.date, u.image_count]));
 
 	// Fill in all days (including zeros)
 	const result: { date: string; imageCount: number }[] = [];
@@ -214,7 +251,7 @@ export function getUserUsageHistory(userId: string, days = 30): { date: string; 
 		const dateStr = current.toISOString().split("T")[0];
 		result.push({
 			date: dateStr,
-			imageCount: usageMap.get(dateStr) || 0
+			imageCount: usageMap.get(dateStr) || 0,
 		});
 		current.setDate(current.getDate() + 1);
 	}
@@ -265,12 +302,14 @@ export function getUserSubscription(userId: string): {
 			ORDER BY sb.created_at DESC
 			LIMIT 1
 		`)
-		.get(userId) as {
-		id: string;
-		boost_product_id: string;
-		original_product_id: string | null;
-		ends_at: string;
-	} | undefined;
+		.get(userId) as
+		| {
+				id: string;
+				boost_product_id: string;
+				original_product_id: string | null;
+				ends_at: string;
+		  }
+		| undefined;
 
 	if (activeBoost) {
 		const boostProduct = db
@@ -291,9 +330,9 @@ export function getUserSubscription(userId: string): {
 
 	const subscription = currentSubscription();
 	const product = subscription
-		? (db.prepare("SELECT * FROM subscription_products WHERE id = ?").get(subscription.product_id) as
-				| SubscriptionProduct
-				| undefined)
+		? (db
+				.prepare("SELECT * FROM subscription_products WHERE id = ?")
+				.get(subscription.product_id) as SubscriptionProduct | undefined)
 		: undefined;
 
 	if (subscription && product) {
@@ -357,13 +396,14 @@ export function getAllowedModelsForUser(userId: string): string[] | null {
 /**
  * Check if a user can use a specific model
  */
-export function canUserUseModel(userId: string, modelId: string): boolean {
+export function canUserUseModel(userId: string, modelId: string, tier?: Tier): boolean {
 	const allowedModels = getAllowedModelsForUser(userId);
-
+	if (tier) return isTierAllowed(allowedModels, modelId, tier);
 	if (allowedModels === null) {
 		return true; // All models allowed
 	}
-
+	// Tools (upscale, remove background) are on every plan.
+	if (getCatalogModel(modelId)?.kind === "tool") return true;
 	return allowedModels.includes(modelId);
 }
 
@@ -375,7 +415,11 @@ export function canUserUseModel(userId: string, modelId: string): boolean {
  * outputs); defaults to the single-image model cost. This is a pre-check for a
  * friendly message only: the authoritative, race-free check is reserveCredits().
  */
-export function canUserGenerate(userId: string, modelId: string, creditCostOverride?: number): UsageLimitResult {
+export function canUserGenerate(
+	userId: string,
+	modelId: string,
+	creditCostOverride?: number,
+): UsageLimitResult {
 	const { product } = getUserSubscription(userId);
 	const usage = getMonthlyUsage(userId);
 	const availableCredits = getAvailableCredits(userId);
@@ -521,7 +565,12 @@ export function reserveCredits(userId: string, amount: number, reason: string): 
  * Give back (part of) a reservation as a positive `refund` ledger row.
  * The original `used` row is left intact so the ledger stays append-only.
  */
-export function refundReservation(userId: string, reservationId: string, amount: number, reason: string): void {
+export function refundReservation(
+	userId: string,
+	reservationId: string,
+	amount: number,
+	reason: string,
+): void {
 	if (amount <= 0) return;
 	addCredits(userId, amount, "refund", `${reason} (reservation ${reservationId})`);
 }
@@ -570,7 +619,11 @@ export interface AssignSubscriptionOptions {
  * for the user is retired as 'superseded' (respecting the one-active-row unique index), the new
  * row is inserted, and the product's welcome bonus is granted once.
  */
-export function assignSubscription(userId: string, productId: string, opts: AssignSubscriptionOptions = {}): string {
+export function assignSubscription(
+	userId: string,
+	productId: string,
+	opts: AssignSubscriptionOptions = {},
+): string {
 	const db = getDb();
 	const id = crypto.randomUUID();
 
@@ -605,7 +658,12 @@ export function assignSubscription(userId: string, productId: string, opts: Assi
 		);
 
 		if (grantBonus && product) {
-			addCredits(userId, product.bonus_credits, "bonus", opts.bonusReason ?? "Subscription welcome bonus");
+			addCredits(
+				userId,
+				product.bonus_credits,
+				"bonus",
+				opts.bonusReason ?? "Subscription welcome bonus",
+			);
 		}
 	})();
 
@@ -642,7 +700,10 @@ const PURCHASED_CREDIT_TYPES = ["purchase", "purchased"];
  * credits are spent before purchased ones: max(0, balance - total purchased).
  * Refills top up only this part, so buying credits never forfeits a refill.
  */
-export function getNonPurchasedBalance(userId: string, balance = getAvailableCredits(userId)): number {
+export function getNonPurchasedBalance(
+	userId: string,
+	balance = getAvailableCredits(userId),
+): number {
 	const placeholders = PURCHASED_CREDIT_TYPES.map(() => "?").join(", ");
 	const row = getDb()
 		.prepare(

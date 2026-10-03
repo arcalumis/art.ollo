@@ -196,7 +196,8 @@ describe("credit costs", () => {
 		const before = (await app.inject({ method: "GET", url: "/api/models/credit-costs" })).json();
 		expect(before.defaultModel).toBe(model);
 		expect(before.costs[model]).toBe(2);
-		expect(before.costs["google/nano-banana-pro"]).toBe(10);
+		expect(before.costs["google/nano-banana-2"]).toBe(3);
+		expect(before.costs["google/nano-banana-pro"]).toBeUndefined();
 
 		setModelCreditCost(model, 7);
 		const after = (await app.inject({ method: "GET", url: "/api/models/credit-costs" })).json();
