@@ -319,11 +319,13 @@ export async function accountRoutes(fastify: FastifyInstance): Promise<void> {
 			const denied = requireRecentAuth(reply, user, request.body);
 			if (denied) return denied;
 
+			// Both branches (address free or already used by another account) consume the same send
+			// budget, record the same pending change and answer identically; only a free address
+			// actually gets the email. Otherwise the cap and the pending state leak which is which.
 			const sent = { success: true, pendingEmail: email };
-			const taken = db
+			const taken = !!db
 				.prepare("SELECT 1 FROM users WHERE email = ? AND id <> ?")
 				.get(email, user.id);
-			if (taken) return sent;
 			if (!reserveEmailSend(email, "email_change", request.ip)) {
 				return fail(
 					reply,
@@ -349,6 +351,8 @@ export async function accountRoutes(fastify: FastifyInstance): Promise<void> {
 					new Date(Date.now() + EMAIL_CHANGE_EXPIRY_MINUTES * 60 * 1000).toISOString(),
 				);
 			})();
+			// The confirm step re-checks and refuses an address in use, so this token is inert.
+			if (taken) return sent;
 
 			const result = await sendEmailChangeEmail(email, user.username, token);
 			if (!result.success) {

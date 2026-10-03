@@ -237,6 +237,22 @@ describe("account: change email", () => {
 		const res = await call("POST", "/api/account/email", user, { email: other.email, sudoToken });
 		expect(res.statusCode).toBe(200);
 		expect(sent).toHaveLength(0);
+		// Same pending state as a free address
+		expect((await call("GET", "/api/account", user)).json().pendingEmail).toBe(other.email);
+	});
+
+	test("an address in use hits the send cap exactly like a free one", async () => {
+		const owner = createUser();
+		const statuses: number[] = [];
+		for (let i = 0; i < 4; i++) {
+			const user = createUser();
+			const sudoToken = await sudoFor(user);
+			statuses.push(
+				(await call("POST", "/api/account/email", user, { email: owner.email, sudoToken })).statusCode,
+			);
+		}
+		expect(statuses).toEqual([200, 200, 200, 429]);
+		expect(sent).toHaveLength(0);
 	});
 
 	test("respects the per-recipient send cap", async () => {
