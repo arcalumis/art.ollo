@@ -204,7 +204,14 @@ describe("email flood protection", () => {
 
 	test("global daily cap blocks sends to anyone", async () => {
 		const prev = process.env.EMAIL_DAILY_CAP;
-		const used = (getDb().prepare("SELECT COUNT(*) AS n FROM email_send_log").get() as { n: number }).n;
+		// Auth mail has its own global budget (receipts and other transactional mail don't count).
+		const used = (
+			getDb()
+				.prepare(
+					"SELECT COUNT(*) AS n FROM email_send_log WHERE kind NOT IN ('receipt', 'payment_failed', 'low_credits', 'email_changed')",
+				)
+				.get() as { n: number }
+		).n;
 		process.env.EMAIL_DAILY_CAP = String(used);
 		try {
 			const res = await requestLink(uniqueEmail("global"));

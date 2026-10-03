@@ -1,9 +1,10 @@
 import "./inject-bun-fix";
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import crypto from "node:crypto";
 import { getDb } from "../server/db";
 import { dedupeActiveSubscriptions, initializeSchema } from "../server/db/schema";
+import { type OutgoingEmail, setEmailTransport } from "../server/services/email";
 import * as stripeService from "../server/services/stripe";
 import { assignSubscription, getUserSubscription } from "../server/services/usage";
 import { authHeader, createUser, creditBalance, getApp } from "./helpers";
@@ -253,12 +254,21 @@ describe("invoice retries on the same payment intent", () => {
 			| undefined;
 		return row?.total_paid_cents ?? 0;
 	}
-	function receiptClaims(invoiceId: string): number {
-		return (
-			getDb().prepare("SELECT COUNT(*) AS n FROM transactional_email_log WHERE dedupe_key = ?").get(`receipt:${invoiceId}`) as {
-				n: number;
-			}
-		).n;
+	let mail: OutgoingEmail[] = [];
+	beforeAll(() =>
+		setEmailTransport(async (m) => {
+			mail.push(m);
+			return { success: true };
+		}),
+	);
+	afterAll(() => setEmailTransport(null));
+	beforeEach(() => {
+		mail = [];
+	});
+	/** Receipts actually sent to this user (emails go out after the webhook commits). */
+	async function receiptsSent(email: string): Promise<number> {
+		await Bun.sleep(5);
+		return mail.filter((m) => m.to === email && m.subject.includes("receipt")).length;
 	}
 
 	test("failed then paid: the failed row becomes succeeded, revenue recorded once", async () => {
@@ -274,7 +284,7 @@ describe("invoice retries on the same payment intent", () => {
 		expect(rows.map((r) => r.status)).toEqual(["succeeded"]);
 		expect(revenueCount(user.id)).toBe(1);
 		expect(totalPaid(user.id)).toBe(1500);
-		expect(receiptClaims(inv.id)).toBe(1);
+		expect(await receiptsSent(user.email)).toBe(1);
 	});
 
 	test("failed, failed, then paid all return 200 and end as one succeeded row", async () => {
@@ -298,7 +308,7 @@ describe("invoice retries on the same payment intent", () => {
 		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["succeeded"]);
 		expect(revenueCount(user.id)).toBe(1);
 		expect(totalPaid(user.id)).toBe(1500);
-		expect(receiptClaims(inv.id)).toBe(1);
+		expect(await receiptsSent(user.email)).toBe(1);
 
 		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
 		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["succeeded"]);

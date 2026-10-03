@@ -1144,4 +1144,6 @@ function runPhase1BMigrations(db: Database): void {
 		);
 		CREATE INDEX IF NOT EXISTS idx_account_reauth_tokens_user ON account_reauth_tokens(user_id);
 	`);
+	// Per-IP daily cap on auth email.
+	db.exec("CREATE INDEX IF NOT EXISTS idx_email_send_log_ip ON email_send_log(ip, created_at)");
 }
