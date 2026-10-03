@@ -13,6 +13,12 @@ export interface MagicLinkResult {
 	error?: string;
 }
 
+export interface MagicLinkVerifyResult {
+	success: boolean;
+	/** True when this link created the account (first sign-in). */
+	isNewUser: boolean;
+}
+
 interface WalletVerifyRequest {
 	walletAddress: string;
 	challenge: string;
@@ -38,7 +44,7 @@ interface AuthContextType {
 	login: (username: string, password: string) => Promise<boolean>;
 	loginWithEmail: (email: string, password: string, rememberMe: boolean) => Promise<boolean>;
 	requestMagicLink: (email: string, rememberMe: boolean) => Promise<MagicLinkResult>;
-	verifyMagicLink: (token: string) => Promise<boolean>;
+	verifyMagicLink: (token: string) => Promise<MagicLinkVerifyResult>;
 	requestPasswordReset: (email: string) => Promise<boolean>;
 	resetPassword: (token: string, newPassword: string) => Promise<boolean>;
 	verifyResetToken: (token: string) => Promise<{ valid: boolean; email?: string }>;
@@ -144,30 +150,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 			if (response.ok) return { success: true };
 			const data = await response.json().catch(() => ({}));
 			if (response.status === 429) {
-				return { success: false, error: "Too many requests. Please wait a minute and try again." };
+				return { success: false, error: "Too many requests. Wait a minute, then try again." };
 			}
-			return { success: false, error: data.error || "Failed to send sign-in link. Please try again." };
+			return { success: false, error: data.error || "The sign-in link wasn't sent. Try again in a moment." };
 		} catch {
-			return { success: false, error: "Network error. Please try again." };
+			return { success: false, error: "Couldn't reach ollo. Check your connection and try again." };
 		}
 	}, []);
 
 	// Verify magic link token and log in
-	const verifyMagicLink = useCallback(async (magicToken: string): Promise<boolean> => {
+	const verifyMagicLink = useCallback(async (magicToken: string): Promise<MagicLinkVerifyResult> => {
 		try {
 			const response = await fetch(`${API_BASE}/api/auth/magic-link/verify?token=${encodeURIComponent(magicToken)}`);
 
 			if (!response.ok) {
-				return false;
+				return { success: false, isNewUser: false };
 			}
 
 			const data = await response.json();
 			localStorage.setItem("token", data.token);
 			setToken(data.token);
 			setUser(data.user);
-			return true;
+			return { success: true, isNewUser: data.isNewUser === true };
 		} catch {
-			return false;
+			return { success: false, isNewUser: false };
 		}
 	}, []);
 
