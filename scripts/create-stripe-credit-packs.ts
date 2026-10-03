@@ -14,9 +14,9 @@ import path from "node:path";
 import Stripe from "stripe";
 
 const PACKS = [
-	{ key: "pack-100", name: "100 credits", credits: 100, priceCents: 800 },
-	{ key: "pack-300", name: "300 credits", credits: 300, priceCents: 2000 },
-	{ key: "pack-1000", name: "1000 credits", credits: 1000, priceCents: 5500 },
+	{ key: "pack-100", name: "100 credits", credits: 100, priceCents: 900 },
+	{ key: "pack-300", name: "300 credits", credits: 300, priceCents: 2400 },
+	{ key: "pack-1000", name: "1000 credits", credits: 1000, priceCents: 6900 },
 ] as const;
 
 const args = process.argv.slice(2);
