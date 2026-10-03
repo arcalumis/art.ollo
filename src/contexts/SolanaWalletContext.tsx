@@ -1,50 +1,44 @@
-import { WalletAdapterNetwork } from "@solana/wallet-adapter-base";
 import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
 import { PhantomWalletAdapter, SolflareWalletAdapter } from "@solana/wallet-adapter-wallets";
-import { clusterApiUrl } from "@solana/web3.js";
-import { type ReactNode, useMemo } from "react";
+import type { ReactNode } from "react";
+import { API_BASE } from "../config";
 
 // Import wallet adapter styles
 import "@solana/wallet-adapter-react-ui/styles.css";
 
+/*
+ * Loaded on demand only (see components/solana/SolanaBoundary): the wallet
+ * libraries are large and most visitors never open a wallet feature. Don't
+ * import this module statically.
+ */
+
+// The backend proxy hides the RPC provider's key. Connection needs an absolute URL.
+const RPC_URL = import.meta.env.PROD
+	? `${window.location.origin}/api/solana/rpc`
+	: `${API_BASE}/api/solana/rpc`;
+
+// One set of adapters for the whole page, so a wallet connected in the upgrade
+// sheet is still connected on the billing page (each boundary has its own provider).
+let sharedWallets: (PhantomWalletAdapter | SolflareWalletAdapter)[] | null = null;
+function wallets() {
+	if (!sharedWallets) sharedWallets = [new PhantomWalletAdapter(), new SolflareWalletAdapter()];
+	return sharedWallets;
+}
+
 interface SolanaWalletProviderProps {
 	children: ReactNode;
-	network?: "mainnet-beta" | "devnet" | "testnet";
 	rpcUrl?: string;
 }
 
-export function SolanaWalletProvider({
-	children,
-	network = "mainnet-beta",
-	rpcUrl,
-}: SolanaWalletProviderProps) {
-	// Convert network string to WalletAdapterNetwork
-	const walletNetwork = useMemo(() => {
-		switch (network) {
-			case "devnet":
-				return WalletAdapterNetwork.Devnet;
-			case "testnet":
-				return WalletAdapterNetwork.Testnet;
-			default:
-				return WalletAdapterNetwork.Mainnet;
-		}
-	}, [network]);
-
-	// RPC endpoint - use custom URL if provided, otherwise fall back to public RPC
-	const endpoint = useMemo(() => rpcUrl || clusterApiUrl(walletNetwork), [rpcUrl, walletNetwork]);
-
-	// Wallet adapters
-	const wallets = useMemo(
-		() => [new PhantomWalletAdapter(), new SolflareWalletAdapter()],
-		[],
-	);
-
+export function SolanaWalletProvider({ children, rpcUrl = RPC_URL }: SolanaWalletProviderProps) {
 	return (
-		<ConnectionProvider endpoint={endpoint}>
-			<WalletProvider wallets={wallets} autoConnect>
+		<ConnectionProvider endpoint={rpcUrl}>
+			<WalletProvider wallets={wallets()} autoConnect>
 				<WalletModalProvider>{children}</WalletModalProvider>
 			</WalletProvider>
 		</ConnectionProvider>
 	);
 }
+
+export default SolanaWalletProvider;

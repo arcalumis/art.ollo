@@ -1,7 +1,7 @@
+import { SignIn } from "@/components/solana/LazySignIn";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { useMediaQuery } from "@/lib/useMediaQuery";
-import { SignIn } from "./SignIn";
 
 interface SignInDialogProps {
 	open: boolean;
