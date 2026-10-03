@@ -3,17 +3,14 @@ import type { ReactNode } from "react";
 import { API_BASE } from "../config";
 import type { User } from "../types";
 
-interface CheckEmailResponse {
-	exists: boolean;
-	hasPassword: boolean;
-	username?: string;
-}
-
 interface WalletChallengeResponse {
 	challenge: string;
 	message: string;
-	isRegistered: boolean;
-	username?: string;
+}
+
+export interface MagicLinkResult {
+	success: boolean;
+	error?: string;
 }
 
 interface WalletVerifyRequest {
@@ -40,8 +37,7 @@ interface AuthContextType {
 	loading: boolean;
 	login: (username: string, password: string) => Promise<boolean>;
 	loginWithEmail: (email: string, password: string, rememberMe: boolean) => Promise<boolean>;
-	checkEmail: (email: string) => Promise<CheckEmailResponse | null>;
-	requestMagicLink: (email: string, rememberMe: boolean) => Promise<boolean>;
+	requestMagicLink: (email: string, rememberMe: boolean) => Promise<MagicLinkResult>;
 	verifyMagicLink: (token: string) => Promise<boolean>;
 	requestPasswordReset: (email: string) => Promise<boolean>;
 	resetPassword: (token: string, newPassword: string) => Promise<boolean>;
@@ -113,25 +109,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		}
 	}, []);
 
-	// Check if email exists and has password
-	const checkEmail = useCallback(async (email: string): Promise<CheckEmailResponse | null> => {
-		try {
-			const response = await fetch(`${API_BASE}/api/auth/check-email`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ email }),
-			});
-
-			if (!response.ok) {
-				return null;
-			}
-
-			return await response.json();
-		} catch {
-			return null;
-		}
-	}, []);
-
 	// Login with email and password
 	const loginWithEmail = useCallback(async (email: string, password: string, rememberMe: boolean): Promise<boolean> => {
 		try {
@@ -155,8 +132,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		}
 	}, []);
 
-	// Request magic link email
-	const requestMagicLink = useCallback(async (email: string, rememberMe: boolean): Promise<boolean> => {
+	// Request a magic link. Also the sign-up path: new emails get a "create your account" link.
+	const requestMagicLink = useCallback(async (email: string, rememberMe: boolean): Promise<MagicLinkResult> => {
 		try {
 			const response = await fetch(`${API_BASE}/api/auth/magic-link`, {
 				method: "POST",
@@ -164,9 +141,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 				body: JSON.stringify({ email, rememberMe }),
 			});
 
-			return response.ok;
+			if (response.ok) return { success: true };
+			const data = await response.json().catch(() => ({}));
+			if (response.status === 429) {
+				return { success: false, error: "Too many requests. Please wait a minute and try again." };
+			}
+			return { success: false, error: data.error || "Failed to send sign-in link. Please try again." };
 		} catch {
-			return false;
+			return { success: false, error: "Network error. Please try again." };
 		}
 	}, []);
 
@@ -289,7 +271,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 				loading,
 				login,
 				loginWithEmail,
-				checkEmail,
 				requestMagicLink,
 				verifyMagicLink,
 				requestPasswordReset,

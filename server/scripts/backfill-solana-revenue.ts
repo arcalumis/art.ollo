@@ -12,7 +12,7 @@ async function getSolUsdPrice(): Promise<number> {
 		const res = await fetch(
 			"https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
 		);
-		const data = await res.json();
+		const data = (await res.json()) as { solana?: { usd?: number } };
 		return data.solana?.usd || 250;
 	} catch {
 		return 250;

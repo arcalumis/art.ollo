@@ -22,9 +22,52 @@ import { threadRoutes } from "./routes/threads";
 
 const isProduction = process.env.NODE_ENV === "production";
 
+const SENSITIVE_QUERY_PARAMS = new Set(["token", "signature"]);
+
+/** Strip secrets (magic-link/reset tokens, signatures) from a URL before it reaches the logs. */
+export function redactUrl(url: string): string {
+	const q = url.indexOf("?");
+	if (q === -1) return url;
+	const params = new URLSearchParams(url.slice(q + 1));
+	let changed = false;
+	for (const key of params.keys()) {
+		if (SENSITIVE_QUERY_PARAMS.has(key.toLowerCase())) {
+			params.set(key, "[REDACTED]");
+			changed = true;
+		}
+	}
+	return changed ? `${url.slice(0, q)}?${params.toString()}` : url;
+}
+
+/**
+ * Caddy is the only hop in front of us (shared docker network `web`; the host port is bound to
+ * 127.0.0.1). Trust loopback + private ranges so request.ip is the real client from
+ * X-Forwarded-For, which Caddy overwrites with the connecting address.
+ */
+export const TRUST_PROXY = ["loopback", "linklocal", "uniquelocal"];
+
+function isApiRequest(url: string): boolean {
+	return url.startsWith("/api/");
+}
+
 export async function buildApp(opts: { logger?: boolean } = {}): Promise<FastifyInstance> {
 	const fastify = Fastify({
-		logger: opts.logger ?? true,
+		trustProxy: TRUST_PROXY,
+		logger:
+			opts.logger === false
+				? false
+				: {
+						serializers: {
+							req(req) {
+								return {
+									method: req.method,
+									url: redactUrl(req.url),
+									hostname: req.hostname,
+									remoteAddress: req.ip,
+								};
+							},
+						},
+					},
 	});
 
 	// Register CORS - in production, require explicit origin
@@ -70,10 +113,14 @@ export async function buildApp(opts: { logger?: boolean } = {}): Promise<Fastify
 		crossOriginResourcePolicy: { policy: "cross-origin" }, // Allow images to load cross-origin
 	});
 
-	// Global rate limiting
+	// Global rate limiting: 100 API requests/min per client IP. Static files (images, uploads,
+	// SPA assets) use a separate, higher bucket so browsing a gallery doesn't eat the API budget.
+	// The health check is exempt (Docker/Caddy poll it).
 	await fastify.register(rateLimit, {
-		max: 100, // 100 requests per minute per IP
 		timeWindow: "1 minute",
+		max: (request) => (isApiRequest(request.url) ? 100 : 1000),
+		keyGenerator: (request) => (isApiRequest(request.url) ? request.ip : `static:${request.ip}`),
+		allowList: (request) => request.url === "/api/health" || request.url.startsWith("/api/health?"),
 	});
 
 	// Register multipart for file uploads

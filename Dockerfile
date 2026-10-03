@@ -12,6 +12,10 @@ RUN bun install --frozen-lockfile
 # Copy source code
 COPY . .
 
+# Frontend build-time config (passed from docker-compose; .env files are excluded from the context)
+ARG VITE_SOLANA_NETWORK=mainnet-beta
+ENV VITE_SOLANA_NETWORK=$VITE_SOLANA_NETWORK
+
 # Build the React frontend
 RUN bun run build
 

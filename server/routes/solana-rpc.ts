@@ -2,36 +2,81 @@ import type { FastifyInstance } from "fastify";
 
 const SOLANA_RPC_URL =
 	process.env.SOLANA_RPC_URL ||
-	(process.env.SOLANA_NETWORK === "devnet"
-		? "https://api.devnet.solana.com"
-		: "https://api.mainnet-beta.solana.com");
+	(process.env.SOLANA_NETWORK === "devnet" ? "https://api.devnet.solana.com" : "https://api.mainnet-beta.solana.com");
+
+/**
+ * JSON-RPC methods the in-browser wallet flow needs. Everything else is refused so the proxy
+ * can't be used as a free general-purpose RPC on our (paid, origin-locked) Alchemy key.
+ * The endpoint stays unauthenticated because the wallet adapter's Connection can't attach our
+ * bearer token; the allowlist plus a per-IP rate limit bound the exposure.
+ */
+export const ALLOWED_RPC_METHODS = new Set([
+	"getLatestBlockhash",
+	"getBalance",
+	"getAccountInfo",
+	"getSignatureStatuses",
+	"sendTransaction",
+	"simulateTransaction",
+	"getFeeForMessage",
+	"getMinimumBalanceForRentExemption",
+	"getTransaction",
+	"getBlockHeight",
+	"getSlot",
+	"isBlockhashValid",
+	"getEpochInfo",
+	"getVersion",
+	"getRecentPrioritizationFees",
+]);
+
+const MAX_BATCH = 10;
+
+interface RpcRequest {
+	jsonrpc?: string;
+	id?: string | number | null;
+	method?: unknown;
+	params?: unknown;
+}
+
+function rpcError(id: RpcRequest["id"], code: number, message: string) {
+	return { jsonrpc: "2.0", error: { code, message }, id: id ?? null };
+}
 
 export async function solanaRpcRoutes(fastify: FastifyInstance) {
-	// Proxy JSON-RPC requests to Solana
-	fastify.post("/api/solana/rpc", async (request, reply) => {
-		try {
-			const response = await fetch(SOLANA_RPC_URL, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"Origin": "https://ollo.art",
-					"Referer": "https://ollo.art/",
-				},
-				body: JSON.stringify(request.body),
-			});
+	fastify.post(
+		"/api/solana/rpc",
+		{
+			bodyLimit: 256 * 1024,
+			config: { rateLimit: { max: 120, timeWindow: "1 minute" } },
+		},
+		async (request, reply) => {
+			const body = request.body as RpcRequest | RpcRequest[] | undefined;
+			const calls = Array.isArray(body) ? body : body ? [body] : [];
 
-			const data = await response.json();
-			return reply.status(response.status).send(data);
-		} catch (error) {
-			fastify.log.error({ err: error, rpcUrl: SOLANA_RPC_URL }, "Solana RPC proxy error");
-			return reply.status(502).send({
-				jsonrpc: "2.0",
-				error: {
-					code: -32603,
-					message: "Failed to reach Solana RPC",
-				},
-				id: (request.body as { id?: number })?.id || null,
-			});
-		}
-	});
+			if (calls.length === 0 || calls.length > MAX_BATCH) {
+				return reply.status(400).send(rpcError(null, -32600, "Invalid request"));
+			}
+			const rejected = calls.find((c) => typeof c?.method !== "string" || !ALLOWED_RPC_METHODS.has(c.method));
+			if (rejected) {
+				return reply.status(403).send(rpcError(rejected?.id, -32601, "Method not allowed"));
+			}
+
+			try {
+				const response = await fetch(SOLANA_RPC_URL, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Origin: "https://ollo.art",
+						Referer: "https://ollo.art/",
+					},
+					body: JSON.stringify(body),
+				});
+
+				const data = await response.json();
+				return reply.status(response.status).send(data);
+			} catch (error) {
+				request.log.error({ err: error instanceof Error ? error.message : String(error) }, "Solana RPC proxy error");
+				return reply.status(502).send(rpcError(Array.isArray(body) ? null : body?.id, -32603, "Failed to reach Solana RPC"));
+			}
+		},
+	);
 }

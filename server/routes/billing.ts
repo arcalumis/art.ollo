@@ -8,6 +8,7 @@ import {
 	getStripeCustomerId,
 	getUserInvoices,
 	getUserSubscription,
+	hasLiveStripeSubscription,
 	isStripeConfigured,
 } from "../services/stripe";
 import { getAvailableCredits } from "../services/usage";
@@ -275,6 +276,23 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 				return reply.status(400).send({ error: "Invalid redirect URL" });
 			}
 
+			// Only prices that belong to one of our active subscription products can be checked out
+			const product = getDb()
+				.prepare("SELECT id FROM subscription_products WHERE stripe_price_id = ? AND is_active = 1")
+				.get(priceId);
+			if (!product) {
+				return reply.status(400).send({ error: "Unknown or unavailable plan" });
+			}
+
+			// One Stripe subscription per user: plan changes and payment fixes go through the portal
+			if (hasLiveStripeSubscription(userId)) {
+				return reply.status(409).send({
+					error: "You already have an active subscription. Manage or change it from the billing portal.",
+					code: "SUBSCRIPTION_EXISTS",
+					usePortal: true,
+				});
+			}
+
 			const url = await createCheckoutSession(userId, priceId, successUrl, cancelUrl);
 
 			if (!url) {
@@ -432,13 +450,19 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 				return { subscription: null };
 			}
 
+			// Period fields live on the subscription in our pinned API version and on items in newer ones
+			const item = subscription.items?.data?.[0];
+			const legacy = subscription as unknown as Record<string, number | undefined>;
+			const periodStart = item?.current_period_start ?? legacy.current_period_start;
+			const periodEnd = item?.current_period_end ?? legacy.current_period_end;
+
 			return {
 				subscription: {
 					id: subscription.id,
 					status: subscription.status,
 					cancelAtPeriodEnd: subscription.cancel_at_period_end,
-					currentPeriodStart: new Date(subscription.current_period_start * 1000).toISOString(),
-					currentPeriodEnd: new Date(subscription.current_period_end * 1000).toISOString(),
+					currentPeriodStart: periodStart ? new Date(periodStart * 1000).toISOString() : null,
+					currentPeriodEnd: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
 				},
 			};
 		},

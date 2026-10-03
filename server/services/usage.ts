@@ -240,7 +240,21 @@ export function getUserSubscription(userId: string): {
 } {
 	const db = getDb();
 
-	// First check for an active boost
+	// Only active/trialing rows that haven't ended grant their tier. past_due, canceled, unpaid,
+	// incomplete, superseded and expired rows fall back to the Free product below.
+	const currentSubscription = () =>
+		db
+			.prepare(
+				`SELECT us.* FROM user_subscriptions us
+				WHERE us.user_id = ?
+				AND COALESCE(us.status, 'active') IN ('active', 'trialing')
+				AND (us.ends_at IS NULL OR datetime(us.ends_at) > datetime('now'))
+				ORDER BY us.created_at DESC
+				LIMIT 1`,
+			)
+			.get(userId) as UserSubscription | undefined;
+
+	// First check for an active boost (takes precedence over everything)
 	const activeBoost = db
 		.prepare(`
 			SELECT sb.id, sb.boost_product_id, sb.original_product_id, sb.ends_at
@@ -259,24 +273,12 @@ export function getUserSubscription(userId: string): {
 	} | undefined;
 
 	if (activeBoost) {
-		// User has an active boost - return the boost product
 		const boostProduct = db
 			.prepare("SELECT * FROM subscription_products WHERE id = ?")
 			.get(activeBoost.boost_product_id) as SubscriptionProduct | undefined;
 
-		// Get original subscription for reference
-		const originalSubscription = db
-			.prepare(
-				`SELECT us.* FROM user_subscriptions us
-				WHERE us.user_id = ?
-				AND (us.ends_at IS NULL OR us.ends_at > datetime('now'))
-				ORDER BY us.created_at DESC
-				LIMIT 1`,
-			)
-			.get(userId) as UserSubscription | undefined;
-
 		return {
-			subscription: originalSubscription || null,
+			subscription: currentSubscription() || null,
 			product: boostProduct || null,
 			boost: {
 				isBoost: true,
@@ -287,30 +289,24 @@ export function getUserSubscription(userId: string): {
 		};
 	}
 
-	// No boost - return normal subscription
-	const subscription = db
-		.prepare(
-			`SELECT us.* FROM user_subscriptions us
-			WHERE us.user_id = ?
-			AND (us.ends_at IS NULL OR us.ends_at > datetime('now'))
-			ORDER BY us.created_at DESC
-			LIMIT 1`,
-		)
-		.get(userId) as UserSubscription | undefined;
+	const subscription = currentSubscription();
+	const product = subscription
+		? (db.prepare("SELECT * FROM subscription_products WHERE id = ?").get(subscription.product_id) as
+				| SubscriptionProduct
+				| undefined)
+		: undefined;
 
-	if (!subscription) {
-		return { subscription: null, product: null, boost: { isBoost: false } };
+	if (subscription && product) {
+		return { subscription, product, boost: { isBoost: false } };
 	}
 
-	const product = db
-		.prepare("SELECT * FROM subscription_products WHERE id = ?")
-		.get(subscription.product_id) as SubscriptionProduct | undefined;
+	const freeProduct = db
+		.prepare(
+			"SELECT * FROM subscription_products WHERE name = 'Free' AND is_active = 1 ORDER BY created_at ASC LIMIT 1",
+		)
+		.get() as SubscriptionProduct | undefined;
 
-	return {
-		subscription: subscription || null,
-		product: product || null,
-		boost: { isBoost: false },
-	};
+	return { subscription: null, product: freeProduct || null, boost: { isBoost: false } };
 }
 
 /**
@@ -556,34 +552,62 @@ export function addCredits(
 	).run(id, userId, creditType, amount, reason);
 }
 
+export interface AssignSubscriptionOptions {
+	stripeSubscriptionId?: string | null;
+	/** 'active' (default) or 'trialing'. */
+	status?: "active" | "trialing";
+	startsAt?: string;
+	endsAt?: string | null;
+	periodStart?: string | null;
+	periodEnd?: string | null;
+	/** Grant the product's bonus_credits (default true). */
+	grantBonus?: boolean;
+	bonusReason?: string;
+}
+
 /**
- * Assign subscription to user
+ * Assign a subscription to a user. In one transaction: every currently 'active'/'trialing' row
+ * for the user is retired as 'superseded' (respecting the one-active-row unique index), the new
+ * row is inserted, and the product's welcome bonus is granted once.
  */
-export function assignSubscription(userId: string, productId: string): string {
+export function assignSubscription(userId: string, productId: string, opts: AssignSubscriptionOptions = {}): string {
 	const db = getDb();
-
-	// End any existing active subscriptions
-	db.prepare(
-		`UPDATE user_subscriptions
-		SET ends_at = datetime('now')
-		WHERE user_id = ? AND (ends_at IS NULL OR ends_at > datetime('now'))`,
-	).run(userId);
-
-	// Create new subscription
 	const id = crypto.randomUUID();
-	db.prepare(
-		`INSERT INTO user_subscriptions (id, user_id, product_id, starts_at)
-		VALUES (?, ?, ?, datetime('now'))`,
-	).run(id, userId, productId);
 
-	// Add bonus credits from the product
-	const product = db
-		.prepare("SELECT bonus_credits FROM subscription_products WHERE id = ?")
-		.get(productId) as { bonus_credits: number } | undefined;
+	db.transaction(() => {
+		db.prepare(
+			`UPDATE user_subscriptions
+			SET status = 'superseded', ends_at = COALESCE(ends_at, datetime('now'))
+			WHERE user_id = ? AND status IN ('active', 'trialing')`,
+		).run(userId);
 
-	if (product && product.bonus_credits > 0) {
-		addCredits(userId, product.bonus_credits, "bonus", "Subscription welcome bonus");
-	}
+		const product = db
+			.prepare("SELECT bonus_credits FROM subscription_products WHERE id = ?")
+			.get(productId) as { bonus_credits: number } | undefined;
+		const grantBonus = opts.grantBonus !== false && !!product && product.bonus_credits > 0;
+
+		db.prepare(
+			`INSERT INTO user_subscriptions
+				(id, user_id, product_id, starts_at, ends_at, status, stripe_subscription_id,
+				 current_period_start, current_period_end, bonus_granted)
+			VALUES (?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?)`,
+		).run(
+			id,
+			userId,
+			productId,
+			opts.startsAt ?? null,
+			opts.endsAt ?? null,
+			opts.status ?? "active",
+			opts.stripeSubscriptionId ?? null,
+			opts.periodStart ?? null,
+			opts.periodEnd ?? null,
+			grantBonus ? 1 : 0,
+		);
+
+		if (grantBonus && product) {
+			addCredits(userId, product.bonus_credits, "bonus", opts.bonusReason ?? "Subscription welcome bonus");
+		}
+	})();
 
 	return id;
 }
@@ -594,18 +618,20 @@ export function assignSubscription(userId: string, productId: string): string {
 export function assignDefaultSubscription(userId: string): void {
 	const db = getDb();
 
-	// Find the default (Free) product
-	const freeProduct = db
-		.prepare("SELECT id FROM subscription_products WHERE name = 'Free' AND is_active = 1 LIMIT 1")
-		.get() as { id: string } | undefined;
+	db.transaction(() => {
+		// Find the default (Free) product
+		const freeProduct = db
+			.prepare("SELECT id FROM subscription_products WHERE name = 'Free' AND is_active = 1 LIMIT 1")
+			.get() as { id: string } | undefined;
 
-	if (freeProduct) {
-		assignSubscription(userId, freeProduct.id);
-	}
+		if (freeProduct) {
+			assignSubscription(userId, freeProduct.id);
+		}
 
-	// Grant initial credits to new users
-	const initialCredits = Number(process.env.INITIAL_CREDITS) || 10;
-	addCredits(userId, initialCredits, "initial", "Welcome credits for new account");
+		// Grant initial credits to new users
+		const initialCredits = Number(process.env.INITIAL_CREDITS) || 10;
+		addCredits(userId, initialCredits, "initial", "Welcome credits for new account");
+	})();
 }
 
 /** Ledger credit_type values that represent credits the user paid for. */

@@ -27,3 +27,6 @@ for (const [k, v] of Object.entries(overrides)) process.env[k] = v;
 for (const [k, v] of Object.entries(process.env)) {
 	if (v && /^(sk_live_|rk_live_)/.test(v)) throw new Error(`Live secret in test env: ${k}`);
 }
+
+// Make app.inject() honour replies sent from preHandlers under Bun (see the file).
+await import("./inject-bun-fix");

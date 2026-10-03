@@ -10,24 +10,22 @@ import {
 	recordPayment,
 	recordRevenueEvent,
 	stripe,
+	syncStripeSubscription,
 	updateUserMetrics,
-	updateUserSubscription,
 } from "../services/stripe";
 import { addCredits } from "../services/usage";
 
-function markEventProcessed(eventId: string, eventType: string): void {
-	const db = getDb();
-	db.prepare(
-		"INSERT OR IGNORE INTO processed_webhook_events (stripe_event_id, event_type) VALUES (?, ?)",
-	).run(eventId, eventType);
-}
+/**
+ * Thrown when an event can't be applied yet but a retry could succeed (e.g. a paid subscription
+ * whose price isn't mapped to a product, or a customer we can't map to a user). The handler
+ * answers 500 so Stripe retries with backoff for up to 3 days, giving the operator time to fix
+ * the mapping; Stripe's dashboard also flags the failing endpoint.
+ */
+export class RetryableWebhookError extends Error {}
 
-function isEventAlreadyProcessed(eventId: string): boolean {
-	const db = getDb();
-	const row = db
-		.prepare("SELECT 1 FROM processed_webhook_events WHERE stripe_event_id = ?")
-		.get(eventId);
-	return row !== undefined;
+/** Loud, greppable operator log for mapping problems. */
+function alert(message: string, details: Record<string, unknown>): void {
+	console.error(`[stripe-webhook][ALERT] ${message}`, JSON.stringify(details));
 }
 
 export async function stripeWebhookRoutes(fastify: FastifyInstance): Promise<void> {
@@ -60,92 +58,128 @@ export async function stripeWebhookRoutes(fastify: FastifyInstance): Promise<voi
 			const body = (request as FastifyRequest & { rawBody: Buffer }).rawBody;
 
 			let event: Stripe.Event;
-
 			try {
-				event = stripe.webhooks.constructEvent(body, sig, STRIPE_WEBHOOK_SECRET);
+				// Must be the async variant: under Bun the Stripe SDK uses SubtleCrypto, and the
+				// sync constructEvent() always throws ("cannot be used in a synchronous context").
+				event = await stripe.webhooks.constructEventAsync(body, sig, STRIPE_WEBHOOK_SECRET);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Unknown error";
-				console.error("Webhook signature verification failed:", message);
-				return reply.status(400).send({ error: `Webhook Error: ${message}` });
+				request.log.warn({ err: message }, "Stripe webhook signature verification failed");
+				return reply.status(400).send({ error: "Webhook signature verification failed" });
 			}
 
-			// Idempotency check — Stripe delivers webhooks at least once, not exactly once
-			if (isEventAlreadyProcessed(event.id)) {
-				console.log(`Duplicate webhook event skipped: ${event.id} (${event.type})`);
-				return { received: true };
-			}
-
-			// Handle the event
 			try {
-				switch (event.type) {
-					case "invoice.paid":
-						await handleInvoicePaid(event.data.object as Stripe.Invoice);
-						break;
-
-					case "invoice.payment_failed":
-						await handleInvoicePaymentFailed(event.data.object as Stripe.Invoice);
-						break;
-
-					// New subscription: sync DB row AND grant bonus credits
-					case "customer.subscription.created":
-						await handleSubscriptionCreated(event.data.object as Stripe.Subscription);
-						break;
-
-					// Renewal/update: sync DB row only
-					case "customer.subscription.updated":
-						await handleSubscriptionUpdated(event.data.object as Stripe.Subscription);
-						break;
-
-					case "customer.subscription.deleted":
-						await handleSubscriptionDeleted(event.data.object as Stripe.Subscription);
-						break;
-
-					case "checkout.session.completed":
-						await handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session);
-						break;
-
-					default:
-						console.log(`Unhandled event type: ${event.type}`);
+				const outcome = processStripeEvent(event);
+				if (outcome === "duplicate") {
+					request.log.info({ eventId: event.id, type: event.type }, "Duplicate Stripe webhook skipped");
 				}
-
-				// Only mark processed after successful handling
-				markEventProcessed(event.id, event.type);
+				return { received: true };
 			} catch (error) {
-				console.error(`Error handling ${event.type}:`, error);
-				// Don't mark as processed — Stripe will retry
+				// Not marked processed (the transaction rolled back): answer 500 so Stripe retries.
+				request.log.error(
+					{ eventId: event.id, type: event.type, err: error instanceof Error ? error.message : String(error) },
+					error instanceof RetryableWebhookError
+						? "Stripe webhook could not be applied yet; asking Stripe to retry"
+						: "Stripe webhook handler failed; asking Stripe to retry",
+				);
+				return reply.status(500).send({ error: "Webhook handler failed" });
 			}
-
-			return { received: true };
 		},
 	);
 }
 
-async function handleInvoicePaid(invoice: Stripe.Invoice): Promise<void> {
-	if (!invoice.customer || typeof invoice.customer !== "string") return;
+/**
+ * Apply one event. Idempotency check, all DB effects and the processed marker run in a single
+ * transaction: an exception rolls everything back so a retry starts clean (no double grants).
+ */
+export function processStripeEvent(event: Stripe.Event): "processed" | "duplicate" {
+	const db = getDb();
+	return db.transaction(() => {
+		const seen = db.prepare("SELECT 1 FROM processed_webhook_events WHERE stripe_event_id = ?").get(event.id);
+		if (seen) return "duplicate" as const;
 
-	const userId = getUserIdFromStripeCustomer(invoice.customer);
+		switch (event.type) {
+			case "invoice.paid":
+				handleInvoicePaid(event.data.object as Stripe.Invoice);
+				break;
+			case "invoice.payment_failed":
+				handleInvoicePaymentFailed(event.data.object as Stripe.Invoice);
+				break;
+			case "customer.subscription.created":
+			case "customer.subscription.updated":
+				handleSubscriptionChange(event.data.object as Stripe.Subscription);
+				break;
+			case "customer.subscription.deleted":
+				handleSubscriptionDeleted(event.data.object as Stripe.Subscription);
+				break;
+			case "checkout.session.completed":
+			case "checkout.session.async_payment_succeeded":
+				handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session);
+				break;
+			default:
+				console.log(`Unhandled Stripe event type: ${event.type}`);
+		}
+
+		db.prepare("INSERT OR IGNORE INTO processed_webhook_events (stripe_event_id, event_type) VALUES (?, ?)").run(
+			event.id,
+			event.type,
+		);
+		return "processed" as const;
+	})();
+}
+
+// Fields present in our pinned API version (2024-12-18.acacia) but missing from the SDK's newer types.
+type LegacyInvoice = Stripe.Invoice & {
+	payment_intent?: string | { id: string } | null;
+	subscription?: string | { id: string } | null;
+};
+
+function invoicePaymentIntentId(invoice: Stripe.Invoice): string | null {
+	const pi = (invoice as LegacyInvoice).payment_intent;
+	if (!pi) return null;
+	return typeof pi === "string" ? pi : pi.id;
+}
+
+function invoiceSubscriptionId(invoice: Stripe.Invoice): string | null {
+	const legacy = (invoice as LegacyInvoice).subscription;
+	if (legacy) return typeof legacy === "string" ? legacy : legacy.id;
+	const modern = (
+		invoice as unknown as { parent?: { subscription_details?: { subscription?: string | { id: string } } } }
+	).parent?.subscription_details?.subscription;
+	if (!modern) return null;
+	return typeof modern === "string" ? modern : modern.id;
+}
+
+function customerId(customer: string | { id: string } | null | undefined): string | null {
+	if (!customer) return null;
+	return typeof customer === "string" ? customer : customer.id;
+}
+
+// Bookkeeping event: an unmapped customer can't be fixed by retrying, so log loudly and ack.
+function handleInvoicePaid(invoice: Stripe.Invoice): void {
+	const customer = customerId(invoice.customer as string | null);
+	if (!customer) return;
+
+	const userId = getUserIdFromStripeCustomer(customer);
 	if (!userId) {
-		console.error("No user found for Stripe customer:", invoice.customer);
+		alert("invoice.paid for unmapped Stripe customer (payment not recorded)", {
+			customer,
+			invoice: invoice.id,
+			amount: invoice.amount_paid,
+		});
 		return;
 	}
 
 	const amountCents = invoice.amount_paid;
-	const paymentIntentId =
-		typeof invoice.payment_intent === "string" ? invoice.payment_intent : null;
-
-	// Use billing_reason to classify: subscription_create and subscription_cycle are subscriptions,
-	// everything else is treated as a one-time charge. Avoid relying on 'manual' which is ambiguous.
 	const paymentType =
-		invoice.billing_reason === "subscription_create" ||
-		invoice.billing_reason === "subscription_cycle"
+		invoice.billing_reason === "subscription_create" || invoice.billing_reason === "subscription_cycle"
 			? "subscription"
 			: "credit_purchase";
 
-	// Record the payment
 	const paymentId = recordPayment(
 		userId,
-		paymentIntentId,
-		invoice.id,
+		invoicePaymentIntentId(invoice),
+		invoice.id ?? null,
 		amountCents,
 		"succeeded",
 		paymentType,
@@ -153,84 +187,91 @@ async function handleInvoicePaid(invoice: Stripe.Invoice): Promise<void> {
 		{ billing_reason: invoice.billing_reason },
 	);
 
-	// Record revenue event
 	recordRevenueEvent(userId, paymentType, amountCents, {
 		paymentId,
 		description: `Invoice ${invoice.number}`,
-		periodStart: invoice.period_start
-			? new Date(invoice.period_start * 1000).toISOString().split("T")[0]
-			: undefined,
-		periodEnd: invoice.period_end
-			? new Date(invoice.period_end * 1000).toISOString().split("T")[0]
-			: undefined,
+		periodStart: invoice.period_start ? new Date(invoice.period_start * 1000).toISOString().split("T")[0] : undefined,
+		periodEnd: invoice.period_end ? new Date(invoice.period_end * 1000).toISOString().split("T")[0] : undefined,
 	});
 
-	// Update user metrics
 	updateUserMetrics(userId, amountCents);
-
 	console.log(`Recorded payment of ${amountCents} cents for user ${userId}`);
 }
 
-async function handleInvoicePaymentFailed(invoice: Stripe.Invoice): Promise<void> {
-	if (!invoice.customer || typeof invoice.customer !== "string") return;
+function handleInvoicePaymentFailed(invoice: Stripe.Invoice): void {
+	const customer = customerId(invoice.customer as string | null);
+	if (!customer) return;
 
-	const userId = getUserIdFromStripeCustomer(invoice.customer);
-	if (!userId) return;
+	const userId = getUserIdFromStripeCustomer(customer);
+	if (!userId) {
+		alert("invoice.payment_failed for unmapped Stripe customer", { customer, invoice: invoice.id });
+		return;
+	}
 
-	const paymentIntentId =
-		typeof invoice.payment_intent === "string" ? invoice.payment_intent : null;
-
-	// Record failed payment
 	recordPayment(
 		userId,
-		paymentIntentId,
-		invoice.id,
+		invoicePaymentIntentId(invoice),
+		invoice.id ?? null,
 		invoice.amount_due,
 		"failed",
 		"subscription",
 		`Failed: Invoice ${invoice.number}`,
 	);
 
-	// Update subscription status
-	const db = getDb();
-	db.prepare(`
-		UPDATE user_subscriptions
-		SET status = 'past_due'
-		WHERE user_id = ? AND status = 'active'
-	`).run(userId);
+	// Only the subscription this invoice belongs to becomes past_due (never Free/admin rows).
+	// customer.subscription.updated carries the same status change and is handled too.
+	const subscriptionId = invoiceSubscriptionId(invoice);
+	if (subscriptionId) {
+		getDb()
+			.prepare(
+				"UPDATE user_subscriptions SET status = 'past_due' WHERE stripe_subscription_id = ? AND status IN ('active', 'trialing')",
+			)
+			.run(subscriptionId);
+	}
 
 	console.log(`Payment failed for user ${userId}, invoice ${invoice.id}`);
 }
 
-// Called only for customer.subscription.created — syncs DB and grants bonus credits
-async function handleSubscriptionCreated(subscription: Stripe.Subscription): Promise<void> {
-	if (!subscription.customer || typeof subscription.customer !== "string") return;
+/**
+ * customer.subscription.created / .updated. Grants value (tier + bonus credits), so mapping
+ * failures are retried rather than silently dropped.
+ */
+function handleSubscriptionChange(subscription: Stripe.Subscription): void {
+	const customer = customerId(subscription.customer as string | null);
+	if (!customer) return;
 
-	const userId = getUserIdFromStripeCustomer(subscription.customer);
+	const userId = getUserIdFromStripeCustomer(customer);
 	if (!userId) {
-		console.error("No user found for Stripe customer:", subscription.customer);
-		return;
-	}
-
-	const priceId = subscription.items.data[0]?.price.id;
-	if (!priceId) return;
-
-	const product = getProductByStripePriceId(priceId);
-	if (!product) {
-		console.error("No product found for Stripe price:", priceId);
-		return;
+		alert("Subscription event for unmapped Stripe customer", { customer, subscription: subscription.id });
+		throw new RetryableWebhookError(`No user for Stripe customer ${customer}`);
 	}
 
 	const item = subscription.items.data[0];
-	const periodStart = item?.current_period_start ?? (subscription as unknown as Record<string, number>).current_period_start;
-	const periodEnd = item?.current_period_end ?? (subscription as unknown as Record<string, number>).current_period_end;
-
-	if (!periodStart || !periodEnd) {
-		console.error(`Subscription ${subscription.id} missing period dates — skipping`);
+	const priceId = item?.price.id;
+	if (!priceId) {
+		alert("Subscription has no price; ignoring", { subscription: subscription.id });
 		return;
 	}
 
-	updateUserSubscription(
+	const product = getProductByStripePriceId(priceId);
+	if (!product) {
+		alert("Subscription price is not mapped to any subscription_products.stripe_price_id", {
+			price: priceId,
+			subscription: subscription.id,
+			userId,
+		});
+		throw new RetryableWebhookError(`No product for Stripe price ${priceId}`);
+	}
+
+	const legacy = subscription as unknown as Record<string, number | undefined>;
+	const periodStart = item?.current_period_start ?? legacy.current_period_start;
+	const periodEnd = item?.current_period_end ?? legacy.current_period_end;
+	if (!periodStart || !periodEnd) {
+		alert("Subscription missing period dates; ignoring", { subscription: subscription.id });
+		return;
+	}
+
+	const { bonusGranted } = syncStripeSubscription(
 		userId,
 		product.id,
 		subscription.id,
@@ -239,133 +280,83 @@ async function handleSubscriptionCreated(subscription: Stripe.Subscription): Pro
 		new Date(periodEnd * 1000),
 	);
 
-	// Grant bonus credits for new subscriptions
-	if (product.bonus_credits > 0) {
-		addCredits(userId, product.bonus_credits, "bonus", "Subscription welcome bonus");
-		console.log(`Granted ${product.bonus_credits} bonus credits to user ${userId} for new subscription`);
+	if (bonusGranted > 0) {
+		console.log(`Granted ${bonusGranted} bonus credits to user ${userId} for subscription ${subscription.id}`);
 	}
-
-	console.log(`Created subscription for user ${userId}: ${subscription.status}`);
+	console.log(`Synced subscription ${subscription.id} for user ${userId}: ${subscription.status}`);
 }
 
-// Called only for customer.subscription.updated — syncs DB row, no bonus credits
-async function handleSubscriptionUpdated(subscription: Stripe.Subscription): Promise<void> {
-	if (!subscription.customer || typeof subscription.customer !== "string") return;
-
-	const userId = getUserIdFromStripeCustomer(subscription.customer);
-	if (!userId) {
-		console.error("No user found for Stripe customer:", subscription.customer);
-		return;
-	}
-
-	const priceId = subscription.items.data[0]?.price.id;
-	if (!priceId) return;
-
-	const product = getProductByStripePriceId(priceId);
-	if (!product) {
-		console.error("No product found for Stripe price:", priceId);
-		return;
-	}
-
-	const item = subscription.items.data[0];
-	const periodStart = item?.current_period_start ?? (subscription as unknown as Record<string, number>).current_period_start;
-	const periodEnd = item?.current_period_end ?? (subscription as unknown as Record<string, number>).current_period_end;
-
-	if (!periodStart || !periodEnd) {
-		console.error(`Subscription ${subscription.id} missing period dates — skipping`);
-		return;
-	}
-
-	updateUserSubscription(
-		userId,
-		product.id,
-		subscription.id,
-		subscription.status,
-		new Date(periodStart * 1000),
-		new Date(periodEnd * 1000),
-	);
-
-	console.log(`Updated subscription for user ${userId}: ${subscription.status}`);
-}
-
-async function handleSubscriptionDeleted(subscription: Stripe.Subscription): Promise<void> {
-	if (!subscription.customer || typeof subscription.customer !== "string") return;
-
-	const userId = getUserIdFromStripeCustomer(subscription.customer);
-	if (!userId) return;
-
+function handleSubscriptionDeleted(subscription: Stripe.Subscription): void {
 	const db = getDb();
 
-	// Mark subscription as canceled
 	db.prepare(`
 		UPDATE user_subscriptions
 		SET status = 'canceled', ends_at = datetime('now')
 		WHERE stripe_subscription_id = ?
 	`).run(subscription.id);
 
-	// Update user metrics for churn tracking
-	db.prepare(`
-		UPDATE user_metrics
-		SET churned_at = datetime('now')
-		WHERE user_id = ?
-	`).run(userId);
+	const customer = customerId(subscription.customer as string | null);
+	const userId = customer ? getUserIdFromStripeCustomer(customer) : null;
+	if (!userId) {
+		alert("subscription.deleted for unmapped Stripe customer", { customer, subscription: subscription.id });
+		return;
+	}
 
+	db.prepare("UPDATE user_metrics SET churned_at = datetime('now') WHERE user_id = ?").run(userId);
 	console.log(`Subscription canceled for user ${userId}`);
 }
 
-async function handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
-	console.log(`Checkout completed: ${session.id}, mode: ${session.mode}`);
+function handleCheckoutCompleted(session: Stripe.Checkout.Session): void {
+	// Subscription-mode checkouts are handled by customer.subscription.* events.
+	if (session.mode !== "payment") return;
 
-	if (session.mode === "payment") {
-		// One-time credit purchase
-		const userId =
-			session.metadata?.user_id ||
-			(typeof session.customer === "string"
-				? getUserIdFromStripeCustomer(session.customer)
-				: null);
-
-		if (!userId) {
-			console.error("No user found for credit purchase checkout:", session.id);
-			return;
-		}
-
-		const credits = Number(session.metadata?.credits);
-		const packageId = session.metadata?.package_id;
-
-		if (!credits || credits <= 0) {
-			console.error("Invalid credits in checkout metadata:", session.metadata);
-			return;
-		}
-
-		// Grant credits
-		addCredits(userId, credits, "purchased", "Stripe credit purchase");
-
-		// Record payment
-		const amountCents = session.amount_total || 0;
-		const paymentIntentId =
-			typeof session.payment_intent === "string" ? session.payment_intent : null;
-
-		const paymentId = recordPayment(
-			userId,
-			paymentIntentId,
-			null,
-			amountCents,
-			"succeeded",
-			"credit_purchase",
-			`Credit purchase: ${credits} credits`,
-			{ package_id: packageId },
-		);
-
-		// Record revenue event
-		recordRevenueEvent(userId, "credit_purchase", amountCents, {
-			paymentId,
-			description: `Stripe credit purchase: ${credits} credits`,
-		});
-
-		// Update user metrics
-		updateUserMetrics(userId, amountCents);
-
-		console.log(`Granted ${credits} credits to user ${userId} via Stripe (${amountCents} cents)`);
+	// Delayed payment methods complete checkout before the money arrives; the grant happens on
+	// checkout.session.async_payment_succeeded instead.
+	if (session.payment_status !== "paid") {
+		console.log(`Checkout ${session.id} completed with payment_status=${session.payment_status}; not granting yet`);
+		return;
 	}
-	// Subscription bonus credits are handled by customer.subscription.created webhook
+
+	const db = getDb();
+	const customer = customerId(session.customer as string | null);
+	const userId = session.metadata?.user_id || (customer ? getUserIdFromStripeCustomer(customer) : null);
+	if (!userId || !db.prepare("SELECT 1 FROM users WHERE id = ?").get(userId)) {
+		alert("Paid credit checkout can't be mapped to a user", { session: session.id, customer, userId });
+		throw new RetryableWebhookError(`No user for checkout ${session.id}`);
+	}
+
+	const credits = Number(session.metadata?.credits);
+	const packageId = session.metadata?.package_id;
+	if (!Number.isInteger(credits) || credits <= 0) {
+		alert("Paid credit checkout has invalid credits metadata", { session: session.id, metadata: session.metadata });
+		throw new RetryableWebhookError(`Invalid credits metadata on ${session.id}`);
+	}
+
+	const paymentIntentId = typeof session.payment_intent === "string" ? session.payment_intent : null;
+	if (paymentIntentId && db.prepare("SELECT 1 FROM payments WHERE stripe_payment_intent_id = ?").get(paymentIntentId)) {
+		console.log(`Checkout ${session.id} already granted (payment intent ${paymentIntentId}); skipping`);
+		return;
+	}
+
+	addCredits(userId, credits, "purchased", "Stripe credit purchase");
+
+	const amountCents = session.amount_total || 0;
+	const paymentId = recordPayment(
+		userId,
+		paymentIntentId,
+		null,
+		amountCents,
+		"succeeded",
+		"credit_purchase",
+		`Credit purchase: ${credits} credits`,
+		{ package_id: packageId, checkout_session: session.id },
+	);
+
+	recordRevenueEvent(userId, "credit_purchase", amountCents, {
+		paymentId,
+		description: `Stripe credit purchase: ${credits} credits`,
+	});
+
+	updateUserMetrics(userId, amountCents);
+	console.log(`Granted ${credits} credits to user ${userId} via Stripe (${amountCents} cents)`);
 }

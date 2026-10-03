@@ -1,7 +1,9 @@
+import type { SQLQueryBindings } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
+import { hashPassword, normalizeEmail } from "./auth";
 import { sendWelcomeEmail } from "../services/email";
 import { calculateGenerationCost, MODELS } from "../services/replicate";
 import {
@@ -187,7 +189,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 			const yearMonth = getCurrentYearMonth();
 
 			let whereClause = "";
-			const params: unknown[] = [];
+			const params: SQLQueryBindings[] = [];
 
 			if (search) {
 				whereClause = "WHERE username LIKE ? OR email LIKE ?";
@@ -275,10 +277,11 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 		};
 	}>("/api/admin/users", async (request, reply) => {
 		const db = getDb();
-		const { username, email, password, sendEmail } = request.body;
+		const { username, password, sendEmail } = request.body;
+		const email = normalizeEmail(request.body.email);
 
 		if (!username || !email) {
-			return reply.status(400).send({ error: "Username and email are required" });
+			return reply.status(400).send({ error: "Username and a valid email are required" });
 		}
 
 		// Check if username already exists
@@ -296,10 +299,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 		// Generate password if not provided
 		const finalPassword = password || crypto.randomBytes(8).toString("base64").slice(0, 12);
 
-		// Hash password
-		const hasher = new Bun.CryptoHasher("sha256");
-		hasher.update(finalPassword);
-		const passwordHash = hasher.digest("hex");
+		const passwordHash = hashPassword(finalPassword);
 
 		const userId = crypto.randomUUID();
 
@@ -428,7 +428,16 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 	}>("/api/admin/users/:id", async (request, reply) => {
 		const db = getDb();
 		const { id } = request.params;
-		const { isAdmin, isActive, email } = request.body;
+		const { isAdmin, isActive } = request.body;
+		const rawEmail = request.body.email;
+		const email = rawEmail ? normalizeEmail(rawEmail) : rawEmail;
+		if (rawEmail && !email) {
+			return reply.status(400).send({ error: "Invalid email address" });
+		}
+		if (email) {
+			const other = db.prepare("SELECT id FROM users WHERE email = ? AND id != ?").get(email, id);
+			if (other) return reply.status(409).send({ error: "Email already in use" });
+		}
 
 		const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
 		if (!user) {
@@ -436,7 +445,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 		}
 
 		const updates: string[] = [];
-		const params: unknown[] = [];
+		const params: SQLQueryBindings[] = [];
 
 		if (isAdmin !== undefined) {
 			updates.push("is_admin = ?");
@@ -445,6 +454,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 		if (isActive !== undefined) {
 			updates.push("is_active = ?");
 			params.push(isActive ? 1 : 0);
+			// Deactivation revokes every outstanding session immediately
+			if (!isActive) updates.push("token_version = COALESCE(token_version, 0) + 1");
 		}
 		if (email !== undefined) {
 			updates.push("email = ?");
@@ -692,7 +703,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 		}
 
 		const updates: string[] = [];
-		const params: unknown[] = [];
+		const params: SQLQueryBindings[] = [];
 
 		if (name !== undefined) {
 			updates.push("name = ?");
