@@ -13,15 +13,21 @@ import { UserSettings } from "./components/UserSettings";
 import { ModelsHelpButton, ModelsReferenceModal } from "./components/ModelsReferenceModal";
 import { LoginPage } from "./components/auth/LoginPage";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import { getModelConfig, isVariationModel } from "./config/models";
+import { fallbackCreditCost, isVariationModel } from "./config/models";
 import { STARTER_PROMPTS, WelcomeScreen } from "./components/WelcomeScreen";
-import { fillPromptBar, type PendingPrompt, takePendingPrompt } from "./lib/pendingPrompt";
+import { type PendingPrompt, takePendingPrompt } from "./lib/pendingPrompt";
+import { CreditPill } from "./components/brand/CreditPill";
+import { opensPaywall } from "./components/billing/generationErrors";
+import { useCheckoutReturn } from "./components/billing/hooks";
+import { PaywallSheet } from "./components/billing/PaywallSheet";
+import { usePaywall } from "./contexts/PaywallContext";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { useEnhancePrompt, useGenerate, useHistory, useModels, useThreads, useUploads } from "./hooks/useApi";
-import { useTutorial, useUserSubscription, useUserUsage } from "./hooks/useUserSettings";
+import { useTutorial, useUserApiKey, useUserSubscription, useUserUsage } from "./hooks/useUserSettings";
 import { AdminLayout } from "./pages/AdminLayout";
 import { Billing } from "./pages/Billing";
 import { Landing } from "./pages/Landing";
+import { Pricing } from "./pages/Pricing";
 import { NotFound } from "./pages/NotFound";
 import { Privacy } from "./pages/Privacy";
 import { Terms } from "./pages/Terms";
@@ -79,7 +85,8 @@ function MainApp() {
 	const [generationQueue, setGenerationQueue] = useState<QueuedGeneration[]>([]);
 	const processingRef = useRef<Set<string>>(new Set());
 
-	const { generate, loading: generating, error: generateError } = useGenerate(token);
+	const { generate, loading: generating } = useGenerate(token);
+	const paywall = usePaywall();
 	const { enhance: enhancePrompt } = useEnhancePrompt(token);
 	const { models, fetchModels } = useModels();
 	const {
@@ -113,9 +120,29 @@ function MainApp() {
 	const { uploads, fetchUploads, archiveUpload, unarchiveUpload, deleteUpload } = useUploads(token);
 	const { usage: userUsage, fetchUsage: fetchUserUsage } = useUserUsage(token);
 	const { subscription: userSubscription, fetchSubscription: fetchUserSubscription } = useUserSubscription(token);
+	const { apiKeyInfo, fetchApiKey } = useUserApiKey(token);
+	const balance = userUsage?.availableCredits ?? null;
+
+	// Purchases (SOL in the sheet, or a return from Stripe) change the balance and maybe the plan.
+	const refreshCredits = useCallback(() => {
+		fetchUserUsage();
+		fetchUserSubscription();
+	}, [fetchUserUsage, fetchUserSubscription]);
+	useCheckoutReturn(refreshCredits);
+	// Own-key generations cost no credits, so the prompt bar shows no credit cost for them.
+	useEffect(() => {
+		if (token) fetchApiKey();
+	}, [token, fetchApiKey]);
+	useEffect(() => {
+		if (paywall.creditsVersion > 0) refreshCredits();
+	}, [paywall.creditsVersion, refreshCredits]);
 
 	const selectedModelInfo = models.find((m) => m.id === selectedModel);
 	const supportsImageInput = selectedModelInfo?.supportsImageInput || false;
+	// Cost of one Generate press at the current model: server price, config fallback while loading.
+	const perImageCost = selectedModelInfo?.creditCost ?? fallbackCreditCost(selectedModel);
+	const outputsPerGenerate = isVariationModel(selectedModel) ? 4 : 1;
+	const currentTotalCost = apiKeyInfo?.hasKey ? 0 : perImageCost * outputsPerGenerate;
 
 	// Get generations to display - either from active thread or empty for welcome screen
 	const displayGenerations = activeThread?.generations || [];
@@ -149,40 +176,64 @@ function MainApp() {
 				),
 			);
 
-			try {
-				const result = await generate(request);
+			// useGenerate never throws: failures come back with a code.
+			const result = await generate(request);
+			processingRef.current.delete(queueItem.id);
+			// Success charges credits; failures may have refunded them. Either way the pill updates.
+			fetchUserUsage();
 
-				if (result?.status === "succeeded") {
-					setGenerationQueue((prev) => prev.filter((item) => item.id !== queueItem.id));
-					// Refresh threads list and current thread
-					fetchThreads();
-					if (result.threadId) {
-						fetchThread(result.threadId);
-					}
-					// Refresh gallery history and usage counter
-					refreshHistory();
-					fetchUserUsage();
-				} else {
-					setGenerationQueue((prev) =>
-						prev.map((item) =>
-							item.id === queueItem.id
-								? { ...item, status: "failed", error: result?.error || "Generation failed" }
-								: item,
-						),
-					);
+			if (result.status === "succeeded") {
+				setGenerationQueue((prev) => prev.filter((item) => item.id !== queueItem.id));
+				// Refresh threads list and current thread
+				fetchThreads();
+				if (result.threadId) {
+					fetchThread(result.threadId);
 				}
-			} catch (err) {
-				setGenerationQueue((prev) =>
-					prev.map((item) =>
-						item.id === queueItem.id ? { ...item, status: "failed", error: String(err) } : item,
-					),
+				refreshHistory();
+				return;
+			}
+
+			const dismiss = () => setGenerationQueue((prev) => prev.filter((item) => item.id !== queueItem.id));
+			const retry = () => {
+				const fresh: QueuedGeneration = { ...queueItem, status: "queued", createdAt: new Date().toISOString() };
+				setGenerationQueue((prev) => prev.map((item) => (item.id === queueItem.id ? fresh : item)));
+				processGenerationRef.current?.(fresh, request);
+			};
+			setGenerationQueue((prev) =>
+				prev.map((item) =>
+					item.id === queueItem.id
+						? {
+								...item,
+								status: "failed",
+								error: result.error,
+								errorCode: result.code,
+								creditsNeeded: result.creditCost,
+								balanceAtFailure: result.availableCredits,
+								onRetry: retry,
+								onDismiss: dismiss,
+								onOpenSettings: () => setShowSettings(true),
+							}
+						: item,
+				),
+			);
+
+			// Out of credits or outside the plan: offer the way forward over the work.
+			if (opensPaywall(result.code)) {
+				paywall.open(
+					result.code === "MODEL_NOT_ALLOWED"
+						? { reason: "model_not_allowed", modelId: request.model }
+						: {
+								reason: "insufficient_credits",
+								needed: result.creditCost,
+								balance: result.availableCredits,
+							},
 				);
-			} finally {
-				processingRef.current.delete(queueItem.id);
 			}
 		},
-		[generate, fetchThreads, fetchThread, refreshHistory, models],
+		[generate, fetchThreads, fetchThread, refreshHistory, models, fetchUserUsage, paywall.open],
 	);
+	const processGenerationRef = useRef<typeof processGeneration | null>(null);
+	processGenerationRef.current = processGeneration;
 
 	const handleAddToInputs = useCallback(
 		(imageUrl: string) => {
@@ -224,6 +275,8 @@ function MainApp() {
 	const handleGenerateRef = useRef<((prompt: string) => void) | null>(null);
 	// undefined = not read yet; null = read, nothing pending (or already used).
 	const pendingRef = useRef<PendingPrompt | null | undefined>(undefined);
+	// Text to put in the prompt bar (starter prompt, pending prompt, example picks).
+	const [promptRequest, setPromptRequest] = useState<{ text: string; nonce: number } | null>(null);
 	const [pendingReady, setPendingReady] = useState(false);
 	const [pendingWaitedOut, setPendingWaitedOut] = useState(false);
 
@@ -242,7 +295,7 @@ function MainApp() {
 		// New accounts land with a sensible prompt in the bar instead of an empty one.
 		const isNewUser = (location.state as { isNewUser?: boolean } | null)?.isNewUser;
 		if (isNewUser || user.tutorialCompleted === false) {
-			requestAnimationFrame(() => fillPromptBar(STARTER_PROMPTS[0]));
+			setPromptRequest({ text: STARTER_PROMPTS[0], nonce: Date.now() });
 		}
 	}, [user, location.state]);
 
@@ -261,16 +314,16 @@ function MainApp() {
 		if (!(userUsage && userSubscription) && !pendingWaitedOut) return;
 		pendingRef.current = null;
 		setPendingReady(false);
-		const cost = getModelConfig(pending.model)?.pricing.creditCost ?? 2;
+		const cost = models.find((m) => m.id === pending.model)?.creditCost ?? fallbackCreditCost(pending.model);
 		const allowed = userSubscription?.subscription?.allowedModels;
 		const canUseModel = allowed == null || allowed.includes(pending.model);
 		const balance = userUsage?.availableCredits;
 		if (canUseModel && balance != null && balance >= cost && handleGenerateRef.current) {
 			handleGenerateRef.current(pending.prompt);
 		} else {
-			requestAnimationFrame(() => fillPromptBar(pending.prompt));
+			setPromptRequest({ text: pending.prompt, nonce: Date.now() });
 		}
-	}, [pendingReady, pendingWaitedOut, selectedModel, userUsage, userSubscription]);
+	}, [pendingReady, pendingWaitedOut, selectedModel, userUsage, userSubscription, models]);
 
 	// The tutorial is gone; the first generation marks it complete so the flag stays meaningful.
 	useEffect(() => {
@@ -542,7 +595,7 @@ function MainApp() {
 
 	// Examples on the empty state fill the prompt bar; nothing is spent until Generate.
 	const handlePromptPick = (prompt: string) => {
-		fillPromptBar(prompt);
+		setPromptRequest({ text: prompt, nonce: Date.now() });
 	};
 
 	return (
@@ -569,26 +622,23 @@ function MainApp() {
 			{/* Main Content */}
 			<main className="flex-1 flex flex-col min-w-0 overflow-hidden">
 				{/* Top Bar - Thread title, Settings gear and theme switcher */}
-				<div className="flex-shrink-0 flex items-center justify-between px-4 py-2 border-b border-[var(--border)]">
-					<div className="flex items-center gap-2">
+				<div className="flex flex-shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-2">
+					<div className="flex min-w-0 items-center gap-2">
 						{activeThread && (
-							<h2 className="text-sm font-medium text-[var(--text-primary)] truncate max-w-xs">
-								{activeThread.title}
-							</h2>
+							<h2 className="max-w-xs truncate text-sm font-medium text-foreground">{activeThread.title}</h2>
 						)}
 					</div>
-					<div className="flex items-center gap-3">
+					<div className="flex shrink-0 items-center gap-2 sm:gap-3">
 						<ModelsHelpButton onClick={() => setShowModelsRef(true)} />
-						{userUsage?.availableCredits != null && (
-							<div className="text-xs text-[var(--text-secondary)]">
-								Credits: <span className="text-[var(--accent)]">
-									{userUsage.availableCredits}
-								</span>
-							</div>
-						)}
+						<CreditPill
+							credits={balance}
+							lowAt={currentTotalCost * 2}
+							onClick={() => setViewMode("billing")}
+						/>
 						<ThemeSwitcher compact />
 					</div>
 				</div>
+				<PaywallSheet />
 
 				{/* Scrollable Content Area */}
 				<div className="flex-1 overflow-y-auto" ref={chatContainerRef}>
@@ -662,7 +712,18 @@ function MainApp() {
 				{/* Creation Panel - hide when viewing billing */}
 				{viewMode !== "billing" && (
 					<>
+						{/* Failures the current view doesn't already show, each with its own Retry/Dismiss */}
+						<div className="px-4 pb-2 empty:hidden">
+							<GenerationStatus
+								failures={generationQueue.filter(
+									(q) =>
+										q.status === "failed" &&
+										(viewMode !== "chat" || (!!activeThread && q.threadId !== activeThread.id)),
+								)}
+							/>
+						</div>
 						<CreationPanel
+							promptRequest={promptRequest}
 							models={models}
 							selectedModel={selectedModel}
 							onSelectModel={setSelectedModel}
@@ -678,12 +739,20 @@ function MainApp() {
 							loading={generating}
 							queueCount={generationQueue.filter(q => q.status !== 'failed').length}
 							allowedModels={userSubscription?.subscription?.allowedModels}
+							creditCost={perImageCost}
+							numOutputs={outputsPerGenerate}
+							balance={balance}
+							usesOwnKey={!!apiKeyInfo?.hasKey}
+							onNeedCredits={(needed) =>
+								// The low-balance hint opens it before the balance is actually short.
+								paywall.open(
+									balance !== null && balance >= needed
+										? { reason: "low_balance", balance }
+										: { reason: "insufficient_credits", needed, balance },
+								)
+							}
+							onLockedModel={(modelId) => paywall.open({ reason: "model_not_allowed", modelId })}
 						/>
-
-						{/* Generation status */}
-						<div className="px-4 pb-2">
-							<GenerationStatus loading={generating} error={generateError} />
-						</div>
 					</>
 				)}
 			</main>
@@ -717,7 +786,7 @@ function MainApp() {
 				allowedModels={userSubscription?.subscription?.allowedModels}
 				onUpgrade={() => {
 					setShowModelsRef(false);
-					window.location.href = "/billing";
+					paywall.open({ reason: "upgrade", balance });
 				}}
 			/>
 		</div>
@@ -783,6 +852,7 @@ function AppRoutes() {
 				/>
 			)}
 			<Route path="/auth/reset-password" element={<ResetPasswordPage />} />
+			<Route path="/pricing" element={<Pricing />} />
 			<Route
 				path="/billing"
 				element={

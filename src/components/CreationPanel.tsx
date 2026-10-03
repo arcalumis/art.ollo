@@ -1,14 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { CameraIcon, ChevronDownIcon, ImagesIcon, SparklesIcon, UploadIcon, XIcon } from "lucide-react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { API_BASE } from "../config";
-import { isVariationModel, modelRequiresImage } from "../config/models";
+import { getModelConfig, isVariationModel, modelRequiresImage } from "../config/models";
 import type { Model } from "../types";
-import { blobToFile, convertHeicToPng, findClosestAspectRatio, getImageDimensions, isHeicFile, resizeImageIfNeeded } from "../utils/imageResize";
+import {
+	blobToFile,
+	convertHeicToPng,
+	findClosestAspectRatio,
+	getImageDimensions,
+	isHeicFile,
+	resizeImageIfNeeded,
+} from "../utils/imageResize";
 import { ImagePicker } from "./ImagePicker";
-import { ImageRequiredTooltip, ModelInfoTooltip } from "./ModelInfoTooltip";
 
 // Aspect ratio options
 const ASPECT_RATIOS = [
-	{ value: "match_input_image", label: "Match Input" },
+	{ value: "match_input_image", label: "Match input" },
 	{ value: "1:1", label: "1:1" },
 	{ value: "4:3", label: "4:3" },
 	{ value: "3:4", label: "3:4" },
@@ -29,6 +38,8 @@ export interface CreationOptions {
 }
 
 interface CreationPanelProps {
+	/** Replaces the prompt text whenever `nonce` changes (starter prompts, example picks). */
+	promptRequest?: { text: string; nonce: number } | null;
 	// Model
 	models: Model[];
 	selectedModel: string;
@@ -55,9 +66,55 @@ interface CreationPanelProps {
 
 	// Subscription
 	allowedModels?: string[] | null;
+
+	// Credits
+	/** Per-image credit cost of the selected model (server value, fallback while loading). */
+	creditCost?: number;
+	/** Images one Generate produces (variation models make 4). */
+	numOutputs?: number;
+	/** Current balance; null while loading. */
+	balance?: number | null;
+	/** Generations run on the user's own Replicate key and cost no credits. */
+	usesOwnKey?: boolean;
+	/** The balance can't cover this generation: open the upgrade sheet. */
+	onNeedCredits?: (needed: number) => void;
+	/** A model outside the user's plan was picked: open the upgrade sheet. */
+	onLockedModel?: (modelId: string) => void;
 }
 
+function PillSelect({
+	label,
+	value,
+	onChange,
+	children,
+	className,
+}: {
+	label: string;
+	value: string;
+	onChange: (value: string) => void;
+	children: React.ReactNode;
+	className?: string;
+}) {
+	return (
+		<label className={cn("relative inline-flex shrink-0 items-center", className)}>
+			<span className="sr-only">{label}</span>
+			<select
+				value={value}
+				onChange={(e) => onChange(e.target.value)}
+				className="h-9 w-full cursor-pointer appearance-none truncate rounded-full border border-border bg-muted py-0 pr-8 pl-3 text-[0.82rem] font-medium text-foreground outline-none hover:border-foreground/30 focus-visible:ring-3 focus-visible:ring-ring/50"
+			>
+				{children}
+			</select>
+			<ChevronDownIcon className="pointer-events-none absolute right-2.5 size-3.5 text-muted-foreground" aria-hidden />
+		</label>
+	);
+}
+
+const iconPill =
+	"inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-full border border-border bg-muted px-3 text-[0.82rem] font-medium text-foreground outline-none hover:border-foreground/30 focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50";
+
 export function CreationPanel({
+	promptRequest,
 	models,
 	selectedModel,
 	onSelectModel,
@@ -73,6 +130,12 @@ export function CreationPanel({
 	loading,
 	queueCount,
 	allowedModels,
+	creditCost,
+	numOutputs = 1,
+	balance = null,
+	usesOwnKey = false,
+	onNeedCredits,
+	onLockedModel,
 }: CreationPanelProps) {
 	// Check if a model is available on the user's plan
 	const isModelAvailable = (modelId: string) => {
@@ -80,53 +143,62 @@ export function CreationPanel({
 		return allowedModels.includes(modelId);
 	};
 	const [prompt, setPrompt] = useState("");
+	useEffect(() => {
+		if (promptRequest) setPrompt(promptRequest.text);
+	}, [promptRequest]);
 	const [enhancing, setEnhancing] = useState(false);
 	const [uploading, setUploading] = useState(false);
 	const [converting, setConverting] = useState(false);
 	const [uploadError, setUploadError] = useState<string | null>(null);
 	const [showPicker, setShowPicker] = useState(false);
-	const [sparkling, setSparkling] = useState(false);
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	const cameraInputRef = useRef<HTMLInputElement>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
+	const reasonId = useId();
 
 	// Check if current model requires an image
 	const requiresImage = modelRequiresImage(selectedModel);
-	const needsImageHighlight = requiresImage && imageInputs.length === 0;
+	const needsImage = requiresImage && imageInputs.length === 0;
 
 	// Check if current model is a variation model (doesn't use prompts)
 	const isVariation = isVariationModel(selectedModel);
+
+	// Cost at the point of action.
+	const perImage = creditCost ?? getModelConfig(selectedModel)?.pricing.creditCost ?? 2;
+	const totalCost = perImage * numOutputs;
+	const cantAfford = !usesOwnKey && balance !== null && balance < totalCost;
+	const lowBalance = !usesOwnKey && !cantAfford && balance !== null && balance < totalCost * 2;
+	const costLabel = usesOwnKey ? "your Replicate key" : `${totalCost} ${totalCost === 1 ? "credit" : "credits"}`;
 
 	// Auto-resize textarea
 	useEffect(() => {
 		if (textareaRef.current) {
 			textareaRef.current.style.height = "auto";
 			const scrollHeight = textareaRef.current.scrollHeight;
-			textareaRef.current.style.height = `${Math.min(Math.max(scrollHeight, 120), 300)}px`;
+			textareaRef.current.style.height = `${Math.min(Math.max(scrollHeight, 72), 240)}px`;
 		}
 	}, [prompt]);
 
+	const canSubmit = isVariation ? imageInputs.length > 0 && !loading : !!prompt.trim() && !loading && !enhancing;
+
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
-		// For variation models, don't require a prompt - just need an image
-		if (isVariation) {
-			if (imageInputs.length > 0 && !loading && !enhancing) {
-				onGenerate(""); // Empty prompt for variations
-			}
+		if (!canSubmit) return;
+		// Not enough credits: show the upgrade sheet over the work instead of a failed request.
+		if (cantAfford) {
+			onNeedCredits?.(totalCost);
 			return;
 		}
-		if (prompt.trim() && !loading && !enhancing) {
-			onGenerate(prompt.trim());
-			setPrompt("");
+		if (isVariation) {
+			onGenerate(""); // Variation models take no prompt
+			return;
 		}
+		onGenerate(prompt.trim());
+		setPrompt("");
 	};
 
 	const handleEnhance = async () => {
 		if (!prompt.trim() || enhancing) return;
-		// Trigger sparkle animation
-		setSparkling(true);
-		setTimeout(() => setSparkling(false), 400);
-
 		setEnhancing(true);
 		try {
 			const enhanced = await onEnhance(prompt.trim(), imageInputs.length > 0);
@@ -145,6 +217,14 @@ export function CreationPanel({
 			e.preventDefault();
 			handleSubmit(e);
 		}
+	};
+
+	const handleModelChange = (id: string) => {
+		if (!isModelAvailable(id)) {
+			onLockedModel?.(id);
+			return;
+		}
+		onSelectModel(id);
 	};
 
 	// File upload handler
@@ -199,7 +279,7 @@ export function CreationPanel({
 						file = await convertHeicToPng(file);
 					} catch (err) {
 						console.error("HEIC conversion failed:", err);
-						errors.push(`Failed to convert ${file.name}`);
+						errors.push(`${file.name} couldn't be converted`);
 						continue;
 					} finally {
 						setConverting(false);
@@ -220,7 +300,7 @@ export function CreationPanel({
 					newUrls.push(upload.imageUrl);
 				} catch (err) {
 					console.error("Upload failed:", err);
-					errors.push(`Failed to upload ${file.name}`);
+					errors.push(`${file.name} didn't upload`);
 				}
 			}
 
@@ -239,12 +319,12 @@ export function CreationPanel({
 
 			onImagesChange([...imageInputs, ...newUrls]);
 			if (errors.length > 0) {
-				setUploadError(errors.join(", "));
+				setUploadError(`${errors.join(", ")}. Try again.`);
 				setTimeout(() => setUploadError(null), 5000);
 			}
 		} catch (err) {
 			console.error("Upload failed:", err);
-			setUploadError("Upload failed");
+			setUploadError("The upload didn't finish. Try again.");
 			setTimeout(() => setUploadError(null), 5000);
 		} finally {
 			setUploading(false);
@@ -262,220 +342,200 @@ export function CreationPanel({
 		onImagesChange(imageInputs.filter((u) => u !== url));
 	};
 
-	const isGenerating = queueCount > 0 || loading;
+	const atImageLimit = imageInputs.length >= maxImages;
+	const imageControlsDisabled = uploading || converting || atImageLimit;
+	const imageCopy = getModelConfig(selectedModel)?.category === "edit" ? "Add the image you want to edit." : "Add a reference image to vary.";
 
 	return (
-		<div className="border-t border-[var(--border)] py-4 px-4 bg-[var(--bg-secondary)]">
-			<form onSubmit={handleSubmit} className="max-w-4xl mx-auto">
-				{/* Desktop: 3-column layout | Mobile: vertical */}
-				<div className="flex flex-col md:flex-row gap-2 md:items-stretch">
-					{/* Column 1: Options (3 rows) */}
-					<div className="order-2 md:order-1 flex-shrink-0 flex flex-col gap-2">
-						{/* Row 1: Model Selector with Info */}
-						<div className="flex items-center gap-1.5">
-							<ModelInfoTooltip modelId={selectedModel} />
-							<select
-								value={selectedModel}
-								onChange={(e) => onSelectModel(e.target.value)}
-								className="cyber-input flex-1 w-full min-w-40 px-2 rounded text-xs text-[var(--text-primary)] flex items-center"
-							>
-								{models.map((m) => {
-									const available = isModelAvailable(m.id);
-									return (
-										<option
-											key={m.id}
-											value={m.id}
-											disabled={!available}
-											className={!available ? "text-gray-500" : ""}
-										>
-											{m.name}{!available ? " 🔒" : ""}
-										</option>
-									);
-								})}
-							</select>
-						</div>
-
-						{/* Row 2: Aspect Ratio & Resolution (shown for all models) */}
-						<div className="flex-1 flex gap-2">
-							<select
-								value={options.aspectRatio}
-								onChange={(e) => onOptionsChange({ ...options, aspectRatio: e.target.value })}
-								className="cyber-input flex-1 px-2 rounded text-xs text-[var(--text-primary)]"
-								title="Aspect Ratio"
-							>
-								{(supportsImageInput ? ASPECT_RATIOS : ASPECT_RATIOS.filter(r => r.value !== "match_input_image")).map((r) => (
-									<option key={r.value} value={r.value}>
-										{r.label}
-									</option>
-								))}
-							</select>
-							<select
-								value={options.resolution}
-								onChange={(e) => onOptionsChange({ ...options, resolution: e.target.value })}
-								className="cyber-input flex-1 px-2 rounded text-xs text-[var(--text-primary)]"
-								title="Resolution"
-							>
-								{RESOLUTIONS.map((r) => (
-									<option key={r.value} value={r.value}>
-										{r.label}
-									</option>
-								))}
-							</select>
-						</div>
-
-						{/* Row 3: Upload Buttons */}
-						{supportsImageInput && (
-							<div className="flex-1 flex gap-2">
-								{/* Camera button - opens camera directly on mobile */}
-								<button
-									type="button"
-									onClick={() => cameraInputRef.current?.click()}
-									disabled={uploading || converting || imageInputs.length >= maxImages}
-									className={`cyber-input hover:border-[var(--accent)] px-2 rounded text-xs cursor-pointer transition-all flex items-center justify-center ${
-										needsImageHighlight ? "border-[var(--accent)] sacred-glow" : ""
-									}`}
-									title="Take photo"
-								>
-									<svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-										<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
-										<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
-									</svg>
-								</button>
-								<input
-									ref={cameraInputRef}
-									type="file"
-									accept="image/*"
-									capture="environment"
-									onChange={handleFileInput}
-									className="hidden"
-								/>
-								{/* Upload button - opens file picker */}
-								<label className={`flex-1 cyber-input hover:border-[var(--accent)] px-2 rounded text-xs cursor-pointer transition-all flex items-center justify-center ${
-									needsImageHighlight ? "border-[var(--accent)] sacred-glow" : ""
-								}`}>
-									<input
-										ref={fileInputRef}
-										type="file"
-										accept="image/*,.heic,.heif"
-										multiple
-										onChange={handleFileInput}
-										className="hidden"
-										disabled={uploading || converting || imageInputs.length >= maxImages}
-									/>
-									{converting ? "Converting..." : uploading ? "Uploading..." : "+ Upload"}
-								</label>
-								<button
-									type="button"
-									onClick={() => setShowPicker(true)}
-									className={`flex-1 cyber-input hover:border-[var(--accent)] px-2 rounded text-xs transition-all flex items-center justify-center ${
-										needsImageHighlight ? "border-[var(--accent)] sacred-glow" : ""
-									}`}
-								>
-									Library
-								</button>
-							</div>
-						)}
-					</div>
-
-					{/* Column 2: Prompt or Image Required notice */}
-					<div className="order-1 md:order-2 flex-1 flex flex-col">
-						{/* Image Required Tooltip */}
-						<ImageRequiredTooltip modelId={selectedModel} show={needsImageHighlight} />
-						{!isVariation && (
-							<textarea
-								ref={textareaRef}
-								value={prompt}
-								onChange={(e) => setPrompt(e.target.value)}
-								onKeyDown={handleKeyDown}
-								placeholder="Describe your vision..."
-								disabled={enhancing}
-								className="cyber-input w-full h-full px-4 py-3 rounded-lg text-sm resize-none"
-								style={{ minHeight: "120px" }}
-							/>
-						)}
-					</div>
-
-					{/* Column 3: Action Buttons (2 rows) */}
-					<div className="order-3 flex md:flex-col gap-2">
-						{!isVariation && (
-							<button
-								type="button"
-								onClick={handleEnhance}
-								disabled={!prompt.trim() || enhancing || loading}
-								className={`enhance-btn flex-1 w-11 rounded-lg flex items-center justify-center ${sparkling ? "sparkling" : ""}`}
-								title="Enhance prompt with AI"
-							>
-								{enhancing ? (
-									<svg className="animate-spin w-5 h-5" viewBox="0 0 24 24">
-										<circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-										<path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-									</svg>
-								) : (
-									<svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-										<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
-									</svg>
-								)}
-							</button>
-						)}
-						<button
-							type="submit"
-							disabled={isVariation ? imageInputs.length === 0 || loading : !prompt.trim() || loading || enhancing}
-							className="submit-btn flex-1 w-11 rounded-lg flex items-center justify-center"
-							title={isVariation ? "Generate 4 variations" : "Generate"}
-						>
-							{isGenerating ? (
-								<span className="flex items-center gap-1">
-									<svg className="animate-spin w-5 h-5" viewBox="0 0 24 24">
-										<circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-										<path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-									</svg>
-									{queueCount > 0 && <span className="text-xs">{queueCount}</span>}
-								</span>
-							) : (
-								<svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-									<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-								</svg>
-							)}
-						</button>
-					</div>
-				</div>
-
-				{/* Upload Error Message */}
-				{uploadError && (
-					<div className="mt-2 px-3 py-2 bg-red-500/20 border border-red-500/50 rounded text-red-400 text-xs">
-						{uploadError}
-					</div>
-				)}
-
-				{/* Selected Images Thumbnails - Below the main layout */}
+		<div className="border-t border-border bg-card px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+			<form onSubmit={handleSubmit} className="mx-auto flex max-w-3xl flex-col gap-2.5">
+				{/* Selected reference images */}
 				{imageInputs.length > 0 && (
-					<div className="flex flex-wrap items-center gap-2 mt-3">
+					<div className="flex flex-wrap items-center gap-2">
 						{imageInputs.map((url) => {
 							const imgSrc = url.startsWith("http") ? url : `${API_BASE}${url}`;
 							return (
-								<div
+								<button
 									key={url}
+									type="button"
 									onClick={() => removeImage(url)}
-									onKeyDown={(e) => e.key === "Enter" && removeImage(url)}
-									role="button"
-									tabIndex={0}
-									className="w-10 h-10 rounded overflow-hidden hover:opacity-70 transition-opacity cursor-pointer bg-[var(--bg-tertiary)]"
-									style={{ minWidth: "40px", minHeight: "40px" }}
-									title="Click to remove"
+									className="group relative size-11 overflow-hidden rounded-lg bg-muted outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+									aria-label="Remove reference image"
 								>
-									<img
-										src={imgSrc}
-										alt="Input"
-										className="w-full h-full object-cover"
-									/>
-								</div>
+									<img src={imgSrc} alt="" className="size-full object-cover" />
+									<span className="absolute inset-0 hidden place-items-center bg-background/70 group-hover:grid group-focus-visible:grid">
+										<XIcon className="size-4 text-foreground" />
+									</span>
+								</button>
 							);
 						})}
-						<span className="text-xs text-[var(--text-secondary)] ml-1">
+						<span className="text-xs text-muted-foreground tabular-nums">
 							{imageInputs.length}/{maxImages}
 						</span>
 					</div>
 				)}
+
+				{needsImage && <p className="text-sm text-muted-foreground">{imageCopy}</p>}
+
+				{!isVariation && (
+					<label className="block">
+						<span className="sr-only">Prompt</span>
+						<textarea
+							ref={textareaRef}
+							value={prompt}
+							onChange={(e) => setPrompt(e.target.value)}
+							onKeyDown={handleKeyDown}
+							placeholder="Describe the image you want"
+							disabled={enhancing}
+							rows={2}
+							className="block w-full resize-none rounded-xl border border-border bg-muted px-4 py-3 text-[0.95rem] text-foreground outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/30 disabled:opacity-60"
+						/>
+					</label>
+				)}
+
+				{/* Settings as pills; scrolls inside itself on narrow screens, never the page. */}
+				<div className="-mx-4 flex items-center gap-2 overflow-x-auto px-4 pb-0.5 [scrollbar-width:none]">
+					<PillSelect label="Model" value={selectedModel} onChange={handleModelChange} className="max-w-[13rem]">
+						{models.map((m) => (
+							<option key={m.id} value={m.id}>
+								{m.name}
+								{isModelAvailable(m.id) ? "" : " (upgrade)"}
+							</option>
+						))}
+					</PillSelect>
+					<PillSelect
+						label="Aspect ratio"
+						value={options.aspectRatio}
+						onChange={(v) => onOptionsChange({ ...options, aspectRatio: v })}
+					>
+						{(supportsImageInput ? ASPECT_RATIOS : ASPECT_RATIOS.filter((r) => r.value !== "match_input_image")).map(
+							(r) => (
+								<option key={r.value} value={r.value}>
+									{r.label}
+								</option>
+							),
+						)}
+					</PillSelect>
+					<PillSelect
+						label="Resolution"
+						value={options.resolution}
+						onChange={(v) => onOptionsChange({ ...options, resolution: v })}
+					>
+						{RESOLUTIONS.map((r) => (
+							<option key={r.value} value={r.value}>
+								{r.label}
+							</option>
+						))}
+					</PillSelect>
+
+					{supportsImageInput && (
+						<>
+							<button
+								type="button"
+								onClick={() => cameraInputRef.current?.click()}
+								disabled={imageControlsDisabled}
+								className={cn(iconPill, "w-9 px-0 md:hidden")}
+								aria-label="Take a photo"
+							>
+								<CameraIcon className="size-4" />
+							</button>
+							<input
+								ref={cameraInputRef}
+								type="file"
+								accept="image/*"
+								capture="environment"
+								onChange={handleFileInput}
+								className="hidden"
+							/>
+							<button
+								type="button"
+								onClick={() => fileInputRef.current?.click()}
+								disabled={imageControlsDisabled}
+								className={cn(iconPill, needsImage && "border-verdigris")}
+							>
+								<UploadIcon className="size-3.5" />
+								{converting ? "Converting…" : uploading ? "Uploading…" : "Upload"}
+							</button>
+							<input
+								ref={fileInputRef}
+								type="file"
+								accept="image/*,.heic,.heif"
+								multiple
+								onChange={handleFileInput}
+								className="hidden"
+							/>
+							<button
+								type="button"
+								onClick={() => setShowPicker(true)}
+								disabled={atImageLimit}
+								className={cn(iconPill, needsImage && "border-verdigris")}
+							>
+								<ImagesIcon className="size-3.5" />
+								Library
+							</button>
+						</>
+					)}
+				</div>
+
+				{uploadError && (
+					<p className="text-sm text-destructive" role="alert">
+						{uploadError}
+					</p>
+				)}
+
+				<div className="flex items-center gap-2">
+					<div className="min-w-0 flex-1 text-[0.82rem] text-muted-foreground" id={reasonId} aria-live="polite">
+						{cantAfford ? (
+							<span>
+								This needs {totalCost} credits and you have {balance}.{" "}
+								<button
+									type="button"
+									onClick={() => onNeedCredits?.(totalCost)}
+									className="font-medium text-foreground underline underline-offset-4 hover:text-verdigris"
+								>
+									Top up
+								</button>
+							</span>
+						) : lowBalance ? (
+							<span>
+								{balance} {balance === 1 ? "credit" : "credits"} left ·{" "}
+								<button
+									type="button"
+									onClick={() => onNeedCredits?.(totalCost)}
+									className="font-medium text-foreground underline underline-offset-4 hover:text-verdigris"
+								>
+									Top up
+								</button>
+							</span>
+						) : queueCount > 0 ? (
+							<span>{queueCount === 1 ? "1 image in progress" : `${queueCount} images in progress`}</span>
+						) : null}
+					</div>
+
+					{!isVariation && (
+						<Button
+							type="button"
+							variant="ghost"
+							size="icon"
+							onClick={handleEnhance}
+							disabled={!prompt.trim() || enhancing || loading}
+							aria-label={enhancing ? "Improving prompt" : "Improve prompt"}
+							title="Improve prompt"
+						>
+							<SparklesIcon className={cn(enhancing && "opacity-50")} />
+						</Button>
+					)}
+					<Button
+						type="submit"
+						disabled={!canSubmit}
+						aria-disabled={cantAfford || undefined}
+						aria-describedby={cantAfford ? reasonId : undefined}
+						className={cn("px-5", cantAfford && "opacity-60")}
+					>
+						{isVariation ? "Make 4 variations" : "Generate"}
+						<span className="font-normal opacity-80">· {costLabel}</span>
+					</Button>
+				</div>
 			</form>
 
 			{/* Image Picker Modal */}

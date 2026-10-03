@@ -68,21 +68,3 @@ export function takePendingPrompt(): PendingPrompt | null {
 	if (pending) clearPendingPrompt();
 	return pending;
 }
-
-/**
- * Put text into the app's prompt bar without starting a generation.
- *
- * CreationPanel keeps its prompt in local state and has no prop for an initial
- * value, so this writes through the textarea's native value setter and fires
- * an input event, which React treats as typing. When CreationPanel grows an
- * `initialPrompt` prop, replace calls to this with that.
- */
-export function fillPromptBar(text: string): boolean {
-	const el = document.querySelector<HTMLTextAreaElement>("main form textarea");
-	if (!el) return false;
-	const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-	if (!setter) return false;
-	setter.call(el, text);
-	el.dispatchEvent(new Event("input", { bubbles: true }));
-	return true;
-}

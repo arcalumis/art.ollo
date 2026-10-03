@@ -13,11 +13,13 @@ import {
 	MODELS,
 	type GenerationResult,
 } from "../services/replicate";
+import { maybeSendLowCreditEmail } from "../services/email";
 import { recordPlatformCost } from "../services/replicate-billing";
 import { SAFE_IMAGE_FILENAME } from "../services/storage";
 import {
 	canUserGenerate,
 	canUserUseModel,
+	getAvailableCredits,
 	getModelCreditCost,
 	recordUsage,
 	refundReservation,
@@ -519,6 +521,13 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 					} catch (err) {
 						fastify.log.error(err, "Failed to record platform cost");
 					}
+				}
+
+				// Low-balance email (throttled, fire-and-forget; never affects the response).
+				if (!usedOwnKey) {
+					try {
+						void maybeSendLowCreditEmail(userId, getAvailableCredits(userId));
+					} catch {}
 				}
 
 				return {

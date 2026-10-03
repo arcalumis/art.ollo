@@ -31,6 +31,8 @@ export interface Model {
 	maxImages?: number;
 	avgGenerationTime?: number | null;
 	sampleCount?: number;
+	/** Per-image credit cost from the server (admin overrides applied). */
+	creditCost?: number;
 }
 
 export interface GenerateRequest {
@@ -46,12 +48,37 @@ export interface GenerateRequest {
 	seed?: number;
 }
 
+/** Machine-readable error codes from /api/generate, plus client-side ones. */
+export type GenerateErrorCode =
+	| "INSUFFICIENT_CREDITS"
+	| "MODEL_NOT_ALLOWED"
+	| "MONTHLY_COST_LIMIT"
+	| "INVALID_REQUEST"
+	| "INVALID_IMAGE_INPUT"
+	| "GENERATION_TIMEOUT"
+	| "GENERATION_CANCELED"
+	| "GENERATION_NO_OUTPUT"
+	| "GENERATION_FAILED"
+	| "API_KEY_UNREADABLE"
+	| "THREAD_NOT_FOUND"
+	| "RATE_LIMITED"
+	| "NETWORK_ERROR"
+	| "UNAUTHORIZED";
+
 export interface GenerateResponse {
 	id: string;
 	status: "starting" | "processing" | "succeeded" | "failed";
 	images?: { id: string; url: string; cost?: number }[];
 	cost?: number;
+	/** Server text; for logs only, never shown to users (UI branches on `code`). */
 	error?: string;
+	code?: GenerateErrorCode;
+	/** Total credits the request needed (on INSUFFICIENT_CREDITS). */
+	creditCost?: number;
+	availableCredits?: number;
+	model?: string;
+	creditsCharged?: number;
+	usedOwnKey?: boolean;
 	threadId?: string;
 }
 
@@ -222,10 +249,8 @@ export interface UserSubscriptionInfo {
 		description: string | null;
 		price: number;
 		allowedModels: string[] | null;
-	} | null;
-	limits: {
-		monthlyImageLimit: number | null;
-		monthlyCostLimit: number | null;
+		creditRefillAmount?: number;
+		topoffIntervalHours?: number;
 	} | null;
 }
 
@@ -265,7 +290,16 @@ export interface QueuedGeneration {
 	model: string;
 	status: "queued" | "generating" | "completed" | "failed";
 	createdAt: string;
+	/** Raw server text, kept for debugging only; the UI renders `errorCode`. */
 	error?: string;
+	errorCode?: GenerateErrorCode;
+	/** Credits the failed request needed and the balance at the time. */
+	creditsNeeded?: number;
+	balanceAtFailure?: number;
+	/** Set on failed items so the row can offer Retry / Dismiss in place. */
+	onRetry?: () => void;
+	onDismiss?: () => void;
+	onOpenSettings?: () => void;
 	result?: Generation;
 	startedAt?: string;
 	estimatedDuration?: number;
