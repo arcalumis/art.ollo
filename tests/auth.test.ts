@@ -204,7 +204,14 @@ describe("email flood protection", () => {
 
 	test("global daily cap blocks sends to anyone", async () => {
 		const prev = process.env.EMAIL_DAILY_CAP;
-		const used = (getDb().prepare("SELECT COUNT(*) AS n FROM email_send_log").get() as { n: number }).n;
+		// Auth mail has its own global budget (receipts and other transactional mail don't count).
+		const used = (
+			getDb()
+				.prepare(
+					"SELECT COUNT(*) AS n FROM email_send_log WHERE kind NOT IN ('receipt', 'payment_failed', 'low_credits', 'email_changed')",
+				)
+				.get() as { n: number }
+		).n;
 		process.env.EMAIL_DAILY_CAP = String(used);
 		try {
 			const res = await requestLink(uniqueEmail("global"));
@@ -465,5 +472,27 @@ describe("log redaction", () => {
 		expect(redactUrl("/x?a=1&signature=zzz&b=2")).toBe("/x?a=1&signature=%5BREDACTED%5D&b=2");
 		expect(redactUrl("/api/health")).toBe("/api/health");
 		expect(redactUrl("/x?q=token")).toBe("/x?q=token");
+	});
+});
+
+describe("sign out", () => {
+	test("POST /api/auth/logout ends this and every other session", async () => {
+		const app = await getApp();
+		const user = createUser();
+		const otherDevice = signToken({ userId: user.id, username: user.username, isAdmin: false });
+		const me = (token: string) =>
+			app.inject({ method: "GET", url: "/api/me", headers: { authorization: `Bearer ${token}` }, remoteAddress: ip() });
+		expect((await me(otherDevice)).statusCode).toBe(200);
+
+		expect((await app.inject({ method: "POST", url: "/api/auth/logout", remoteAddress: ip() })).statusCode).toBe(401);
+		const res = await app.inject({ method: "POST", url: "/api/auth/logout", headers: authHeader(user), remoteAddress: ip() });
+		expect(res.statusCode).toBe(200);
+		expect((await me(user.token)).statusCode).toBe(401);
+		expect((await me(otherDevice)).statusCode).toBe(401);
+		// A replayed logout with the revoked token does nothing
+		expect(
+			(await app.inject({ method: "POST", url: "/api/auth/logout", headers: authHeader(user), remoteAddress: ip() }))
+				.statusCode,
+		).toBe(401);
 	});
 });

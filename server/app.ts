@@ -132,6 +132,23 @@ export async function buildApp(opts: { logger?: boolean } = {}): Promise<Fastify
 		},
 	});
 
+	// SVGs are served from our own origin, so a browser opening one directly treats it as a
+	// document. Sandbox it (no script, no same-origin access) and forbid content sniffing.
+	fastify.addHook("onSend", async (request, reply, payload) => {
+		let pathname = request.url.split("?")[0];
+		try {
+			pathname = decodeURIComponent(pathname);
+		} catch {
+			// malformed escapes: check the raw path
+		}
+		pathname = pathname.toLowerCase();
+		if ((pathname.startsWith("/images/") || pathname.startsWith("/uploads/")) && pathname.endsWith(".svg")) {
+			reply.header("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'");
+			reply.header("X-Content-Type-Options", "nosniff");
+		}
+		return payload;
+	});
+
 	// Serve generated images
 	await fastify.register(fastifyStatic, {
 		root: path.join(process.cwd(), "generated-images"),

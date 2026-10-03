@@ -69,39 +69,84 @@ function escapeHtml(value: string): string {
 
 // ---- Flood protection ----
 
-const PER_RECIPIENT_HOURLY = 3;
-const PER_RECIPIENT_DAILY = 10;
+/**
+ * Mail the user's own payments and balance trigger. It has its own budget (per recipient and
+ * global), so a flood of sign-in requests can never use up the room receipts need.
+ */
+const TRANSACTIONAL_KINDS = ["receipt", "payment_failed", "low_credits", "email_changed"] as const;
+const TRANSACTIONAL_SET = new Set<string>(TRANSACTIONAL_KINDS);
+const TRANSACTIONAL_SQL_LIST = TRANSACTIONAL_KINDS.map((k) => `'${k}'`).join(", ");
 
-function dailyCap(): number {
-	const n = Number(process.env.EMAIL_DAILY_CAP);
-	return Number.isFinite(n) && n > 0 ? n : 500;
+interface Budget {
+	recipientHourly: number;
+	recipientDaily: number;
+	globalDaily: number;
+	/** Only for mail a visitor can trigger (auth); transactional mail has no requesting IP. */
+	ipDaily: number | null;
+}
+
+function envCap(name: string, fallback: number): number {
+	const n = Number(process.env[name]);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function budgetFor(transactional: boolean): Budget {
+	return transactional
+		? {
+				recipientHourly: 10,
+				recipientDaily: 20,
+				globalDaily: envCap("EMAIL_TRANSACTIONAL_DAILY_CAP", 500),
+				ipDaily: null,
+			}
+		: {
+				recipientHourly: 3,
+				recipientDaily: 10,
+				globalDaily: envCap("EMAIL_DAILY_CAP", 500),
+				ipDaily: envCap("EMAIL_PER_IP_DAILY_CAP", 20),
+			};
 }
 
 /**
- * Reserve an auth-email send for `recipient`. Returns false (and records nothing) when the
- * recipient's hourly/daily cap or the global daily cap is exhausted. Check + insert run in one
- * transaction so concurrent requests cannot both squeeze past the limit.
+ * Reserve an email send for `recipient`. Returns false (and records nothing) when a cap for the
+ * kind's budget is exhausted: per recipient (hourly/daily), per requesting IP (daily, auth mail
+ * only) or global (daily). Check + insert run in one transaction so concurrent requests cannot
+ * both squeeze past a limit.
  */
 export function reserveEmailSend(recipient: string, kind: string, ip?: string): boolean {
 	const db = getDb();
+	const transactional = TRANSACTIONAL_SET.has(kind);
+	const budget = budgetFor(transactional);
+	const inBudget = transactional ? `kind IN (${TRANSACTIONAL_SQL_LIST})` : `kind NOT IN (${TRANSACTIONAL_SQL_LIST})`;
 	return db.transaction(() => {
 		const counts = db
 			.prepare(`
 				SELECT
 					SUM(CASE WHEN recipient = ? AND created_at > datetime('now', '-1 hour') THEN 1 ELSE 0 END) AS hour,
 					SUM(CASE WHEN recipient = ? THEN 1 ELSE 0 END) AS day,
+					SUM(CASE WHEN ip IS NOT NULL AND ip = ? THEN 1 ELSE 0 END) AS from_ip,
 					COUNT(*) AS total
 				FROM email_send_log
-				WHERE created_at > datetime('now', '-1 day')
+				WHERE created_at > datetime('now', '-1 day') AND ${inBudget}
 			`)
-			.get(recipient, recipient) as { hour: number | null; day: number | null; total: number };
+			.get(recipient, recipient, ip ?? null) as {
+			hour: number | null;
+			day: number | null;
+			from_ip: number | null;
+			total: number;
+		};
 
-		if ((counts.hour ?? 0) >= PER_RECIPIENT_HOURLY || (counts.day ?? 0) >= PER_RECIPIENT_DAILY) {
+		if ((counts.hour ?? 0) >= budget.recipientHourly || (counts.day ?? 0) >= budget.recipientDaily) {
 			console.warn(`[email] Per-recipient cap reached for ${recipient} (${kind}); not sending`);
 			return false;
 		}
-		if (counts.total >= dailyCap()) {
-			console.error(`[email] GLOBAL daily email cap (${dailyCap()}) reached; not sending ${kind}`);
+		if (ip && budget.ipDaily !== null && (counts.from_ip ?? 0) >= budget.ipDaily) {
+			console.warn(`[email] Per-IP daily cap reached for ${ip} (${kind}); not sending`);
+			return false;
+		}
+		if (counts.total >= budget.globalDaily) {
+			console.error(
+				`[email] GLOBAL daily ${transactional ? "transactional" : "auth"} email cap (${budget.globalDaily}) reached; not sending ${kind}`,
+			);
 			return false;
 		}
 		db.prepare("INSERT INTO email_send_log (id, recipient, kind, ip) VALUES (?, ?, ?, ?)").run(
@@ -395,6 +440,50 @@ export async function sendEmailChangeEmail(to: string, username: string, token: 
 	});
 }
 
+/**
+ * "Confirm it's you" link for a sensitive account change (email or password). Sent to the
+ * account's CURRENT address. The caller reserves the send first.
+ */
+export async function sendReauthEmail(to: string, username: string, token: string): Promise<SendResult> {
+	const url = `${APP_URL}/settings?reauth=${token}`;
+	return sendEmail({
+		to,
+		subject: "Confirm it's you on ollo.art",
+		devLink: url,
+		html: plainLayout({
+			heading: "Confirm it's you",
+			paragraphs: [
+				`Hi ${escapeHtml(username)}, someone signed in to your ollo.art account asked to change its email or password.`,
+				"If that was you, open the link below on the same device to continue. The link expires in 15 minutes.",
+			],
+			buttonUrl: url,
+			buttonLabel: "Confirm it's me",
+			footer:
+				"If this wasn't you, don't open the link. Your account is unchanged. Sign out everywhere from Settings, or reply to this email or write to support@matahari.dev for help.",
+		}),
+	});
+}
+
+/** Sent to the OLD address after the sign-in email changed, so a takeover can't go unnoticed. */
+export async function sendEmailChangedNotice(to: string, username: string, newEmail: string): Promise<SendResult> {
+	if (!reserveEmailSend(to, "email_changed")) return { success: false, error: "Send cap reached" };
+	return sendEmail({
+		to,
+		subject: "Your ollo.art email was changed",
+		html: plainLayout({
+			heading: "Your sign-in email was changed",
+			paragraphs: [
+				`Hi ${escapeHtml(username)}, the email on your ollo.art account was changed to <strong>${escapeHtml(newEmail)}</strong>. Sign-in links, receipts and notices now go there, and this address no longer works for signing in.`,
+				"If you made this change, there's nothing else to do.",
+				"If you didn't, reply to this email or write to <a href=\"mailto:support@matahari.dev\" style=\"color: #2d6f61;\">support@matahari.dev</a> from this address and we'll help you get the account back.",
+			],
+			buttonUrl: "mailto:support@matahari.dev",
+			buttonLabel: "Contact support",
+			footer: "We send this notice to your previous address every time the account email changes.",
+		}),
+	});
+}
+
 function userEmail(userId: string): string | null {
 	const row = getDb().prepare("SELECT email FROM users WHERE id = ?").get(userId) as
 		| { email: string | null }
@@ -410,24 +499,46 @@ function claimTransactional(dedupeKey: string, userId: string, kind: string): bo
 	return result.changes === 1;
 }
 
-async function safely(label: string, send: () => Promise<SendResult>): Promise<void> {
+/** Give a dedupe key back after a send that didn't happen, so a later trigger can retry it. */
+function releaseTransactional(dedupeKey: string): void {
+	getDb().prepare("DELETE FROM transactional_email_log WHERE dedupe_key = ?").run(dedupeKey);
+}
+
+/** Returns whether the email went out. Never throws. */
+async function safely(label: string, send: () => Promise<SendResult>): Promise<boolean> {
 	try {
 		const result = await send();
 		if (!result.success) console.warn(`[email] ${label} not sent: ${result.error}`);
+		return result.success;
 	} catch (err) {
 		console.error(`[email] ${label} failed:`, err instanceof Error ? err.message : err);
+		return false;
+	}
+}
+
+/**
+ * Claim the dedupe key (so concurrent triggers send once), send, and release the key if the
+ * send didn't happen (send cap, provider error) so it isn't marked as sent forever.
+ */
+async function sendOnce(
+	dedupeKey: string,
+	userId: string,
+	kind: string,
+	send: (to: string) => Promise<SendResult>,
+): Promise<void> {
+	try {
+		const to = userEmail(userId);
+		if (!to || !claimTransactional(dedupeKey, userId, kind)) return;
+		const ok = await safely(kind, () => send(to));
+		if (!ok) releaseTransactional(dedupeKey);
+	} catch (err) {
+		console.error(`[email] ${kind} failed:`, err instanceof Error ? err.message : err);
 	}
 }
 
 /** Send a receipt at most once per dedupe key (e.g. `receipt:<invoice id>`). Never throws. */
 export async function sendReceiptOnce(userId: string, dedupeKey: string, data: ReceiptData): Promise<void> {
-	try {
-		const to = userEmail(userId);
-		if (!to || !claimTransactional(dedupeKey, userId, "receipt")) return;
-		await safely("receipt", () => sendPaymentReceiptEmail(to, data));
-	} catch (err) {
-		console.error("[email] receipt failed:", err instanceof Error ? err.message : err);
-	}
+	await sendOnce(dedupeKey, userId, "receipt", (to) => sendPaymentReceiptEmail(to, data));
 }
 
 /** Send a payment-failed notice at most once per dedupe key (e.g. `failed:<invoice id>`). Never throws. */
@@ -436,13 +547,7 @@ export async function sendPaymentFailedOnce(
 	dedupeKey: string,
 	data: { amountCents: number; currency?: string },
 ): Promise<void> {
-	try {
-		const to = userEmail(userId);
-		if (!to || !claimTransactional(dedupeKey, userId, "payment_failed")) return;
-		await safely("payment failed", () => sendPaymentFailedEmail(to, data));
-	} catch (err) {
-		console.error("[email] payment failed notice failed:", err instanceof Error ? err.message : err);
-	}
+	await sendOnce(dedupeKey, userId, "payment_failed", (to) => sendPaymentFailedEmail(to, data));
 }
 
 export const LOW_CREDIT_THRESHOLD = 5;

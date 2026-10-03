@@ -101,6 +101,7 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 			return {
 				paymentId: payment.paymentId,
 				recipientWallet: payment.recipientWallet,
+				reference: payment.reference,
 				amountLamports: payment.amountLamports,
 				amountSol: payment.amountSol,
 				credits: payment.credits,
@@ -251,6 +252,7 @@ export async function solanaBillingRoutes(fastify: FastifyInstance): Promise<voi
 			return {
 				paymentId: payment.paymentId,
 				recipientWallet: payment.recipientWallet,
+				reference: payment.reference,
 				amountLamports: payment.amountLamports,
 				amountSol: payment.amountSol,
 				productName: payment.productName,

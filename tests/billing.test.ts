@@ -1,9 +1,10 @@
 import "./inject-bun-fix";
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import crypto from "node:crypto";
 import { getDb } from "../server/db";
 import { dedupeActiveSubscriptions, initializeSchema } from "../server/db/schema";
+import { type OutgoingEmail, setEmailTransport } from "../server/services/email";
 import * as stripeService from "../server/services/stripe";
 import { assignSubscription, getUserSubscription } from "../server/services/usage";
 import { authHeader, createUser, creditBalance, getApp } from "./helpers";
@@ -17,6 +18,11 @@ beforeAll(() => {
 	}) as unknown as typeof fetch);
 });
 afterAll(() => fetchSpy.mockRestore());
+
+function stripeClient() {
+	if (!stripeService.stripe) throw new Error("Stripe client not configured in tests");
+	return stripeService.stripe;
+}
 
 function rid(prefix: string): string {
 	return `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
@@ -40,10 +46,10 @@ function linkCustomer(userId: string): string {
 	return customer;
 }
 
-async function sendEvent(type: string, object: Record<string, unknown>, id = rid("evt")) {
+async function sendEvent(type: string, object: Record<string, unknown>, id = rid("evt"), created?: number) {
 	const app = await getApp();
-	const payload = JSON.stringify({ id, object: "event", type, data: { object } });
-	const signature = await stripeService.stripe!.webhooks.generateTestHeaderStringAsync({ payload, secret: WEBHOOK_SECRET });
+	const payload = JSON.stringify({ id, object: "event", type, data: { object }, ...(created ? { created } : {}) });
+	const signature = await stripeClient().webhooks.generateTestHeaderStringAsync({ payload, secret: WEBHOOK_SECRET });
 	return app.inject({
 		method: "POST",
 		url: "/api/webhooks/stripe",
@@ -222,6 +228,98 @@ describe("stripe webhooks", () => {
 	});
 });
 
+describe("invoice retries on the same payment intent", () => {
+	function invoice(opts: { id: string; customer: string; pi: string; amount?: number }) {
+		return {
+			id: opts.id,
+			object: "invoice",
+			customer: opts.customer,
+			payment_intent: opts.pi,
+			subscription: rid("sub"),
+			amount_paid: opts.amount ?? 1500,
+			amount_due: opts.amount ?? 1500,
+			billing_reason: "subscription_cycle",
+			number: "INV-1",
+			currency: "usd",
+		};
+	}
+	function paymentRows(pi: string) {
+		return getDb().prepare("SELECT id, status, amount_cents FROM payments WHERE stripe_payment_intent_id = ?").all(pi) as Array<{
+			id: string;
+			status: string;
+			amount_cents: number;
+		}>;
+	}
+	function revenueCount(userId: string): number {
+		return (getDb().prepare("SELECT COUNT(*) AS n FROM revenue_events WHERE user_id = ?").get(userId) as { n: number }).n;
+	}
+	function totalPaid(userId: string): number {
+		const row = getDb().prepare("SELECT total_paid_cents FROM user_metrics WHERE user_id = ?").get(userId) as
+			| { total_paid_cents: number }
+			| undefined;
+		return row?.total_paid_cents ?? 0;
+	}
+	let mail: OutgoingEmail[] = [];
+	beforeAll(() =>
+		setEmailTransport(async (m) => {
+			mail.push(m);
+			return { success: true };
+		}),
+	);
+	afterAll(() => setEmailTransport(null));
+	beforeEach(() => {
+		mail = [];
+	});
+	/** Receipts actually sent to this user (emails go out after the webhook commits). */
+	async function receiptsSent(email: string): Promise<number> {
+		await Bun.sleep(5);
+		return mail.filter((m) => m.to === email && m.subject.includes("receipt")).length;
+	}
+
+	test("failed then paid: the failed row becomes succeeded, revenue recorded once", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const inv = invoice({ id: rid("in"), customer, pi: rid("pi") });
+		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["failed"]);
+		expect(revenueCount(user.id)).toBe(0);
+
+		expect((await sendEvent("invoice.paid", inv)).statusCode).toBe(200);
+		const rows = paymentRows(inv.payment_intent);
+		expect(rows.map((r) => r.status)).toEqual(["succeeded"]);
+		expect(revenueCount(user.id)).toBe(1);
+		expect(totalPaid(user.id)).toBe(1500);
+		expect(await receiptsSent(user.email)).toBe(1);
+	});
+
+	test("failed, failed, then paid all return 200 and end as one succeeded row", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const inv = invoice({ id: rid("in"), customer, pi: rid("pi") });
+		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
+		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent)).toHaveLength(1);
+		expect((await sendEvent("invoice.paid", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["succeeded"]);
+		expect(revenueCount(user.id)).toBe(1);
+		expect(totalPaid(user.id)).toBe(1500);
+	});
+
+	test("invoice.paid delivered three times (distinct events) counts once; a late failure doesn't downgrade", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const inv = invoice({ id: rid("in"), customer, pi: rid("pi") });
+		for (let i = 0; i < 3; i++) expect((await sendEvent("invoice.paid", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["succeeded"]);
+		expect(revenueCount(user.id)).toBe(1);
+		expect(totalPaid(user.id)).toBe(1500);
+		expect(await receiptsSent(user.email)).toBe(1);
+
+		expect((await sendEvent("invoice.payment_failed", inv)).statusCode).toBe(200);
+		expect(paymentRows(inv.payment_intent).map((r) => r.status)).toEqual(["succeeded"]);
+	});
+});
+
 describe("subscriptions", () => {
 	test("assignSubscription retires the previous active row", () => {
 		const user = createUser();
@@ -326,5 +424,108 @@ describe("billing checkout guards", () => {
 		});
 		expect(res.statusCode).toBe(409);
 		expect(res.json().usePortal).toBe(true);
+	});
+
+	function checkout(user: ReturnType<typeof createUser>, priceId: string) {
+		return getApp().then((app) =>
+			app.inject({
+				method: "POST",
+				url: "/api/billing/checkout",
+				headers: authHeader(user),
+				payload: { priceId, successUrl: "http://localhost:5173/ok", cancelUrl: "http://localhost:5173/no" },
+			}),
+		);
+	}
+
+	test("asks Stripe too: a live subscription not yet seen locally blocks a second checkout", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const product = makeProduct();
+		const s = stripeClient();
+		const list = spyOn(s.subscriptions, "list").mockResolvedValue({ data: [{ id: "sub_x", status: "past_due" }] } as never);
+		const create = spyOn(s.checkout.sessions, "create").mockResolvedValue({ url: "https://checkout.example/x" } as never);
+		try {
+			const res = await checkout(user, product.priceId);
+			expect(res.statusCode).toBe(409);
+			expect(res.json().usePortal).toBe(true);
+			expect(list).toHaveBeenCalledWith({ customer, status: "all", limit: 100 });
+			expect(create).not.toHaveBeenCalled();
+		} finally {
+			list.mockRestore();
+			create.mockRestore();
+		}
+	});
+
+	test("only ended subscriptions in Stripe: checkout proceeds and other open subscription checkouts are expired", async () => {
+		const user = createUser();
+		linkCustomer(user.id);
+		const product = makeProduct();
+		const s = stripeClient();
+		const list = spyOn(s.subscriptions, "list").mockResolvedValue({
+			data: [{ id: "sub_old", status: "canceled" }, { id: "sub_inc", status: "incomplete_expired" }],
+		} as never);
+		const openSessions = spyOn(s.checkout.sessions, "list").mockResolvedValue({
+			data: [
+				{ id: "cs_tab1", mode: "subscription" },
+				{ id: "cs_pack", mode: "payment" },
+			],
+		} as never);
+		const expire = spyOn(s.checkout.sessions, "expire").mockResolvedValue({} as never);
+		const create = spyOn(s.checkout.sessions, "create").mockResolvedValue({ url: "https://checkout.example/new" } as never);
+		try {
+			const res = await checkout(user, product.priceId);
+			expect(res.statusCode).toBe(200);
+			expect(res.json().url).toBe("https://checkout.example/new");
+			expect(expire.mock.calls.map((c) => c[0])).toEqual(["cs_tab1"]);
+			expect(create).toHaveBeenCalledTimes(1);
+		} finally {
+			list.mockRestore();
+			openSessions.mockRestore();
+			expire.mockRestore();
+			create.mockRestore();
+		}
+	});
+});
+
+describe("out-of-order subscription events", () => {
+	function status(sub: string): string | undefined {
+		const row = getDb().prepare("SELECT status FROM user_subscriptions WHERE stripe_subscription_id = ?").get(sub) as {
+			status: string;
+		} | null;
+		return row?.status;
+	}
+
+	test("an older subscription event delivered late doesn't overwrite newer state", async () => {
+		const user = createUser();
+		const customer = linkCustomer(user.id);
+		const product = makeProduct();
+		const sub = rid("sub");
+		const t = Math.floor(Date.now() / 1000);
+		const obj = (s: string) => subscriptionObject({ sub, customer, priceId: product.priceId, status: s });
+
+		expect((await sendEvent("customer.subscription.updated", obj("active"), rid("evt"), t)).statusCode).toBe(200);
+		// An older 'incomplete' arrives after the newer 'active': ignored, but acknowledged
+		const stale = rid("evt");
+		expect((await sendEvent("customer.subscription.updated", obj("incomplete"), stale, t - 60)).statusCode).toBe(200);
+		expect(isProcessed(stale)).toBe(true);
+		expect(status(sub)).toBe("active");
+
+		// A late, older payment failure doesn't flip it to past_due either
+		await sendEvent(
+			"invoice.payment_failed",
+			{ id: rid("in"), object: "invoice", customer, subscription: sub, payment_intent: rid("pi"), amount_due: 1500 },
+			rid("evt"),
+			t - 30,
+		);
+		expect(status(sub)).toBe("active");
+
+		// Newer events still apply
+		expect((await sendEvent("customer.subscription.updated", obj("past_due"), rid("evt"), t + 60)).statusCode).toBe(200);
+		expect(status(sub)).toBe("past_due");
+		expect((await sendEvent("customer.subscription.deleted", obj("canceled"), rid("evt"), t + 120)).statusCode).toBe(200);
+		expect(status(sub)).toBe("canceled");
+		// A stale 'active' after deletion can't resurrect it
+		await sendEvent("customer.subscription.updated", obj("active"), rid("evt"), t + 90);
+		expect(status(sub)).toBe("canceled");
 	});
 });

@@ -223,6 +223,25 @@ function isValidWalletAddress(address: string): boolean {
 	}
 }
 
+/**
+ * Check a signed wallet challenge (from /api/auth/wallet/challenge) and consume it atomically,
+ * so each challenge proves control of the wallet exactly once.
+ */
+export function verifyAndConsumeWalletChallenge(walletAddress: string, challenge: unknown, signature: unknown): boolean {
+	if (typeof challenge !== "string" || typeof signature !== "string" || !isValidWalletAddress(walletAddress)) return false;
+	const [nonce, timestamp] = challenge.split(":");
+	if (!nonce || !timestamp || !verifyWalletSignature(walletAddress, walletMessage(nonce, timestamp), signature)) {
+		return false;
+	}
+	const consumed = getDb()
+		.prepare(`
+			UPDATE wallet_challenges SET used_at = datetime('now')
+			WHERE challenge = ? AND wallet_address = ? AND used_at IS NULL AND expires_at > ?
+		`)
+		.run(challenge, walletAddress, new Date().toISOString());
+	return consumed.changes === 1;
+}
+
 function isActive(user: Pick<UserRow, "is_active">): boolean {
 	return user.is_active !== 0;
 }
@@ -336,6 +355,19 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
 				tutorialCompleted: !!row?.tutorial_completed_at,
 			},
 		};
+	});
+
+	// Sign out this and every other session: bumping token_version revokes all issued tokens.
+	fastify.post("/api/auth/logout", { preHandler: authMiddleware }, async (request) => {
+		const userId = request.user?.userId ?? "";
+		const db = getDb();
+		db.transaction(() => {
+			db.prepare("UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = ?").run(userId);
+			db.prepare(
+				"UPDATE account_reauth_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL",
+			).run(userId);
+		})();
+		return { success: true };
 	});
 
 	// ==================== Email auth ====================

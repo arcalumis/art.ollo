@@ -369,6 +369,91 @@ function pickExtension(
 const UNSAFE_SVG =
 	/<\s*(script|foreignObject|iframe|embed|object|use)\b|\son\w+\s*=|javascript:|data:text\/html|<!ENTITY/i;
 
+/** Drawing elements a vector illustration needs. Anything else (a, image, use, style, ...) is refused. */
+const SVG_ELEMENTS = new Set([
+	"svg",
+	"g",
+	"path",
+	"rect",
+	"circle",
+	"ellipse",
+	"line",
+	"polyline",
+	"polygon",
+	"defs",
+	"lineargradient",
+	"radialgradient",
+	"stop",
+	"clippath",
+	"mask",
+	"pattern",
+	"title",
+	"desc",
+	"metadata",
+	"text",
+	"tspan",
+	"filter",
+	"fegaussianblur",
+	"feoffset",
+	"feblend",
+	"fecolormatrix",
+	"feflood",
+	"fecomposite",
+	"femerge",
+	"femergenode",
+]);
+
+/** Decode numeric and the few named entities that can spell out a URL scheme. */
+function decodeEntities(value: string): string {
+	return value
+		.replace(/&#x([0-9a-f]+);?/gi, (_, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16) || 0))
+		.replace(/&#(\d+);?/g, (_, dec: string) => String.fromCodePoint(Number(dec) || 0))
+		.replace(/&colon;/gi, ":")
+		.replace(/&(tab|newline);/gi, "");
+}
+
+/**
+ * Is this SVG safe to serve from our own origin? Allowlist-style: strict UTF-8 without a BOM
+ * (UTF-16 and BOM-prefixed files can slip markup past text checks), only known drawing
+ * elements, no event handlers, only in-document (#id) references, and no script-capable URL
+ * schemes even when spelled with entities or whitespace.
+ */
+export function isSafeSvg(buffer: Buffer): boolean {
+	if (buffer.length >= 2 && ((buffer[0] === 0xff && buffer[1] === 0xfe) || (buffer[0] === 0xfe && buffer[1] === 0xff)))
+		return false;
+	if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) return false;
+	if (buffer.includes(0)) return false; // UTF-16 without a BOM, or binary
+	let text: string;
+	try {
+		text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+	} catch {
+		return false;
+	}
+	if (UNSAFE_SVG.test(text)) return false;
+	if (/<!DOCTYPE|<\?xml-stylesheet|<!\[CDATA\[/i.test(text)) return false;
+
+	const normalized = decodeEntities(text)
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters is the point
+		.replace(/[\s\u0000-\u001f]+/g, "")
+		.toLowerCase();
+	if (/javascript:|vbscript:|data:text\/html|data:image\/svg/.test(normalized)) return false;
+	if (/\son\w+\s*=/i.test(decodeEntities(text))) return false;
+
+	for (const match of text.matchAll(/<\s*([a-zA-Z][\w:.-]*)/g)) {
+		const name = match[1].toLowerCase();
+		const local = name.includes(":") ? name.slice(name.indexOf(":") + 1) : name;
+		if (!SVG_ELEMENTS.has(local)) return false;
+	}
+	// References must stay inside the document: href="#id", url(#id).
+	for (const match of text.matchAll(/(?:xlink:)?href\s*=\s*(["'])(.*?)\1/gi)) {
+		if (!decodeEntities(match[2]).trim().startsWith("#")) return false;
+	}
+	for (const match of text.matchAll(/url\(\s*(["']?)(.*?)\1\s*\)/gi)) {
+		if (!decodeEntities(match[2]).trim().startsWith("#")) return false;
+	}
+	return true;
+}
+
 /** One saved output with its official cost and real pixel size. */
 export interface GenerationResult {
 	id: string;
@@ -414,7 +499,7 @@ async function downloadAndSaveImage(
 	}
 
 	const ext = pickExtension(response.headers.get("content-type"), imageUrl, requestedFormat);
-	if (ext === "svg" && UNSAFE_SVG.test(buffer.toString("utf8"))) {
+	if (ext === "svg" && !isSafeSvg(buffer)) {
 		throw new Error("Generated SVG contained unsafe content");
 	}
 

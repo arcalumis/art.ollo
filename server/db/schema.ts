@@ -1119,4 +1119,40 @@ function runPhase1BMigrations(db: Database): void {
 	if (!hasColumn(db, "users", "deleted_at")) {
 		db.exec("ALTER TABLE users ADD COLUMN deleted_at DATETIME DEFAULT NULL");
 	}
+
+	// ---- Review fixes migrations ----
+	// Solana Pay reference key per payment request: the verifier requires it in the transaction's
+	// account keys, binding the on-chain transfer to exactly one pending payment.
+	for (const table of ["solana_transactions", "solana_subscription_transactions"]) {
+		if (!hasColumn(db, table, "reference")) {
+			db.exec(`ALTER TABLE ${table} ADD COLUMN reference TEXT DEFAULT NULL`);
+		}
+		db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_reference ON ${table}(reference) WHERE reference IS NOT NULL`);
+	}
+	// Recent re-authentication for sensitive account changes. 'link' rows are emailed to the
+	// current address; confirming one (or the current password, or a wallet signature) issues a
+	// short-lived 'sudo' row that the email/password endpoints require.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS account_reauth_tokens (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			kind TEXT NOT NULL CHECK (kind IN ('link', 'sudo')),
+			token_hash TEXT UNIQUE NOT NULL,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME DEFAULT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_account_reauth_tokens_user ON account_reauth_tokens(user_id);
+	`);
+	// Per-IP daily cap on auth email.
+	db.exec("CREATE INDEX IF NOT EXISTS idx_email_send_log_ip ON email_send_log(ip, created_at)");
+	// Newest Stripe event applied per subscription, so a late-delivered older event is ignored.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS stripe_subscription_event_state (
+			stripe_subscription_id TEXT PRIMARY KEY,
+			last_event_created INTEGER NOT NULL,
+			last_event_id TEXT NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`);
 }

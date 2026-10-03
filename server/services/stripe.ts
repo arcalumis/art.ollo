@@ -108,6 +108,8 @@ export async function createCheckoutSession(
 
 	if (!customerId) return null;
 
+	await expireOpenSubscriptionCheckouts(customerId);
+
 	const session = await stripe.checkout.sessions.create({
 		customer: customerId,
 		mode: "subscription",
@@ -236,7 +238,22 @@ export async function cancelSubscription(subscriptionId: string): Promise<boolea
 	}
 }
 
-// Record a payment in the database
+export interface RecordedPayment {
+	/** payments.id of the (new or existing) row. */
+	id: string;
+	/**
+	 * True only when this call moved the payment into 'succeeded' (new row, or a failed row that
+	 * a retry paid). Revenue, metrics and receipts key off this so they happen exactly once.
+	 */
+	becameSucceeded: boolean;
+}
+
+/**
+ * Record a payment, idempotently per Stripe payment intent (or, when there is no payment intent,
+ * per invoice). Stripe retries a failed invoice on the SAME payment intent, so a later attempt
+ * updates the existing row instead of tripping the UNIQUE constraint (which used to roll the
+ * webhook back and 500 forever). A succeeded row is never downgraded by a late failure event.
+ */
 export function recordPayment(
 	userId: string,
 	stripePaymentIntentId: string | null,
@@ -246,15 +263,48 @@ export function recordPayment(
 	paymentType: string,
 	description?: string,
 	metadata?: Record<string, unknown>,
-): string {
+): RecordedPayment {
 	const db = getDb();
-	const id = crypto.randomUUID();
+	const metadataJson = metadata ? JSON.stringify(metadata) : null;
+
+	const previous = (
+		stripePaymentIntentId
+			? db.prepare("SELECT id, status FROM payments WHERE stripe_payment_intent_id = ?").get(stripePaymentIntentId)
+			: stripeInvoiceId
+				? db
+						.prepare(
+							"SELECT id, status FROM payments WHERE stripe_invoice_id = ? AND stripe_payment_intent_id IS NULL ORDER BY created_at DESC LIMIT 1",
+						)
+						.get(stripeInvoiceId)
+				: undefined
+	) as { id: string; status: string } | undefined | null;
+
+	const becameSucceeded = status === "succeeded" && previous?.status !== "succeeded";
+	// Used only when no row exists yet (an existing row keeps its id through the upsert).
+	const newId = crypto.randomUUID();
+
+	if (previous && !stripePaymentIntentId) {
+		db.prepare(`
+			UPDATE payments SET status = ?, amount_cents = ?, payment_type = ?,
+				description = COALESCE(?, description), metadata = COALESCE(?, metadata)
+			WHERE id = ? AND status <> 'succeeded'
+		`).run(status, amountCents, paymentType, description ?? null, metadataJson, previous.id);
+		return { id: previous.id, becameSucceeded };
+	}
 
 	db.prepare(`
 		INSERT INTO payments (id, user_id, stripe_payment_intent_id, stripe_invoice_id, amount_cents, status, payment_type, description, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(stripe_payment_intent_id) DO UPDATE SET
+			status = excluded.status,
+			amount_cents = excluded.amount_cents,
+			stripe_invoice_id = COALESCE(excluded.stripe_invoice_id, payments.stripe_invoice_id),
+			payment_type = excluded.payment_type,
+			description = COALESCE(excluded.description, payments.description),
+			metadata = COALESCE(excluded.metadata, payments.metadata)
+		WHERE payments.status <> 'succeeded'
 	`).run(
-		id,
+		newId,
 		userId,
 		stripePaymentIntentId,
 		stripeInvoiceId,
@@ -262,10 +312,11 @@ export function recordPayment(
 		status,
 		paymentType,
 		description ?? null,
-		metadata ? JSON.stringify(metadata) : null,
+		metadataJson,
 	);
 
-	return id;
+	const id = previous?.id ?? newId;
+	return { id, becameSucceeded };
 }
 
 // Record a revenue event
@@ -384,6 +435,75 @@ export function syncStripeSubscription(
 	}
 
 	return { subscriptionId, bonusGranted };
+}
+
+/** Stripe statuses that mean the customer already has a subscription to manage, not a new one. */
+const LIVE_REMOTE_STATUSES = new Set(["active", "trialing", "past_due"]);
+
+/**
+ * Ask Stripe (not our possibly-lagging local rows) whether the user's customer already has a
+ * live subscription: a checkout completed in another tab may not have reached our webhook yet.
+ */
+export async function hasLiveSubscriptionInStripe(userId: string): Promise<boolean> {
+	if (!stripe) return false;
+	const customerId = getStripeCustomerId(userId);
+	if (!customerId) return false;
+	const subscriptions = await stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 });
+	return subscriptions.data.some((s) => LIVE_REMOTE_STATUSES.has(s.status));
+}
+
+/**
+ * Expire the customer's other open subscription Checkout Sessions, so two tabs can't both be
+ * completed into two subscriptions. Best effort: a failure here never blocks the new checkout.
+ */
+async function expireOpenSubscriptionCheckouts(customerId: string): Promise<void> {
+	if (!stripe) return;
+	try {
+		const open = await stripe.checkout.sessions.list({ customer: customerId, status: "open", limit: 100 });
+		for (const session of open.data) {
+			if (session.mode === "subscription") await stripe.checkout.sessions.expire(session.id);
+		}
+	} catch (err) {
+		console.warn("[stripe] Could not expire open checkout sessions:", err instanceof Error ? err.message : err);
+	}
+}
+
+/**
+ * Last Stripe event (by its `created` time) applied to a subscription. Events for one
+ * subscription can arrive out of order; an older one must not overwrite newer state.
+ */
+export function lastAppliedSubscriptionEvent(stripeSubscriptionId: string): number | null {
+	const row = getDb()
+		.prepare("SELECT last_event_created FROM stripe_subscription_event_state WHERE stripe_subscription_id = ?")
+		.get(stripeSubscriptionId) as { last_event_created: number } | null;
+	return row?.last_event_created ?? null;
+}
+
+/** True when an event created at `created` is older than what was already applied. */
+export function isStaleSubscriptionEvent(stripeSubscriptionId: string, created: number | undefined): boolean {
+	if (!created) return false;
+	const last = lastAppliedSubscriptionEvent(stripeSubscriptionId);
+	// Stripe timestamps are whole seconds, so equal times are applied (in arrival order).
+	return last !== null && created < last;
+}
+
+export function recordAppliedSubscriptionEvent(
+	stripeSubscriptionId: string,
+	eventId: string,
+	created: number | undefined,
+): void {
+	if (!created) return;
+	getDb()
+		.prepare(`
+			INSERT INTO stripe_subscription_event_state (stripe_subscription_id, last_event_created, last_event_id)
+			VALUES (?, ?, ?)
+			ON CONFLICT(stripe_subscription_id) DO UPDATE SET
+				last_event_created = excluded.last_event_created,
+				last_event_id = excluded.last_event_id,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE excluded.last_event_created >= stripe_subscription_event_state.last_event_created
+		`)
+		.run(stripeSubscriptionId, created, eventId);
 }
 
 /** Does the user already have a live Stripe subscription (should manage it in the portal)? */

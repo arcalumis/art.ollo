@@ -9,6 +9,7 @@ import {
 	getUserInvoices,
 	getUserSubscription,
 	hasLiveStripeSubscription,
+	hasLiveSubscriptionInStripe,
 	isStripeConfigured,
 } from "../services/stripe";
 import { getAvailableCredits } from "../services/usage";
@@ -291,7 +292,9 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			}
 
 			// One Stripe subscription per user: plan changes and payment fixes go through the portal
-			if (hasLiveStripeSubscription(userId)) {
+			// Local rows can lag (another tab's checkout may not have reached our webhook yet), so
+			// Stripe is asked too.
+			if (hasLiveStripeSubscription(userId) || (await hasLiveSubscriptionInStripe(userId))) {
 				return reply.status(409).send({
 					error: "You already have an active subscription. Manage or change it from the billing portal.",
 					code: "SUBSCRIPTION_EXISTS",

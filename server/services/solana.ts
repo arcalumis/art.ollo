@@ -1,5 +1,5 @@
 import type { SQLQueryBindings } from "bun:sqlite";
-import { Connection, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import crypto from "node:crypto";
 import { getDb } from "../db";
 import { parseDbTime } from "../db/schema";
@@ -142,6 +142,8 @@ export interface SolanaTransaction {
 export interface PendingPayment {
 	paymentId: string;
 	recipientWallet: string;
+	/** Solana Pay reference: must be added to the transfer as a read-only, non-signer account. */
+	reference: string;
 	amountLamports: number;
 	amountSol: number;
 	credits: number;
@@ -253,13 +255,14 @@ export function initiatePayment(
 	const db = getDb();
 	const paymentId = crypto.randomUUID();
 	const amountLamports = Math.round(pkg.priceSol * LAMPORTS_PER_SOL);
+	const reference = newPaymentReference();
 
 	// Create a placeholder transaction record (signature will be empty until verified)
 	// We use the paymentId as a temporary signature to track this pending payment
 	db.prepare(`
 		INSERT INTO solana_transactions
-		(id, user_id, wallet_address, transaction_signature, amount_lamports, amount_sol, credits_purchased, status, network)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+		(id, user_id, wallet_address, transaction_signature, amount_lamports, amount_sol, credits_purchased, status, network, reference)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
 	`).run(
 		paymentId,
 		userId,
@@ -269,11 +272,13 @@ export function initiatePayment(
 		pkg.priceSol,
 		pkg.credits,
 		SOLANA_NETWORK,
+		reference,
 	);
 
 	return {
 		paymentId,
 		recipientWallet: SOLANA_TREASURY_WALLET,
+		reference,
 		amountLamports,
 		amountSol: pkg.priceSol,
 		credits: pkg.credits,
@@ -299,6 +304,17 @@ interface PendingRow {
 	amount_lamports: number;
 	status: string;
 	created_at: string;
+	/** Solana Pay reference. NULL only on rows created before references existed. */
+	reference: string | null;
+}
+
+/**
+ * A fresh random public key that binds one payment request to one on-chain transaction (the
+ * Solana Pay "reference" pattern). Nobody holds its private key; it only has to appear in the
+ * transaction's account keys, which a third party's unrelated transfer never contains.
+ */
+function newPaymentReference(): string {
+	return Keypair.generate().publicKey.toBase58();
 }
 
 /** True when `walletAddress` is linked (wallet login) to a different account. */
@@ -361,13 +377,26 @@ function validatePaymentTransaction(tx: FinalizedTx, pending: PendingRow): strin
 	const loaded = tx.meta?.loadedAddresses;
 	const keys = [...staticKeys, ...(loaded?.writable ?? []), ...(loaded?.readonly ?? [])].map((k) => k.toBase58());
 
+	// The payment's reference key must be in the transaction. This is what proves the transfer
+	// was made for THIS payment request: the wallet address typed at initiate proves nothing, and
+	// anyone watching the treasury could otherwise claim someone else's transfer.
+	const createdAt = parseDbTime(pending.created_at);
+	if (pending.reference) {
+		if (!keys.includes(pending.reference)) {
+			return "Transaction was not made for this payment request";
+		}
+	} else if (createdAt === null || Date.now() - createdAt > LATE_PAYMENT_WINDOW_SECONDS * 1000) {
+		// Legacy rows (created before references) are honoured only within their original
+		// window. TODO: delete this branch once no reference-less pending rows remain.
+		return "This payment request has expired";
+	}
+
 	// Fee payer (first signer) must be the wallet recorded when the payment was initiated
 	if (keys[0] !== pending.wallet_address) {
 		return "Transaction was not sent from the wallet that initiated this payment";
 	}
 
 	// The transaction must not predate the pending payment (no reusing old transfers)
-	const createdAt = parseDbTime(pending.created_at);
 	if (!tx.blockTime || createdAt === null) {
 		return "Unable to determine transaction time";
 	}
@@ -427,7 +456,7 @@ export async function verifyAndCreditTransaction(
 	const db = getDb();
 	const pending = db
 		.prepare(`
-			SELECT id, user_id, wallet_address, amount_lamports, credits_purchased, status, created_at
+			SELECT id, user_id, wallet_address, amount_lamports, credits_purchased, status, created_at, reference
 			FROM solana_transactions
 			WHERE id = ? AND user_id = ?
 		`)
@@ -563,6 +592,8 @@ export interface SolanaSubscriptionProduct {
 export interface PendingSubscriptionPayment {
 	paymentId: string;
 	recipientWallet: string;
+	/** Solana Pay reference: must be added to the transfer as a read-only, non-signer account. */
+	reference: string;
 	amountLamports: number;
 	amountSol: number;
 	productName: string;
@@ -647,12 +678,13 @@ export function initiateSubscriptionPayment(
 
 	const paymentId = crypto.randomUUID();
 	const amountLamports = Math.round(product.price_sol * LAMPORTS_PER_SOL);
+	const reference = newPaymentReference();
 
 	// Create pending subscription transaction
 	db.prepare(`
 		INSERT INTO solana_subscription_transactions
-		(id, user_id, product_id, wallet_address, transaction_signature, amount_lamports, amount_sol, status, network)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+		(id, user_id, product_id, wallet_address, transaction_signature, amount_lamports, amount_sol, status, network, reference)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
 	`).run(
 		paymentId,
 		userId,
@@ -662,11 +694,13 @@ export function initiateSubscriptionPayment(
 		amountLamports,
 		product.price_sol,
 		SOLANA_NETWORK,
+		reference,
 	);
 
 	return {
 		paymentId,
 		recipientWallet: SOLANA_TREASURY_WALLET,
+		reference,
 		amountLamports,
 		amountSol: product.price_sol,
 		productName: product.name,
@@ -689,7 +723,7 @@ export async function verifyAndCreateSubscription(
 	const db = getDb();
 	const pending = db
 		.prepare(`
-			SELECT id, user_id, product_id, wallet_address, amount_lamports, status, created_at
+			SELECT id, user_id, product_id, wallet_address, amount_lamports, status, created_at, reference
 			FROM solana_subscription_transactions
 			WHERE id = ? AND user_id = ?
 		`)

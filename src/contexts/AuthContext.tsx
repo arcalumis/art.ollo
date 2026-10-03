@@ -51,6 +51,8 @@ interface AuthContextType {
 	requestWalletChallenge: (walletAddress: string) => Promise<WalletChallengeResponse | null>;
 	verifyWalletSignature: (data: WalletVerifyRequest) => Promise<WalletVerifyResponse | null>;
 	updateUser: (updates: Partial<User>) => void;
+	/** Switch to a token the server just issued (e.g. after the email changed and sessions reset). */
+	adoptToken: (token: string) => void;
 	logout: () => void;
 }
 
@@ -263,8 +265,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		setUser((prev) => (prev ? { ...prev, ...updates } : null));
 	}, []);
 
+	const adoptToken = useCallback((next: string) => {
+		try {
+			localStorage.setItem("token", next);
+		} catch {
+			// storage blocked: the session lasts for this page only
+		}
+		setToken(next);
+	}, []);
+
+	// Signing out ends every session on the server (best effort: local state clears regardless,
+	// e.g. offline, or after account deletion when the token is already revoked).
 	const logout = useCallback(() => {
+		const current = localStorage.getItem("token");
+		if (current) {
+			void fetch(`${API_BASE}/api/auth/logout`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${current}` },
+				keepalive: true,
+			}).catch(() => {});
+		}
 		localStorage.removeItem("token");
+		try {
+			localStorage.removeItem("ollo:sudo");
+		} catch {
+			// nothing stored
+		}
 		setToken(null);
 		setUser(null);
 	}, []);
@@ -285,6 +311,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 				requestWalletChallenge,
 				verifyWalletSignature,
 				updateUser,
+				adoptToken,
 				logout,
 			}}
 		>
