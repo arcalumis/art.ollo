@@ -1,43 +1,34 @@
 import type { SQLQueryBindings } from "bun:sqlite";
 import crypto from "node:crypto";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { getDb } from "../db";
 import { authMiddleware } from "../middleware/auth";
-import { hashPassword, normalizeEmail } from "./auth";
-import { sendWelcomeEmail } from "../services/email";
-import { calculateGenerationCost, MODELS } from "../services/replicate";
+import { writeAudit } from "../services/admin-audit";
+import { getUserDetail, listUsers } from "../services/admin-metrics";
 import {
-	cancelBoost,
-	getAllActiveBoosts,
-	getActiveBoost,
-	grantSubscriptionBoost,
-} from "../services/subscription-boost";
+	checkBoostDays,
+	checkCreditAmount,
+	checkCreditCost,
+	checkCreditPackage,
+	checkOverrideKey,
+	checkProductFields,
+	checkReason,
+} from "../services/admin-validation";
+import { reserveEmailSend, sendMagicLinkEmail } from "../services/email";
 import {
 	createCreditPackage,
 	deleteCreditPackage,
 	getAllCreditPackages,
-	getSolPriceHistory,
 	updateCreditPackage,
 } from "../services/solana";
-import {
-	addCredits,
-	assignSubscription,
-	deleteModelCreditCost,
-	getAllModelCreditCosts,
-	getCurrentYearMonth,
-	getUserUsageHistory,
-	setModelCreditCost,
-} from "../services/usage";
+import { cancelBoost, getActiveBoost, getAllActiveBoosts, grantSubscriptionBoost } from "../services/subscription-boost";
+import { createEmailToken } from "../services/tokens";
+import { addCredits, assignSubscription, deleteModelCreditCost, setModelCreditCost } from "../services/usage";
+import { adminConsoleRoutes } from "./admin-console";
+import { actorOf, rejected } from "./admin-helpers";
+import { hashPassword, normalizeEmail } from "./auth";
 
-interface UserRow {
-	id: string;
-	username: string;
-	email: string | null;
-	is_admin: number;
-	is_active: number;
-	created_at: string;
-	last_login: string | null;
-}
+const MAGIC_LINK_EXPIRY_MINUTES = Number(process.env.MAGIC_LINK_EXPIRY_MINUTES) || 15;
 
 interface ProductRow {
 	id: string;
@@ -55,1147 +46,787 @@ interface ProductRow {
 	allowed_models: string | null;
 	credit_refill_amount: number;
 	topoff_interval_hours: number;
+	stripe_price_id: string | null;
 	created_at: string;
 }
 
-interface UsageRow {
-	image_count: number;
-	total_cost: number;
-	used_own_key: number;
-}
-
-interface SubscriptionRow {
+interface UserStateRow {
 	id: string;
-	product_id: string;
-	product_name: string;
-	starts_at: string;
-	ends_at: string | null;
+	username: string;
+	email: string | null;
+	is_admin: number;
+	is_active: number | null;
+	deleted_at: string | null;
+	token_version: number | null;
 }
 
-interface CreditRow {
-	total: number;
-}
-
-interface StatsRow {
-	total_users: number;
-	total_generations: number;
-	total_cost: number;
-}
-
-interface ModelCostRow {
-	model: string;
-	count: number;
-	total_cost: number;
-	avg_predict_time: number | null;
-}
-
-interface GenerationRow {
-	id: string;
-	model: string;
-	width: number | null;
-	height: number | null;
-	parameters: string | null;
-	cost: number;
-}
-
-// Admin-only middleware
-async function adminMiddleware(
-	request: { user?: { userId: string; isAdmin: boolean } },
-	reply: { status: (code: number) => { send: (body: unknown) => void } },
-): Promise<void> {
+async function adminOnly(request: FastifyRequest, reply: FastifyReply): Promise<void> {
 	if (!request.user?.isAdmin) {
-		return reply.status(403).send({ error: "Admin access required" });
+		return reply.status(403).send({ error: "Admin access required", code: "ADMIN_REQUIRED" });
 	}
 }
 
-export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
-	// Apply auth middleware to all admin routes
-	fastify.addHook("preHandler", authMiddleware);
-	fastify.addHook("preHandler", adminMiddleware);
+function userState(id: string): UserStateRow | undefined {
+	return getDb()
+		.prepare("SELECT id, username, email, is_admin, is_active, deleted_at, token_version FROM users WHERE id = ?")
+		.get(id) as UserStateRow | undefined;
+}
 
-	// GET /api/admin/stats - Dashboard statistics
+function balanceOf(userId: string): number {
+	return (
+		getDb().prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM user_credits WHERE user_id = ?").get(userId) as {
+			total: number;
+		}
+	).total;
+}
+
+/** Other admins who can still sign in (active, not deleted). */
+function otherActiveAdmins(excludeId: string): number {
+	return (
+		getDb()
+			.prepare(
+				"SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND COALESCE(is_active, 1) = 1 AND deleted_at IS NULL AND id != ?",
+			)
+			.get(excludeId) as { n: number }
+	).n;
+}
+
+function productDto(product: ProductRow, activeUsers: number) {
+	let allowedModels: string[] | null = null;
+	try {
+		allowedModels = product.allowed_models ? JSON.parse(product.allowed_models) : null;
+	} catch {
+		allowedModels = null;
+	}
+	return {
+		id: product.id,
+		name: product.name,
+		description: product.description,
+		monthlyImageLimit: product.monthly_image_limit,
+		monthlyCostLimit: product.monthly_cost_limit,
+		dailyImageLimit: product.daily_image_limit,
+		bonusCredits: product.bonus_credits,
+		price: product.price,
+		priceSol: product.price_sol,
+		availableForUsd: product.available_for_usd === 1,
+		availableForSol: product.available_for_sol === 1,
+		isActive: product.is_active === 1,
+		allowedModels,
+		creditRefillAmount: product.credit_refill_amount || 0,
+		topoffIntervalHours: product.topoff_interval_hours || 24,
+		stripePriceId: product.stripe_price_id || null,
+		createdAt: product.created_at,
+		activeUsers,
+	};
+}
+
+function getProduct(id: string) {
+	const row = getDb().prepare("SELECT * FROM subscription_products WHERE id = ?").get(id) as ProductRow | undefined;
+	return row ? productDto(row, 0) : null;
+}
+
+/** Create a sign-in link for a user and email it (respects the per-recipient and global caps). */
+async function sendSignInLink(
+	user: { id: string; username: string; email: string | null },
+	ip: string,
+): Promise<{ ok: true } | { ok: false; status: number; code: string; error: string }> {
+	if (!user.email) return { ok: false, status: 400, code: "NO_EMAIL", error: "This user has no email address." };
+	if (!reserveEmailSend(user.email, "admin_magic_link", ip)) {
+		return {
+			ok: false,
+			status: 429,
+			code: "EMAIL_CAP",
+			error: "This address has had too many emails recently. Try again later.",
+		};
+	}
+	const token = createEmailToken({
+		userId: user.id,
+		type: "magic_link",
+		rememberMe: false,
+		expiresInMinutes: MAGIC_LINK_EXPIRY_MINUTES,
+	});
+	const result = await sendMagicLinkEmail(user.email, user.username, token, false);
+	if (!result.success) {
+		return { ok: false, status: 502, code: "EMAIL_FAILED", error: "The email couldn't be sent. Try again later." };
+	}
+	return { ok: true };
+}
+
+export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
+	fastify.addHook("preHandler", authMiddleware);
+	fastify.addHook("preHandler", adminOnly);
+
+	// Overview, subscriptions, payments, models, health, moderation, audit log.
+	await fastify.register(adminConsoleRoutes);
+
+	// Small totals (kept for older callers and session tests).
 	fastify.get("/api/admin/stats", async () => {
 		const db = getDb();
-		const yearMonth = getCurrentYearMonth();
-
-		const stats = db
+		const row = db
 			.prepare(
-				`SELECT
-				(SELECT COUNT(*) FROM users) as total_users,
-				(SELECT COUNT(*) FROM generations WHERE deleted_at IS NULL) as total_generations,
-				(SELECT COALESCE(SUM(cost), 0) FROM generations) as total_cost`,
+				"SELECT (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM generations WHERE deleted_at IS NULL) AS generations",
 			)
-			.get() as StatsRow;
-
-		const monthlyStats = db
-			.prepare(
-				`SELECT
-				COALESCE(SUM(image_count), 0) as image_count,
-				COALESCE(SUM(total_cost), 0) as total_cost
-			FROM usage_monthly WHERE year_month = ?`,
-			)
-			.get(yearMonth) as { image_count: number; total_cost: number };
-
-		// Cost breakdown by model
-		const costByModel = db
-			.prepare(
-				`SELECT
-					model,
-					COUNT(*) as count,
-					COALESCE(SUM(cost), 0) as total_cost,
-					AVG(predict_time) as avg_predict_time
-				FROM generations
-				WHERE deleted_at IS NULL
-				GROUP BY model
-				ORDER BY total_cost DESC`,
-			)
-			.all() as ModelCostRow[];
-
-		const recentUsers = db
-			.prepare(
-				`SELECT id, username, created_at
-			FROM users ORDER BY created_at DESC LIMIT 5`,
-			)
-			.all() as { id: string; username: string; created_at: string }[];
-
-		return {
-			totalUsers: stats.total_users,
-			totalGenerations: stats.total_generations,
-			totalCost: stats.total_cost,
-			thisMonth: {
-				imageCount: monthlyStats.image_count,
-				totalCost: monthlyStats.total_cost,
-			},
-			costByModel: costByModel.map((row) => ({
-				model: row.model,
-				count: row.count,
-				totalCost: row.total_cost,
-				avgPredictTime: row.avg_predict_time,
-				avgCostPerImage: row.count > 0 ? row.total_cost / row.count : 0,
-			})),
-			recentUsers,
-		};
+			.get() as { users: number; generations: number };
+		return { totalUsers: row.users, totalGenerations: row.generations };
 	});
 
-	// GET /api/admin/users - List all users
-	fastify.get<{ Querystring: { search?: string; page?: string; limit?: string } }>(
+	// ============================================
+	// USERS
+	// ============================================
+
+	fastify.get<{ Querystring: { search?: string; page?: string; limit?: string; filter?: string } }>(
 		"/api/admin/users",
-		async (request, reply) => {
-			const db = getDb();
-			const search = (request.query.search || "").slice(0, 100); // Max 100 chars
-			const page = Math.max(1, Number.parseInt(request.query.page || "1", 10) || 1);
-			const limit = Math.min(100, Math.max(1, Number.parseInt(request.query.limit || "20", 10) || 20));
-			const offset = (page - 1) * limit;
-			const yearMonth = getCurrentYearMonth();
-
-			let whereClause = "";
-			const params: SQLQueryBindings[] = [];
-
-			if (search) {
-				whereClause = "WHERE username LIKE ? OR email LIKE ?";
-				params.push(`%${search}%`, `%${search}%`);
-			}
-
-			const totalResult = db
-				.prepare(`SELECT COUNT(*) as count FROM users ${whereClause}`)
-				.get(...params) as { count: number };
-
-			const users = db
-				.prepare(`SELECT * FROM users ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
-				.all(...params, limit, offset) as UserRow[];
-
-			// Get usage and subscription for each user
-			const usersWithDetails = users.map((user) => {
-				const usage = db
-					.prepare(
-						"SELECT image_count, total_cost, used_own_key FROM usage_monthly WHERE user_id = ? AND year_month = ?",
-					)
-					.get(user.id, yearMonth) as UsageRow | undefined;
-
-				const subscription = db
-					.prepare(
-						`SELECT us.id, us.product_id, sp.name as product_name, us.starts_at, us.ends_at
-				FROM user_subscriptions us
-				JOIN subscription_products sp ON sp.id = us.product_id
-				WHERE us.user_id = ? AND (us.ends_at IS NULL OR us.ends_at > datetime('now'))
-				ORDER BY us.created_at DESC LIMIT 1`,
-					)
-					.get(user.id) as SubscriptionRow | undefined;
-
-				const credits = db
-					.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM user_credits WHERE user_id = ?")
-					.get(user.id) as CreditRow;
-
-				// Get 30-day usage history for the frequency bar
-				const dailyUsageHistory = getUserUsageHistory(user.id, 30);
-
-				return {
-					id: user.id,
-					username: user.username,
-					email: user.email,
-					isAdmin: user.is_admin === 1,
-					isActive: user.is_active === 1,
-					createdAt: user.created_at,
-					lastLogin: user.last_login,
-					currentMonth: usage
-						? {
-								imageCount: usage.image_count,
-								totalCost: usage.total_cost,
-								usedOwnKey: usage.used_own_key,
-							}
-						: { imageCount: 0, totalCost: 0, usedOwnKey: 0 },
-					subscription: subscription
-						? {
-								productId: subscription.product_id,
-								productName: subscription.product_name,
-								startsAt: subscription.starts_at,
-								endsAt: subscription.ends_at,
-							}
-						: null,
-					credits: credits.total,
-					dailyUsageHistory,
-				};
+		async (request) => {
+			return listUsers({
+				search: request.query.search,
+				page: Number.parseInt(request.query.page || "1", 10) || 1,
+				limit: Number.parseInt(request.query.limit || "25", 10) || 25,
+				filter: request.query.filter,
 			});
-
-			return {
-				users: usersWithDetails,
-				total: totalResult.count,
-				page,
-				limit,
-				totalPages: Math.ceil(totalResult.count / limit),
-			};
 		},
 	);
 
-	// POST /api/admin/users - Create new user
-	fastify.post<{
-		Body: {
-			username: string;
-			email: string;
-			password?: string;
-			sendEmail?: boolean;
-		};
-	}>("/api/admin/users", async (request, reply) => {
-		const db = getDb();
-		const { username, password, sendEmail } = request.body;
-		const email = normalizeEmail(request.body.email);
+	// Create a user. No password is generated or shown: the user gets a sign-in link by email.
+	fastify.post<{ Body: { username?: unknown; email?: unknown; sendLink?: boolean; reason?: unknown } }>(
+		"/api/admin/users",
+		async (request, reply) => {
+			const db = getDb();
+			const username = typeof request.body?.username === "string" ? request.body.username.trim() : "";
+			const email = normalizeEmail(request.body?.email);
+			if (!username || username.length > 50 || !email) {
+				return reply.status(400).send({ error: "Username and a valid email are required", code: "INVALID_USER" });
+			}
+			const reason = checkReason(request.body?.reason ?? "Created from the admin console");
+			if (rejected(reply, reason)) return;
+			if (db.prepare("SELECT id FROM users WHERE username = ?").get(username)) {
+				return reply.status(409).send({ error: "Username already exists", code: "USERNAME_TAKEN" });
+			}
+			if (db.prepare("SELECT id FROM users WHERE email = ?").get(email)) {
+				return reply.status(409).send({ error: "Email already in use", code: "EMAIL_TAKEN" });
+			}
 
-		if (!username || !email) {
-			return reply.status(400).send({ error: "Username and a valid email are required" });
-		}
+			const userId = crypto.randomUUID();
+			db.transaction(() => {
+				// A random password nobody ever sees (bcrypt, like every other hash); they sign in by link.
+				db.prepare(
+					"INSERT INTO users (id, username, password_hash, email, is_admin, is_active) VALUES (?, ?, ?, ?, 0, 1)",
+				).run(userId, username, hashPassword(crypto.randomBytes(24).toString("base64url")), email);
+				const free = db
+					.prepare("SELECT id FROM subscription_products WHERE name = 'Free' AND is_active = 1 LIMIT 1")
+					.get() as { id: string } | undefined;
+				if (free) assignSubscription(userId, free.id);
+				writeAudit(actorOf(request), {
+					action: "user.create",
+					targetType: "user",
+					targetId: userId,
+					after: { username, email },
+					reason: reason.value,
+					ip: request.ip,
+				});
+			})();
 
-		// Check if username already exists
-		const existingUser = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
-		if (existingUser) {
-			return reply.status(409).send({ error: "Username already exists" });
-		}
+			let linkSent = false;
+			let linkError: string | undefined;
+			if (request.body?.sendLink !== false) {
+				const sent = await sendSignInLink({ id: userId, username, email }, request.ip);
+				linkSent = sent.ok;
+				if (!sent.ok) linkError = sent.error;
+			}
+			return { id: userId, username, email, linkSent, linkError };
+		},
+	);
 
-		// Check if email already exists
-		const existingEmail = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
-		if (existingEmail) {
-			return reply.status(409).send({ error: "Email already in use" });
-		}
-
-		// Generate password if not provided
-		const finalPassword = password || crypto.randomBytes(8).toString("base64").slice(0, 12);
-
-		const passwordHash = hashPassword(finalPassword);
-
-		const userId = crypto.randomUUID();
-
-		db.prepare(
-			`INSERT INTO users (id, username, password_hash, email, is_admin, is_active)
-			VALUES (?, ?, ?, ?, 0, 1)`,
-		).run(userId, username, passwordHash, email);
-
-		// Assign default subscription if one exists
-		const defaultProduct = db
-			.prepare(
-				"SELECT id FROM subscription_products WHERE is_active = 1 ORDER BY price ASC LIMIT 1",
-			)
-			.get() as { id: string } | undefined;
-
-		if (defaultProduct) {
-			assignSubscription(userId, defaultProduct.id);
-		}
-
-		// Send welcome email if requested
-		let emailSent = false;
-		let emailError: string | undefined;
-		if (sendEmail) {
-			const result = await sendWelcomeEmail(email, username);
-			emailSent = result.success;
-			emailError = result.error;
-		}
-
-		return {
-			id: userId,
-			username,
-			email,
-			isAdmin: false,
-			isActive: true,
-			emailSent,
-			emailError,
-			generatedPassword: !password ? finalPassword : undefined,
-		};
-	});
-
-	// GET /api/admin/users/:id - Get single user details
 	fastify.get<{ Params: { id: string } }>("/api/admin/users/:id", async (request, reply) => {
-		const db = getDb();
-		const { id } = request.params;
-
-		const user = db.prepare("SELECT * FROM users WHERE id = ?").get(id) as UserRow | undefined;
-
-		if (!user) {
-			return reply.status(404).send({ error: "User not found" });
-		}
-
-		// Get all usage history
-		const usageHistory = db
-			.prepare("SELECT * FROM usage_monthly WHERE user_id = ? ORDER BY year_month DESC")
-			.all(id) as (UsageRow & { year_month: string })[];
-
-		// Get subscription history
-		const subscriptionHistory = db
-			.prepare(
-				`SELECT us.*, sp.name as product_name
-			FROM user_subscriptions us
-			JOIN subscription_products sp ON sp.id = us.product_id
-			WHERE us.user_id = ?
-			ORDER BY us.created_at DESC`,
-			)
-			.all(id) as (SubscriptionRow & { created_at: string })[];
-
-		// Get credit history
-		const creditHistory = db
-			.prepare("SELECT * FROM user_credits WHERE user_id = ? ORDER BY created_at DESC")
-			.all(id) as {
-			id: string;
-			credit_type: string;
-			amount: number;
-			reason: string;
-			created_at: string;
-		}[];
-
-		const credits = db
-			.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM user_credits WHERE user_id = ?")
-			.get(id) as CreditRow;
-
-		// Check for API key
-		const hasApiKey =
-			db.prepare("SELECT 1 FROM user_api_keys WHERE user_id = ? AND is_active = 1").get(id) !==
-			undefined;
-
-		return {
-			id: user.id,
-			username: user.username,
-			email: user.email,
-			isAdmin: user.is_admin === 1,
-			isActive: user.is_active === 1,
-			createdAt: user.created_at,
-			lastLogin: user.last_login,
-			hasApiKey,
-			credits: credits.total,
-			usageHistory: usageHistory.map((u) => ({
-				yearMonth: u.year_month,
-				imageCount: u.image_count,
-				totalCost: u.total_cost,
-				usedOwnKey: u.used_own_key,
-			})),
-			subscriptionHistory: subscriptionHistory.map((s) => ({
-				id: s.id,
-				productId: s.product_id,
-				productName: s.product_name,
-				startsAt: s.starts_at,
-				endsAt: s.ends_at,
-				createdAt: s.created_at,
-			})),
-			creditHistory: creditHistory.map((c) => ({
-				id: c.id,
-				type: c.credit_type,
-				amount: c.amount,
-				reason: c.reason,
-				createdAt: c.created_at,
-			})),
-		};
+		const detail = getUserDetail(request.params.id);
+		if (!detail) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+		return detail;
 	});
 
-	// PATCH /api/admin/users/:id - Update user
+	// Change admin rights, active state or email. Blocks self-demotion, self-deactivation and
+	// removing the last admin who can sign in.
 	fastify.patch<{
 		Params: { id: string };
-		Body: { isAdmin?: boolean; isActive?: boolean; email?: string };
+		Body: { isAdmin?: unknown; isActive?: unknown; email?: unknown; reason?: unknown };
 	}>("/api/admin/users/:id", async (request, reply) => {
 		const db = getDb();
 		const { id } = request.params;
-		const { isAdmin, isActive } = request.body;
-		const rawEmail = request.body.email;
-		const email = rawEmail ? normalizeEmail(rawEmail) : rawEmail;
-		if (rawEmail && !email) {
-			return reply.status(400).send({ error: "Invalid email address" });
+		const body = request.body ?? {};
+		const target = userState(id);
+		if (!target) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+		const reason = checkReason(body.reason);
+		if (rejected(reply, reason)) return;
+
+		if (body.isAdmin !== undefined && typeof body.isAdmin !== "boolean") {
+			return reply.status(400).send({ error: "isAdmin must be true or false", code: "INVALID_FIELD" });
 		}
-		if (email) {
-			const other = db.prepare("SELECT id FROM users WHERE email = ? AND id != ?").get(email, id);
-			if (other) return reply.status(409).send({ error: "Email already in use" });
+		if (body.isActive !== undefined && typeof body.isActive !== "boolean") {
+			return reply.status(400).send({ error: "isActive must be true or false", code: "INVALID_FIELD" });
+		}
+		const selfId = request.user?.userId;
+		if (id === selfId && body.isAdmin === false) {
+			return reply.status(400).send({ error: "You can't remove your own admin access.", code: "SELF_DEMOTION" });
+		}
+		if (id === selfId && body.isActive === false) {
+			return reply.status(400).send({ error: "You can't deactivate your own account.", code: "SELF_DEACTIVATION" });
+		}
+		const targetIsLiveAdmin = target.is_admin === 1 && target.is_active !== 0 && !target.deleted_at;
+		if (targetIsLiveAdmin && (body.isAdmin === false || body.isActive === false) && otherActiveAdmins(id) === 0) {
+			return reply
+				.status(400)
+				.send({ error: "This is the last admin who can sign in. Make someone else an admin first.", code: "LAST_ADMIN" });
 		}
 
-		const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
-		if (!user) {
-			return reply.status(404).send({ error: "User not found" });
+		let email: string | null | undefined;
+		if (body.email !== undefined) {
+			if (body.email === null || body.email === "") email = null;
+			else {
+				email = normalizeEmail(body.email);
+				if (!email) return reply.status(400).send({ error: "Invalid email address", code: "INVALID_EMAIL" });
+				if (db.prepare("SELECT id FROM users WHERE email = ? AND id != ?").get(email, id)) {
+					return reply.status(409).send({ error: "Email already in use", code: "EMAIL_TAKEN" });
+				}
+			}
 		}
 
 		const updates: string[] = [];
 		const params: SQLQueryBindings[] = [];
-
-		if (isAdmin !== undefined) {
+		if (body.isAdmin !== undefined) {
 			updates.push("is_admin = ?");
-			params.push(isAdmin ? 1 : 0);
+			params.push(body.isAdmin ? 1 : 0);
 		}
-		if (isActive !== undefined) {
+		if (body.isActive !== undefined) {
 			updates.push("is_active = ?");
-			params.push(isActive ? 1 : 0);
-			// Deactivation revokes every outstanding session immediately
-			if (!isActive) updates.push("token_version = COALESCE(token_version, 0) + 1");
+			params.push(body.isActive ? 1 : 0);
+			// Deactivation revokes every outstanding session immediately.
+			if (!body.isActive) updates.push("token_version = COALESCE(token_version, 0) + 1");
 		}
 		if (email !== undefined) {
 			updates.push("email = ?");
-			params.push(email || null);
+			params.push(email);
 		}
+		if (updates.length === 0) return { success: true };
 
-		if (updates.length > 0) {
-			params.push(id);
-			db.prepare(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`).run(...params);
-		}
-
+		db.transaction(() => {
+			db.prepare(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
+			const after = userState(id);
+			writeAudit(actorOf(request), {
+				action:
+					body.isActive !== undefined
+						? body.isActive
+							? "user.reactivate"
+							: "user.deactivate"
+						: body.isAdmin !== undefined
+							? body.isAdmin
+								? "user.grant_admin"
+								: "user.revoke_admin"
+							: "user.update_email",
+				targetType: "user",
+				targetId: id,
+				before: { isAdmin: target.is_admin === 1, isActive: target.is_active !== 0, email: target.email },
+				after: { isAdmin: after?.is_admin === 1, isActive: after?.is_active !== 0, email: after?.email ?? null },
+				reason: reason.value,
+				ip: request.ip,
+			});
+		})();
 		return { success: true };
 	});
 
-	// POST /api/admin/users/:id/credits - Add credits to user
-	fastify.post<{ Params: { id: string }; Body: { amount: number; reason: string } }>(
+	// Grant or deduct credits: an integer within ±10,000 that never takes the balance below 0.
+	fastify.post<{ Params: { id: string }; Body: { amount?: unknown; reason?: unknown } }>(
 		"/api/admin/users/:id/credits",
 		async (request, reply) => {
 			const db = getDb();
 			const { id } = request.params;
-			const { amount, reason } = request.body;
+			if (!userState(id)) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+			const amount = checkCreditAmount(request.body?.amount);
+			if (rejected(reply, amount)) return;
+			const reason = checkReason(request.body?.reason);
+			if (rejected(reply, reason)) return;
 
-			const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
-			if (!user) {
-				return reply.status(404).send({ error: "User not found" });
+			const apply = db.transaction((): { ok: true; before: number; after: number } | { ok: false; before: number } => {
+				const before = balanceOf(id);
+				if (before + amount.value < 0) return { ok: false, before };
+				addCredits(id, amount.value, amount.value > 0 ? "admin_grant" : "admin_deduct", reason.value);
+				const after = before + amount.value;
+				writeAudit(actorOf(request), {
+					action: amount.value > 0 ? "credits.grant" : "credits.deduct",
+					targetType: "user",
+					targetId: id,
+					before: { balance: before },
+					after: { balance: after, amount: amount.value },
+					reason: reason.value,
+					ip: request.ip,
+				});
+				return { ok: true, before, after };
+			});
+			const result = apply.immediate();
+			if (!result.ok) {
+				return reply.status(400).send({
+					error: `That would leave a negative balance (they have ${result.before} credits).`,
+					code: "NEGATIVE_BALANCE",
+					balance: result.before,
+				});
 			}
-
-			if (!amount || amount === 0) {
-				return reply.status(400).send({ error: "Amount is required and must be non-zero" });
-			}
-
-			addCredits(
-				id,
-				amount,
-				amount > 0 ? "admin_grant" : "admin_deduct",
-				reason || "Admin adjustment",
-			);
-
-			const credits = db
-				.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM user_credits WHERE user_id = ?")
-				.get(id) as CreditRow;
-
-			return { success: true, newBalance: credits.total };
+			return { success: true, newBalance: result.after };
 		},
 	);
 
-	// POST /api/admin/users/:id/subscription - Assign subscription to user
-	fastify.post<{ Params: { id: string }; Body: { productId: string } }>(
+	// Change plan. Stripe-billed plans are changed in Stripe, not here.
+	fastify.post<{ Params: { id: string }; Body: { productId?: unknown; reason?: unknown; grantBonus?: unknown } }>(
 		"/api/admin/users/:id/subscription",
 		async (request, reply) => {
 			const db = getDb();
 			const { id } = request.params;
-			const { productId } = request.body;
-
-			const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
-			if (!user) {
-				return reply.status(404).send({ error: "User not found" });
-			}
-
+			if (!userState(id)) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+			const reason = checkReason(request.body?.reason);
+			if (rejected(reply, reason)) return;
+			const productId = typeof request.body?.productId === "string" ? request.body.productId : "";
 			const product = db
-				.prepare("SELECT id FROM subscription_products WHERE id = ? AND is_active = 1")
-				.get(productId);
-			if (!product) {
-				return reply.status(404).send({ error: "Product not found" });
+				.prepare("SELECT id, name FROM subscription_products WHERE id = ? AND is_active = 1")
+				.get(productId) as { id: string; name: string } | undefined;
+			if (!product) return reply.status(404).send({ error: "Plan not found", code: "PRODUCT_NOT_FOUND" });
+
+			const current = db
+				.prepare(`
+					SELECT us.id, us.stripe_subscription_id, us.status, sp.name
+					FROM user_subscriptions us JOIN subscription_products sp ON sp.id = us.product_id
+					WHERE us.user_id = ? AND us.status IN ('active', 'trialing', 'past_due')
+					ORDER BY us.created_at DESC LIMIT 1
+				`)
+				.get(id) as { id: string; stripe_subscription_id: string | null; status: string; name: string } | undefined;
+			if (current?.stripe_subscription_id) {
+				return reply.status(409).send({
+					error: "This user pays through Stripe. Change or cancel the plan in Stripe first.",
+					code: "STRIPE_MANAGED",
+					stripeSubscriptionId: current.stripe_subscription_id,
+				});
 			}
 
-			const subscriptionId = assignSubscription(id, productId);
-
+			const subscriptionId = db.transaction(() => {
+				const sid = assignSubscription(id, product.id, {
+					grantBonus: request.body?.grantBonus === true,
+					bonusReason: `Plan change by admin: ${product.name}`,
+				});
+				writeAudit(actorOf(request), {
+					action: "subscription.change",
+					targetType: "user",
+					targetId: id,
+					before: current ? { plan: current.name, status: current.status } : { plan: "Free" },
+					after: { plan: product.name, subscriptionId: sid, grantBonus: request.body?.grantBonus === true },
+					reason: reason.value,
+					ip: request.ip,
+				});
+				return sid;
+			})();
 			return { success: true, subscriptionId };
 		},
 	);
 
-	// GET /api/admin/products - List subscription products
+	// Sign out everywhere: bump token_version so every outstanding session stops working.
+	fastify.post<{ Params: { id: string }; Body: { reason?: unknown } }>(
+		"/api/admin/users/:id/sign-out",
+		async (request, reply) => {
+			const db = getDb();
+			const { id } = request.params;
+			const target = userState(id);
+			if (!target) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+			const reason = checkReason(request.body?.reason);
+			if (rejected(reply, reason)) return;
+			db.transaction(() => {
+				db.prepare("UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = ?").run(id);
+				writeAudit(actorOf(request), {
+					action: "user.sign_out_everywhere",
+					targetType: "user",
+					targetId: id,
+					before: { sessionVersion: target.token_version ?? 0 },
+					after: { sessionVersion: (target.token_version ?? 0) + 1 },
+					reason: reason.value,
+					ip: request.ip,
+				});
+			})();
+			return { success: true };
+		},
+	);
+
+	// Email the user a sign-in link (replaces showing a generated password).
+	fastify.post<{ Params: { id: string }; Body: { reason?: unknown } }>(
+		"/api/admin/users/:id/sign-in-link",
+		async (request, reply) => {
+			const target = userState(request.params.id);
+			if (!target) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+			if (target.is_active === 0 || target.deleted_at) {
+				return reply.status(400).send({ error: "Reactivate this account first.", code: "USER_INACTIVE" });
+			}
+			const reason = checkReason(request.body?.reason);
+			if (rejected(reply, reason)) return;
+			const sent = await sendSignInLink(target, request.ip);
+			if (!sent.ok) return reply.status(sent.status).send({ error: sent.error, code: sent.code });
+			writeAudit(actorOf(request), {
+				action: "user.send_sign_in_link",
+				targetType: "user",
+				targetId: target.id,
+				after: { email: target.email },
+				reason: reason.value,
+				ip: request.ip,
+			});
+			return { success: true };
+		},
+	);
+
+	// ============================================
+	// BOOSTS
+	// ============================================
+
+	fastify.get("/api/admin/boosts", async () => {
+		const db = getDb();
+		return {
+			boosts: getAllActiveBoosts().map((boost) => {
+				const user = db.prepare("SELECT username, email FROM users WHERE id = ?").get(boost.userId) as
+					| { username: string; email: string | null }
+					| undefined;
+				return { ...boost, username: user?.username || "Unknown", email: user?.email };
+			}),
+		};
+	});
+
+	fastify.get<{ Params: { id: string } }>("/api/admin/users/:id/boost", async (request, reply) => {
+		if (!userState(request.params.id)) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+		return { boost: getActiveBoost(request.params.id) };
+	});
+
+	// Comp a boost: 1 to 365 days, with a reason.
+	fastify.post<{ Params: { id: string }; Body: { productId?: unknown; durationDays?: unknown; reason?: unknown } }>(
+		"/api/admin/users/:id/boost",
+		async (request, reply) => {
+			const db = getDb();
+			const { id } = request.params;
+			if (!userState(id)) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+			const days = checkBoostDays(request.body?.durationDays);
+			if (rejected(reply, days)) return;
+			const reason = checkReason(request.body?.reason);
+			if (rejected(reply, reason)) return;
+			const productId = typeof request.body?.productId === "string" ? request.body.productId : "";
+			if (!productId) return reply.status(400).send({ error: "Choose a plan for the boost", code: "PRODUCT_REQUIRED" });
+
+			const before = getActiveBoost(id);
+			const boost = db.transaction(() => {
+				const b = grantSubscriptionBoost(id, productId, days.value, request.user?.userId ?? null, reason.value);
+				if (!b) return null;
+				writeAudit(actorOf(request), {
+					action: "boost.grant",
+					targetType: "user",
+					targetId: id,
+					before: before ? { plan: before.boostProductName, endsAt: before.endsAt } : null,
+					after: { plan: b.boostProductName, endsAt: b.endsAt, days: days.value },
+					reason: reason.value,
+					ip: request.ip,
+				});
+				return b;
+			})();
+			if (!boost) return reply.status(404).send({ error: "Plan not found", code: "PRODUCT_NOT_FOUND" });
+			return { success: true, boost };
+		},
+	);
+
+	fastify.delete<{ Params: { id: string }; Body: { reason?: unknown } }>(
+		"/api/admin/users/:id/boost",
+		async (request, reply) => {
+			const { id } = request.params;
+			if (!userState(id)) return reply.status(404).send({ error: "User not found", code: "NOT_FOUND" });
+			const reason = checkReason(request.body?.reason);
+			if (rejected(reply, reason)) return;
+			const boost = getActiveBoost(id);
+			if (!boost) return reply.status(404).send({ error: "No active boost", code: "NO_BOOST" });
+			const success = cancelBoost(boost.id);
+			writeAudit(actorOf(request), {
+				action: "boost.cancel",
+				targetType: "user",
+				targetId: id,
+				before: { plan: boost.boostProductName, endsAt: boost.endsAt },
+				reason: reason.value,
+				ip: request.ip,
+			});
+			return { success };
+		},
+	);
+
+	// ============================================
+	// PRODUCTS (plans)
+	// ============================================
+
 	fastify.get("/api/admin/products", async () => {
 		const db = getDb();
-
 		const products = db
 			.prepare("SELECT * FROM subscription_products ORDER BY price ASC, created_at ASC")
-			.all() as (ProductRow & { stripe_price_id: string | null })[];
-
-		// Get user count for each product
-		const productsWithStats = products.map((product) => {
-			const userCount = db
-				.prepare(
-					`SELECT COUNT(DISTINCT user_id) as count
-				FROM user_subscriptions
-				WHERE product_id = ? AND (ends_at IS NULL OR ends_at > datetime('now'))`,
-				)
-				.get(product.id) as { count: number };
-
-			return {
-				id: product.id,
-				name: product.name,
-				description: product.description,
-				monthlyImageLimit: product.monthly_image_limit,
-				monthlyCostLimit: product.monthly_cost_limit,
-				dailyImageLimit: product.daily_image_limit,
-				bonusCredits: product.bonus_credits,
-				price: product.price,
-				priceSol: product.price_sol,
-				availableForUsd: product.available_for_usd === 1,
-				availableForSol: product.available_for_sol === 1,
-				isActive: product.is_active === 1,
-				allowedModels: product.allowed_models ? JSON.parse(product.allowed_models) : null,
-				creditRefillAmount: product.credit_refill_amount || 0,
-				topoffIntervalHours: product.topoff_interval_hours || 24,
-				stripePriceId: product.stripe_price_id || null,
-				createdAt: product.created_at,
-				activeUsers: userCount.count,
-			};
-		});
-
-		return { products: productsWithStats };
-	});
-
-	// POST /api/admin/products - Create subscription product
-	fastify.post<{
-		Body: {
-			name: string;
-			description?: string;
-			monthlyImageLimit?: number;
-			monthlyCostLimit?: number;
-			dailyImageLimit?: number;
-			bonusCredits?: number;
-			price?: number;
-			priceSol?: number;
-			availableForUsd?: boolean;
-			availableForSol?: boolean;
-			allowedModels?: string[] | null;
-			creditRefillAmount?: number;
-			topoffIntervalHours?: number;
-			stripePriceId?: string;
-		};
-	}>("/api/admin/products", async (request, reply) => {
-		const db = getDb();
-		const {
-			name,
-			description,
-			monthlyImageLimit,
-			monthlyCostLimit,
-			dailyImageLimit,
-			bonusCredits,
-			price,
-			priceSol,
-			availableForUsd,
-			availableForSol,
-			allowedModels,
-			creditRefillAmount,
-			topoffIntervalHours,
-			stripePriceId,
-		} = request.body;
-
-		if (!name) {
-			return reply.status(400).send({ error: "Name is required" });
-		}
-
-		const id = crypto.randomUUID();
-
-		db.prepare(
-			`INSERT INTO subscription_products
-			(id, name, description, monthly_image_limit, monthly_cost_limit, daily_image_limit, bonus_credits, price, price_sol, available_for_usd, available_for_sol, allowed_models, credit_refill_amount, topoff_interval_hours, stripe_price_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		).run(
-			id,
-			name,
-			description || null,
-			monthlyImageLimit ?? null,
-			monthlyCostLimit ?? null,
-			dailyImageLimit ?? null,
-			bonusCredits ?? 0,
-			price ?? 0,
-			priceSol ?? null,
-			availableForUsd !== false ? 1 : 0,
-			availableForSol === true ? 1 : 0,
-			allowedModels ? JSON.stringify(allowedModels) : null,
-			creditRefillAmount ?? 0,
-			topoffIntervalHours ?? 24,
-			stripePriceId || null,
+			.all() as ProductRow[];
+		const counts = new Map(
+			(
+				db
+					.prepare(
+						"SELECT product_id, COUNT(DISTINCT user_id) AS n FROM user_subscriptions WHERE status IN ('active', 'trialing', 'past_due') GROUP BY product_id",
+					)
+					.all() as Array<{ product_id: string; n: number }>
+			).map((r) => [r.product_id, r.n]),
 		);
-
-		return {
-			id,
-			name,
-			description: description || null,
-			monthlyImageLimit: monthlyImageLimit ?? null,
-			monthlyCostLimit: monthlyCostLimit ?? null,
-			dailyImageLimit: dailyImageLimit ?? null,
-			bonusCredits: bonusCredits ?? 0,
-			price: price ?? 0,
-			priceSol: priceSol ?? null,
-			availableForUsd: availableForUsd !== false,
-			availableForSol: availableForSol === true,
-			allowedModels: allowedModels ?? null,
-			creditRefillAmount: creditRefillAmount ?? 0,
-			topoffIntervalHours: topoffIntervalHours ?? 24,
-			stripePriceId: stripePriceId || null,
-			isActive: true,
-		};
+		return { products: products.map((p) => productDto(p, counts.get(p.id) ?? 0)) };
 	});
 
-	// PATCH /api/admin/products/:id - Update subscription product
-	fastify.patch<{
-		Params: { id: string };
-		Body: {
-			name?: string;
-			description?: string;
-			monthlyImageLimit?: number | null;
-			monthlyCostLimit?: number | null;
-			dailyImageLimit?: number | null;
-			bonusCredits?: number;
-			price?: number;
-			priceSol?: number | null;
-			availableForUsd?: boolean;
-			availableForSol?: boolean;
-			isActive?: boolean;
-			allowedModels?: string[] | null;
-			creditRefillAmount?: number;
-			topoffIntervalHours?: number;
-			stripePriceId?: string | null;
-		};
-	}>("/api/admin/products/:id", async (request, reply) => {
+	fastify.post<{ Body: Record<string, unknown> }>("/api/admin/products", async (request, reply) => {
 		const db = getDb();
-		const { id } = request.params;
-		const {
-			name,
-			description,
-			monthlyImageLimit,
-			monthlyCostLimit,
-			dailyImageLimit,
-			bonusCredits,
-			price,
-			priceSol,
-			availableForUsd,
-			availableForSol,
-			isActive,
-			allowedModels,
-			creditRefillAmount,
-			topoffIntervalHours,
-			stripePriceId,
-		} = request.body;
-
-		const product = db.prepare("SELECT id FROM subscription_products WHERE id = ?").get(id);
-		if (!product) {
-			return reply.status(404).send({ error: "Product not found" });
-		}
-
-		const updates: string[] = [];
-		const params: SQLQueryBindings[] = [];
-
-		if (name !== undefined) {
-			updates.push("name = ?");
-			params.push(name);
-		}
-		if (description !== undefined) {
-			updates.push("description = ?");
-			params.push(description || null);
-		}
-		if (monthlyImageLimit !== undefined) {
-			updates.push("monthly_image_limit = ?");
-			params.push(monthlyImageLimit);
-		}
-		if (monthlyCostLimit !== undefined) {
-			updates.push("monthly_cost_limit = ?");
-			params.push(monthlyCostLimit);
-		}
-		if (dailyImageLimit !== undefined) {
-			updates.push("daily_image_limit = ?");
-			params.push(dailyImageLimit);
-		}
-		if (bonusCredits !== undefined) {
-			updates.push("bonus_credits = ?");
-			params.push(bonusCredits);
-		}
-		if (price !== undefined) {
-			updates.push("price = ?");
-			params.push(price);
-		}
-		if (priceSol !== undefined) {
-			updates.push("price_sol = ?");
-			params.push(priceSol);
-		}
-		if (availableForUsd !== undefined) {
-			updates.push("available_for_usd = ?");
-			params.push(availableForUsd ? 1 : 0);
-		}
-		if (availableForSol !== undefined) {
-			updates.push("available_for_sol = ?");
-			params.push(availableForSol ? 1 : 0);
-		}
-		if (isActive !== undefined) {
-			updates.push("is_active = ?");
-			params.push(isActive ? 1 : 0);
-		}
-		if (allowedModels !== undefined) {
-			updates.push("allowed_models = ?");
-			params.push(allowedModels ? JSON.stringify(allowedModels) : null);
-		}
-		if (creditRefillAmount !== undefined) {
-			updates.push("credit_refill_amount = ?");
-			params.push(creditRefillAmount);
-		}
-		if (topoffIntervalHours !== undefined) {
-			updates.push("topoff_interval_hours = ?");
-			params.push(topoffIntervalHours);
-		}
-		if (stripePriceId !== undefined) {
-			updates.push("stripe_price_id = ?");
-			params.push(stripePriceId || null);
-		}
-
-		if (updates.length > 0) {
-			params.push(id);
-			db.prepare(`UPDATE subscription_products SET ${updates.join(", ")} WHERE id = ?`).run(
-				...params,
+		const body = request.body ?? {};
+		const valid = checkProductFields(body, true);
+		if (rejected(reply, valid)) return;
+		const id = crypto.randomUUID();
+		const num = (v: unknown) => (typeof v === "number" ? v : null);
+		db.transaction(() => {
+			db.prepare(
+				`INSERT INTO subscription_products
+				(id, name, description, monthly_image_limit, monthly_cost_limit, daily_image_limit, bonus_credits, price, price_sol,
+				 available_for_usd, available_for_sol, allowed_models, credit_refill_amount, topoff_interval_hours, stripe_price_id)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				id,
+				String(body.name).trim(),
+				typeof body.description === "string" && body.description ? body.description : null,
+				num(body.monthlyImageLimit),
+				num(body.monthlyCostLimit),
+				num(body.dailyImageLimit),
+				num(body.bonusCredits) ?? 0,
+				num(body.price) ?? 0,
+				num(body.priceSol),
+				body.availableForUsd !== false ? 1 : 0,
+				body.availableForSol === true ? 1 : 0,
+				Array.isArray(body.allowedModels) ? JSON.stringify(body.allowedModels) : null,
+				num(body.creditRefillAmount) ?? 0,
+				num(body.topoffIntervalHours) ?? 24,
+				typeof body.stripePriceId === "string" && body.stripePriceId ? body.stripePriceId : null,
 			);
-		}
-
-		return { success: true };
+			writeAudit(actorOf(request), {
+				action: "product.create",
+				targetType: "product",
+				targetId: id,
+				after: getProduct(id),
+				ip: request.ip,
+			});
+		})();
+		return reply.status(201).send(getProduct(id));
 	});
 
-	// DELETE /api/admin/products/:id - Deactivate subscription product
+	fastify.patch<{ Params: { id: string }; Body: Record<string, unknown> }>(
+		"/api/admin/products/:id",
+		async (request, reply) => {
+			const db = getDb();
+			const { id } = request.params;
+			const before = getProduct(id);
+			if (!before) return reply.status(404).send({ error: "Plan not found", code: "NOT_FOUND" });
+			const body = request.body ?? {};
+			const valid = checkProductFields(body, false);
+			if (rejected(reply, valid)) return;
+
+			const columns: Record<string, [string, (v: unknown) => SQLQueryBindings]> = {
+				name: ["name", (v) => String(v).trim()],
+				description: ["description", (v) => (typeof v === "string" && v ? v : null)],
+				monthlyImageLimit: ["monthly_image_limit", (v) => (v as number | null) ?? null],
+				monthlyCostLimit: ["monthly_cost_limit", (v) => (v as number | null) ?? null],
+				dailyImageLimit: ["daily_image_limit", (v) => (v as number | null) ?? null],
+				bonusCredits: ["bonus_credits", (v) => (v as number | null) ?? 0],
+				price: ["price", (v) => (v as number | null) ?? 0],
+				priceSol: ["price_sol", (v) => (v as number | null) ?? null],
+				availableForUsd: ["available_for_usd", (v) => (v ? 1 : 0)],
+				availableForSol: ["available_for_sol", (v) => (v ? 1 : 0)],
+				isActive: ["is_active", (v) => (v ? 1 : 0)],
+				allowedModels: ["allowed_models", (v) => (Array.isArray(v) ? JSON.stringify(v) : null)],
+				creditRefillAmount: ["credit_refill_amount", (v) => (v as number | null) ?? 0],
+				topoffIntervalHours: ["topoff_interval_hours", (v) => (v as number | null) ?? 24],
+				stripePriceId: ["stripe_price_id", (v) => (typeof v === "string" && v ? v : null)],
+			};
+			const updates: string[] = [];
+			const params: SQLQueryBindings[] = [];
+			for (const [key, [col, map]] of Object.entries(columns)) {
+				if (body[key] === undefined) continue;
+				updates.push(`${col} = ?`);
+				params.push(map(body[key]));
+			}
+			if (updates.length === 0) return { success: true };
+			db.transaction(() => {
+				db.prepare(`UPDATE subscription_products SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
+				writeAudit(actorOf(request), {
+					action: "product.update",
+					targetType: "product",
+					targetId: id,
+					before,
+					after: getProduct(id),
+					ip: request.ip,
+				});
+			})();
+			return { success: true };
+		},
+	);
+
 	fastify.delete<{ Params: { id: string } }>("/api/admin/products/:id", async (request, reply) => {
 		const db = getDb();
 		const { id } = request.params;
-
-		const product = db.prepare("SELECT id FROM subscription_products WHERE id = ?").get(id);
-		if (!product) {
-			return reply.status(404).send({ error: "Product not found" });
-		}
-
-		// Soft delete by deactivating
-		db.prepare("UPDATE subscription_products SET is_active = 0 WHERE id = ?").run(id);
-
+		const before = getProduct(id);
+		if (!before) return reply.status(404).send({ error: "Plan not found", code: "NOT_FOUND" });
+		db.transaction(() => {
+			db.prepare("UPDATE subscription_products SET is_active = 0 WHERE id = ?").run(id);
+			writeAudit(actorOf(request), {
+				action: "product.deactivate",
+				targetType: "product",
+				targetId: id,
+				before: { isActive: before.isActive },
+				after: { isActive: false },
+				ip: request.ip,
+			});
+		})();
 		return { success: true };
 	});
 
-	// POST /api/admin/costs/recalculate - Recalculate costs for historical generations
-	fastify.post<{ Body: { dryRun?: boolean } }>(
-		"/api/admin/costs/recalculate",
+	// ============================================
+	// CREDIT PACKAGES
+	// ============================================
+
+	fastify.get("/api/admin/credit-packages", async () => ({ packages: getAllCreditPackages() }));
+
+	fastify.post<{ Body: Record<string, unknown> }>("/api/admin/credit-packages", async (request, reply) => {
+		const b = request.body ?? {};
+		const check = checkCreditPackage({
+			name: b.name as string,
+			credits: b.credits as number,
+			priceSol: (b.priceSol as number | null | undefined) ?? null,
+			priceCents: (b.priceCents as number | null | undefined) ?? null,
+			stripePriceId: (b.stripePriceId as string | null | undefined) ?? null,
+			availableForUsd: b.availableForUsd === true,
+			availableForSol: b.availableForSol === true,
+			isActive: b.isActive !== false,
+		});
+		if (rejected(reply, check)) return;
+		const v = check.value;
+		const pkg = createCreditPackage({
+			name: v.name,
+			credits: v.credits,
+			priceSol: v.priceSol ?? 0,
+			priceCents: v.priceCents,
+			stripePriceId: v.stripePriceId,
+			availableForUsd: v.availableForUsd,
+			availableForSol: v.availableForSol,
+			isActive: v.isActive,
+		});
+		if (!pkg) return reply.status(500).send({ error: "Failed to create package", code: "CREATE_FAILED" });
+		writeAudit(actorOf(request), {
+			action: "credit_package.create",
+			targetType: "credit_package",
+			targetId: pkg.id,
+			after: pkg,
+			ip: request.ip,
+		});
+		return reply.status(201).send(pkg);
+	});
+
+	fastify.patch<{ Params: { id: string }; Body: Record<string, unknown> }>(
+		"/api/admin/credit-packages/:id",
 		async (request, reply) => {
-			const db = getDb();
-			const dryRun = request.body?.dryRun ?? true;
-
-			// Get all generations
-			const generations = db
-				.prepare(
-					`SELECT id, model, width, height, parameters, cost
-					FROM generations
-					WHERE deleted_at IS NULL`,
-				)
-				.all() as GenerationRow[];
-
-			let oldTotalCost = 0;
-			let newTotalCost = 0;
-			const updates: { id: string; model: string; oldCost: number; newCost: number }[] = [];
-
-			for (const gen of generations) {
-				oldTotalCost += gen.cost || 0;
-
-				// Parse parameters to get resolution if available
-				let resolution: string | undefined;
-				if (gen.parameters) {
-					try {
-						const params = JSON.parse(gen.parameters);
-						resolution = params.resolution;
-					} catch {
-						// Ignore parse errors
-					}
-				}
-
-				const newCost = calculateGenerationCost(gen.model, {
-					numOutputs: 1,
-					resolution,
-					width: gen.width || undefined,
-					height: gen.height || undefined,
-				});
-
-				newTotalCost += newCost;
-
-				if (Math.abs((gen.cost || 0) - newCost) > 0.0001) {
-					updates.push({
-						id: gen.id,
-						model: gen.model,
-						oldCost: gen.cost || 0,
-						newCost,
-					});
-				}
-			}
-
-			// Apply updates if not dry run
-			if (!dryRun && updates.length > 0) {
-				const updateStmt = db.prepare("UPDATE generations SET cost = ? WHERE id = ?");
-				for (const update of updates) {
-					updateStmt.run(update.newCost, update.id);
-				}
-
-				// Recalculate usage_monthly totals
-				const monthlyRecalc = db.prepare(`
-					UPDATE usage_monthly
-					SET total_cost = (
-						SELECT COALESCE(SUM(g.cost), 0)
-						FROM generations g
-						WHERE g.user_id = usage_monthly.user_id
-						AND strftime('%Y-%m', g.created_at) = usage_monthly.year_month
-					)
-				`);
-				monthlyRecalc.run();
-			}
-
-			// Summarize by model
-			const summaryByModel: Record<string, { count: number; oldTotal: number; newTotal: number }> =
-				{};
-			for (const update of updates) {
-				if (!summaryByModel[update.model]) {
-					summaryByModel[update.model] = { count: 0, oldTotal: 0, newTotal: 0 };
-				}
-				summaryByModel[update.model].count++;
-				summaryByModel[update.model].oldTotal += update.oldCost;
-				summaryByModel[update.model].newTotal += update.newCost;
-			}
-
-			return {
-				dryRun,
-				totalGenerations: generations.length,
-				generationsUpdated: updates.length,
-				oldTotalCost: Math.round(oldTotalCost * 10000) / 10000,
-				newTotalCost: Math.round(newTotalCost * 10000) / 10000,
-				costDifference: Math.round((newTotalCost - oldTotalCost) * 10000) / 10000,
-				summaryByModel: Object.entries(summaryByModel).map(([model, data]) => ({
-					model,
-					count: data.count,
-					oldTotal: Math.round(data.oldTotal * 10000) / 10000,
-					newTotal: Math.round(data.newTotal * 10000) / 10000,
-					difference: Math.round((data.newTotal - data.oldTotal) * 10000) / 10000,
-				})),
-			};
+			const { id } = request.params;
+			const before = getAllCreditPackages().find((p) => p.id === id);
+			if (!before) return reply.status(404).send({ error: "Package not found", code: "NOT_FOUND" });
+			const b = request.body ?? {};
+			// Validate the package as it will be after the edit.
+			const check = checkCreditPackage({
+				name: (b.name as string | undefined) ?? before.name,
+				credits: (b.credits as number | undefined) ?? before.credits,
+				priceSol: b.priceSol !== undefined ? (b.priceSol as number | null) : before.priceSol,
+				priceCents: b.priceCents !== undefined ? (b.priceCents as number | null) : before.priceCents,
+				stripePriceId: b.stripePriceId !== undefined ? (b.stripePriceId as string | null) : before.stripePriceId,
+				availableForUsd: b.availableForUsd !== undefined ? b.availableForUsd === true : before.availableForUsd,
+				availableForSol: b.availableForSol !== undefined ? b.availableForSol === true : before.availableForSol,
+				isActive: b.isActive !== undefined ? b.isActive !== false : before.isActive,
+			});
+			if (rejected(reply, check)) return;
+			const v = check.value;
+			updateCreditPackage(id, {
+				name: v.name,
+				credits: v.credits,
+				priceSol: v.priceSol ?? 0,
+				priceCents: v.priceCents,
+				stripePriceId: v.stripePriceId,
+				availableForUsd: v.availableForUsd,
+				availableForSol: v.availableForSol,
+				isActive: v.isActive,
+			});
+			writeAudit(actorOf(request), {
+				action: "credit_package.update",
+				targetType: "credit_package",
+				targetId: id,
+				before,
+				after: getAllCreditPackages().find((p) => p.id === id),
+				ip: request.ip,
+			});
+			return { success: true };
 		},
 	);
 
-	// GET /api/admin/costs/pricing - Get current model pricing configuration
-	fastify.get("/api/admin/costs/pricing", async () => {
-		// Import the pricing map from replicate service
-		// We'll calculate sample costs for common scenarios
-		const models = [
-			"black-forest-labs/flux-schnell",
-			"black-forest-labs/flux-dev",
-			"black-forest-labs/flux-1.1-pro",
-			"black-forest-labs/flux-1.1-pro-ultra",
-			"black-forest-labs/flux-2-pro",
-			"black-forest-labs/flux-2-dev",
-			"black-forest-labs/flux-redux-schnell",
-			"black-forest-labs/flux-redux-dev",
-			"black-forest-labs/flux-kontext-pro",
-			"google/nano-banana-pro",
-		];
-
-		const pricing = models.map((model) => ({
-			model,
-			costPerImage1MP: calculateGenerationCost(model, { numOutputs: 1 }),
-			costPerImage2MP: calculateGenerationCost(model, {
-				numOutputs: 1,
-				resolution: "2 MP",
-			}),
-			costPerImage4MP: calculateGenerationCost(model, {
-				numOutputs: 1,
-				resolution: "4 MP",
-			}),
-		}));
-
-		return { pricing };
-	});
-
-	// ============================================
-	// SUBSCRIPTION BOOST MANAGEMENT
-	// ============================================
-
-	// GET /api/admin/boosts - List all active boosts
-	fastify.get("/api/admin/boosts", async () => {
-		const db = getDb();
-		const boosts = getAllActiveBoosts();
-
-		// Enrich with user info
-		const boostsWithUsers = boosts.map((boost) => {
-			const user = db
-				.prepare("SELECT username, email FROM users WHERE id = ?")
-				.get(boost.userId) as { username: string; email: string | null } | undefined;
-
-			const grantedBy = boost.grantedByUserId
-				? (db.prepare("SELECT username FROM users WHERE id = ?").get(boost.grantedByUserId) as
-						| { username: string }
-						| undefined)
-				: null;
-
-			return {
-				...boost,
-				username: user?.username || "Unknown",
-				email: user?.email,
-				grantedByUsername: grantedBy?.username,
-			};
-		});
-
-		return { boosts: boostsWithUsers };
-	});
-
-	// GET /api/admin/users/:id/boost - Get user's active boost
-	fastify.get<{ Params: { id: string } }>("/api/admin/users/:id/boost", async (request, reply) => {
-		const { id } = request.params;
-
-		const db = getDb();
-		const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
-		if (!user) {
-			return reply.status(404).send({ error: "User not found" });
-		}
-
-		const boost = getActiveBoost(id);
-		return { boost };
-	});
-
-	// POST /api/admin/users/:id/boost - Grant boost to user
-	fastify.post<{
-		Params: { id: string };
-		Body: { productId: string; durationDays?: number; reason?: string };
-	}>("/api/admin/users/:id/boost", async (request, reply) => {
-		const { id } = request.params;
-		const { productId, durationDays = 30, reason } = request.body;
-
-		const db = getDb();
-		const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
-		if (!user) {
-			return reply.status(404).send({ error: "User not found" });
-		}
-
-		if (!productId) {
-			return reply.status(400).send({ error: "Product ID is required" });
-		}
-
-		const adminUserId = request.user?.userId || null;
-		const boost = grantSubscriptionBoost(id, productId, durationDays, adminUserId, reason || null);
-
-		if (!boost) {
-			return reply.status(400).send({ error: "Failed to grant boost. Product may not exist." });
-		}
-
-		return { success: true, boost };
-	});
-
-	// DELETE /api/admin/users/:id/boost - Cancel user's active boost
-	fastify.delete<{ Params: { id: string } }>("/api/admin/users/:id/boost", async (request, reply) => {
-		const { id } = request.params;
-
-		const db = getDb();
-		const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
-		if (!user) {
-			return reply.status(404).send({ error: "User not found" });
-		}
-
-		const boost = getActiveBoost(id);
-		if (!boost) {
-			return reply.status(404).send({ error: "No active boost found" });
-		}
-
-		const success = cancelBoost(boost.id);
-		return { success };
-	});
-
-	// ============================================
-	// SOL CREDIT PACKAGE MANAGEMENT
-	// ============================================
-
-	// GET /api/admin/credit-packages - List all credit packages
-	fastify.get("/api/admin/credit-packages", async () => {
-		const packages = getAllCreditPackages();
-		return { packages };
-	});
-
-	// POST /api/admin/credit-packages - Create credit package
-	fastify.post<{
-		Body: {
-			name: string;
-			credits: number;
-			priceSol: number;
-			priceCents?: number | null;
-			stripePriceId?: string | null;
-			availableForUsd?: boolean;
-			availableForSol?: boolean;
-			isActive?: boolean;
-		};
-	}>("/api/admin/credit-packages", async (request, reply) => {
-		const { name, credits, priceSol, priceCents, stripePriceId, availableForUsd, availableForSol, isActive } = request.body;
-
-		if (!name || !credits || !priceSol) {
-			return reply.status(400).send({ error: "Name, credits, and priceSol are required" });
-		}
-
-		const pkg = createCreditPackage({ name, credits, priceSol, priceCents, stripePriceId, availableForUsd, availableForSol, isActive });
-
-		if (!pkg) {
-			return reply.status(500).send({ error: "Failed to create package" });
-		}
-
-		return pkg;
-	});
-
-	// PATCH /api/admin/credit-packages/:id - Update credit package
-	fastify.patch<{
-		Params: { id: string };
-		Body: {
-			name?: string;
-			credits?: number;
-			priceSol?: number;
-			priceCents?: number | null;
-			stripePriceId?: string | null;
-			availableForUsd?: boolean;
-			availableForSol?: boolean;
-			isActive?: boolean;
-		};
-	}>("/api/admin/credit-packages/:id", async (request, reply) => {
-		const { id } = request.params;
-		const { name, credits, priceSol, priceCents, stripePriceId, availableForUsd, availableForSol, isActive } = request.body;
-
-		const success = updateCreditPackage(id, { name, credits, priceSol, priceCents, stripePriceId, availableForUsd, availableForSol, isActive });
-
-		if (!success) {
-			return reply.status(404).send({ error: "Package not found" });
-		}
-
-		return { success: true };
-	});
-
-	// DELETE /api/admin/credit-packages/:id - Deactivate credit package
 	fastify.delete<{ Params: { id: string } }>("/api/admin/credit-packages/:id", async (request, reply) => {
 		const { id } = request.params;
-
-		const success = deleteCreditPackage(id);
-
-		if (!success) {
-			return reply.status(404).send({ error: "Package not found" });
-		}
-
+		if (!deleteCreditPackage(id)) return reply.status(404).send({ error: "Package not found", code: "NOT_FOUND" });
+		writeAudit(actorOf(request), {
+			action: "credit_package.deactivate",
+			targetType: "credit_package",
+			targetId: id,
+			after: { isActive: false },
+			ip: request.ip,
+		});
 		return { success: true };
 	});
 
 	// ============================================
-	// FINANCIAL ANALYSIS
+	// MODEL CREDIT COSTS (overrides; `<model>` or `<model>:<tier>`)
 	// ============================================
 
-	// GET /api/admin/financials/sol-analysis - SOL price history + margin analysis
-	fastify.get<{ Querystring: { days?: string } }>(
-		"/api/admin/financials/sol-analysis",
-		async (request) => {
-			const days = Math.min(365, Math.max(1, Number.parseInt(request.query.days || "30", 10) || 30));
-			const priceHistory = getSolPriceHistory(days);
-
-			const db = getDb();
-
-			// Get refill/breakage stats
-			const refillStats = db
-				.prepare(`
-					SELECT
-						COUNT(*) as total_events,
-						SUM(CASE WHEN credits_added > 0 THEN 1 ELSE 0 END) as refills_with_credits,
-						SUM(CASE WHEN credits_added = 0 THEN 1 ELSE 0 END) as breakage_events,
-						SUM(credits_added) as total_credits_refilled
-					FROM credit_topoff_log
-					WHERE created_at >= datetime('now', '-' || ? || ' days')
-				`)
-				.get(days) as {
-				total_events: number;
-				refills_with_credits: number;
-				breakage_events: number;
-				total_credits_refilled: number;
-			};
-
-			return {
-				priceHistory,
-				refillStats: {
-					totalEvents: refillStats.total_events || 0,
-					refillsWithCredits: refillStats.refills_with_credits || 0,
-					breakageEvents: refillStats.breakage_events || 0,
-					totalCreditsRefilled: refillStats.total_credits_refilled || 0,
-				},
-			};
-		},
-	);
-
-	// ============================================
-	// MODEL CREDIT COSTS
-	// ============================================
-
-	// GET /api/admin/model-costs - List all models with credit costs
-	fastify.get("/api/admin/model-costs", async () => {
-		const creditCosts = getAllModelCreditCosts();
-		const creditCostMap = new Map(creditCosts.map((c) => [c.modelId, c]));
-
-		const models = MODELS.map((model) => {
-			const costInfo = creditCostMap.get(model.id);
-			const baseCost = calculateGenerationCost(model.id, { numOutputs: 1 });
-
-			return {
-				id: model.id,
-				name: model.name,
-				category: model.category || "quality",
-				creditCost: costInfo?.creditCost ?? 2,
-				isOverride: costInfo?.isOverride ?? false,
-				baseCostUsd: Math.round(baseCost * 10000) / 10000,
-			};
-		});
-
-		return { models };
-	});
-
-	// PATCH /api/admin/model-costs/:modelId - Set credit cost for a model
-	fastify.patch<{
-		Params: { modelId: string };
-		Body: { creditCost: number };
-	}>("/api/admin/model-costs/:modelId", async (request, reply) => {
-		const modelId = decodeURIComponent(request.params.modelId);
-		const { creditCost } = request.body;
-
-		if (creditCost == null || creditCost < 0 || !Number.isInteger(creditCost)) {
-			return reply.status(400).send({ error: "creditCost must be a non-negative integer" });
-		}
-
-		setModelCreditCost(modelId, creditCost);
-
-		return { success: true, modelId, creditCost };
-	});
-
-	// DELETE /api/admin/model-costs/:modelId - Reset to hardcoded default
-	fastify.delete<{ Params: { modelId: string } }>(
-		"/api/admin/model-costs/:modelId",
+	fastify.patch<{ Params: { key: string }; Body: { creditCost?: unknown; reason?: unknown } }>(
+		"/api/admin/model-costs/:key",
 		async (request, reply) => {
-			const modelId = decodeURIComponent(request.params.modelId);
-			const deleted = deleteModelCreditCost(modelId);
-
-			if (!deleted) {
-				return reply.status(404).send({ error: "No override found for this model" });
-			}
-
-			return { success: true, modelId };
+			const key = decodeURIComponent(request.params.key);
+			const parsed = checkOverrideKey(key);
+			if (rejected(reply, parsed)) return;
+			const cost = checkCreditCost(request.body?.creditCost);
+			if (rejected(reply, cost)) return;
+			const db = getDb();
+			const before = db.prepare("SELECT credit_cost FROM model_credit_costs WHERE model_id = ?").get(key) as
+				| { credit_cost: number }
+				| undefined;
+			db.transaction(() => {
+				setModelCreditCost(key, cost.value);
+				writeAudit(actorOf(request), {
+					action: "model_cost.set",
+					targetType: "model",
+					targetId: key,
+					before: before ? { creditCost: before.credit_cost } : null,
+					after: { creditCost: cost.value },
+					reason: typeof request.body?.reason === "string" ? request.body.reason.slice(0, 500) : null,
+					ip: request.ip,
+				});
+			})();
+			return { success: true, key, creditCost: cost.value };
 		},
 	);
+
+	fastify.delete<{ Params: { key: string } }>("/api/admin/model-costs/:key", async (request, reply) => {
+		const key = decodeURIComponent(request.params.key);
+		const db = getDb();
+		const before = db.prepare("SELECT credit_cost FROM model_credit_costs WHERE model_id = ?").get(key) as
+			| { credit_cost: number }
+			| undefined;
+		if (!before || !deleteModelCreditCost(key)) {
+			return reply.status(404).send({ error: "No override for this model", code: "NOT_FOUND" });
+		}
+		writeAudit(actorOf(request), {
+			action: "model_cost.reset",
+			targetType: "model",
+			targetId: key,
+			before: { creditCost: before.credit_cost },
+			after: null,
+			ip: request.ip,
+		});
+		return { success: true, key };
+	});
 }
