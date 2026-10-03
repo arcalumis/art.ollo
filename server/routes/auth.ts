@@ -357,6 +357,19 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
 		};
 	});
 
+	// Sign out this and every other session: bumping token_version revokes all issued tokens.
+	fastify.post("/api/auth/logout", { preHandler: authMiddleware }, async (request) => {
+		const userId = request.user?.userId ?? "";
+		const db = getDb();
+		db.transaction(() => {
+			db.prepare("UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = ?").run(userId);
+			db.prepare(
+				"UPDATE account_reauth_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL",
+			).run(userId);
+		})();
+		return { success: true };
+	});
+
 	// ==================== Email auth ====================
 	// /api/auth/check-email was removed: it disclosed whether an email had an account.
 

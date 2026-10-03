@@ -274,8 +274,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		setToken(next);
 	}, []);
 
+	// Signing out ends every session on the server (best effort: local state clears regardless,
+	// e.g. offline, or after account deletion when the token is already revoked).
 	const logout = useCallback(() => {
+		const current = localStorage.getItem("token");
+		if (current) {
+			void fetch(`${API_BASE}/api/auth/logout`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${current}` },
+				keepalive: true,
+			}).catch(() => {});
+		}
 		localStorage.removeItem("token");
+		try {
+			localStorage.removeItem("ollo:sudo");
+		} catch {
+			// nothing stored
+		}
 		setToken(null);
 		setUser(null);
 	}, []);

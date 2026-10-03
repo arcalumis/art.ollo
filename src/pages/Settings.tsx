@@ -664,6 +664,28 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 			</Section>
 
 			<Section
+				id="sessions-title"
+				title="Sessions"
+				hint="Lost a device or signed in somewhere shared? End every session, this one included."
+			>
+				<div>
+					<Button
+						variant="outline"
+						onClick={() => {
+							onNavigateAway?.();
+							navigate("/", { replace: true });
+							logout();
+							toast("Signed out everywhere", {
+								description: "Every device needs to sign in again.",
+							});
+						}}
+					>
+						Sign out everywhere
+					</Button>
+				</div>
+			</Section>
+
+			<Section
 				id="appearance-title"
 				title="Appearance"
 				hint="Night and Plaster are two finishes of the same ollo."
