@@ -8,6 +8,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VITE_SOLANA_NETWORK: ${VITE_SOLANA_NETWORK:-mainnet-beta}
     environment:
       - NODE_ENV=production
       - PORT=3001

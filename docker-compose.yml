@@ -12,9 +12,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Baked into the frontend bundle at build time (.env files are not in the build context)
+        VITE_SOLANA_NETWORK: ${VITE_SOLANA_NETWORK:-mainnet-beta}
     container_name: artollo-app-1
+    # Caddy reaches the app over the shared `web` network; the host port is loopback-only.
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     environment:
       - NODE_ENV=production
     env_file:

@@ -5,10 +5,11 @@ node_modules
 .git
 .gitignore
 
-# Environment files (use docker-compose env instead)
+# Environment files (secrets come from docker-compose env_file at runtime; build-time
+# VITE_* values are passed as build args)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Documentation
 *.md
@@ -30,6 +31,11 @@ uploads/*
 
 # Build artifacts (rebuilt in container)
 dist
+
+# Not needed in the image
+tests
+shots
+scripts/*.sh
 
 # Misc
 .DS_Store
