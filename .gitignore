@@ -34,3 +34,4 @@ data/
 .env.production
 .zshrc
 server-dist/
+shots/

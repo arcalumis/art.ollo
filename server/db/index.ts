@@ -2,7 +2,8 @@ import { Database } from "bun:sqlite";
 import path from "node:path";
 import { initializeSchema } from "./schema";
 
-const DB_PATH = path.join(process.cwd(), "data", "generations.db");
+// DB_PATH lets tests run against ":memory:" without touching data/.
+const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), "data", "generations.db");
 
 let db: Database | null = null;
 let checkpointInterval: NodeJS.Timeout | null = null;
