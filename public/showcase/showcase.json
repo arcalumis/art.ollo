@@ -1,0 +1,12 @@
+[
+  { "slug": "sunken-monk", "model": "Flux Redux Dev", "prompt": "Top down view from above, underwater scene hinting at buried treasure. A colossal stone statue of a meditating monk, weathered to a moss-covered green." },
+  { "slug": "bronze-crow-underwater", "model": "Flux 2 Pro", "prompt": "The whole statue is underwater and viewed from underwater." },
+  { "slug": "soldier-ruins", "model": "Nano Banana Pro", "prompt": "A dramatic oil painting of the soldier on horseback, set amidst the ravaged remnants of a war-torn cityscape." },
+  { "slug": "owl-stethoscope", "model": "Flux 2 Dev", "prompt": "Have a stethoscope hanging from his pouch and black round glasses." },
+  { "slug": "panda-donkey", "model": "Flux 2 Dev", "prompt": "Add a straw hat on the donkey." },
+  { "slug": "rabbit-treehouse", "model": "Flux 2 Dev", "prompt": "This same rabbit is building himself a treehouse in the forest." },
+  { "slug": "owl-glasses", "model": "Flux 2 Dev", "prompt": "Have the owl wearing black round glasses." },
+  { "slug": "dragon-reading", "model": "Flux 2 Dev", "prompt": "A young dragon sitting in a beautiful garden under an apple tree eating an apple while reading a book." },
+  { "slug": "roman-soldier", "model": "Flux 2 Dev", "prompt": "Roman soldier from biblical times in oil paint." },
+  { "slug": "monk-aquarium", "model": "Flux 2 Dev", "prompt": "Giant meditating monk stone statue in a giant fish tank with fish swimming around, surrounded by a tiny village." }
+]
