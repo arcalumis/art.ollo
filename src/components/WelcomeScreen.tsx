@@ -1,99 +1,54 @@
-import { OlloAvatar } from "./OlloAvatar";
+import { Button } from "@/components/ui/button";
 
 interface WelcomeScreenProps {
-	onPromptClick: (prompt: string) => void;
-	onCategoryClick: (category: string) => void;
-	onStartWithOllo?: () => void;
+	/** Put an example into the prompt bar (doesn't start it: nothing is spent until Generate). */
+	onPromptPick: (prompt: string) => void;
 	onOpenModelGuide?: () => void;
 }
 
-const categories = [
-	{ id: "portrait", label: "Portrait" },
-	{ id: "landscape", label: "Landscape" },
-	{ id: "abstract", label: "Abstract" },
-	{ id: "photo", label: "Photo" },
+/** Prompts that have made good first images on ollo (from the landing showcase). */
+export const STARTER_PROMPTS = [
+	"A young dragon sitting in a beautiful garden under an apple tree eating an apple while reading a book.",
+	"Giant meditating monk stone statue in a giant fish tank with fish swimming around, surrounded by a tiny village.",
+	"Roman soldier from biblical times in oil paint.",
 ];
 
-const suggestions = [
-	"A divine being emerging from golden light",
-	"Oil painting of a sunset over ancient ruins",
-	"Ethereal portrait bathed in warm amber glow",
-	"Celestial landscape with radiant sky",
-	"Sacred geometry floating in cosmic space",
-	"Futuristic city skyline at golden hour",
-];
-
-export function WelcomeScreen({ onPromptClick, onCategoryClick, onStartWithOllo, onOpenModelGuide }: WelcomeScreenProps) {
+/** Empty state for an account with no series yet. */
+export function WelcomeScreen({ onPromptPick, onOpenModelGuide }: WelcomeScreenProps) {
 	return (
-		<div className="flex flex-col items-center justify-center min-h-[60vh] px-4">
-			{/* Main Heading */}
-			<h1 className="welcome-heading text-3xl md:text-4xl text-center text-[var(--text-primary)] mb-2">
-				What will you create?
-			</h1>
-			<p className="text-sm text-[var(--text-secondary)] mb-6">
-				Describe your vision and let divine inspiration bring it to life
+		<div className="flex min-h-[55vh] flex-col justify-center py-8">
+			<h1 className="font-display text-3xl leading-tight sm:text-4xl">Start your first series</h1>
+			<p className="mt-3 max-w-prose text-muted-foreground">
+				Describe an image in the bar below and press Generate. Then ask for changes, one at a time:
+				each step builds on the last image.
 			</p>
 
-			{/* Ollo CTA */}
-			{onStartWithOllo && (
-				<div className="flex flex-col items-center gap-3 mb-8">
-					<button
-						type="button"
-						onClick={onStartWithOllo}
-						className="divine-gradient rounded-xl py-3 px-6 flex items-center gap-3 sacred-glow hover:scale-[1.02] transition-transform"
-					>
-						<OlloAvatar size="sm" animated={false} />
-						<span className="text-base font-semibold">Start building with Ollo</span>
-					</button>
-					<span className="text-xs text-[var(--text-secondary)]">or dive right in below</span>
-				</div>
-			)}
-
-			{/* Category Pills */}
-			<div className="flex flex-wrap justify-center gap-2 mb-10">
-				{categories.map((cat) => (
-					<button
-						key={cat.id}
-						type="button"
-						onClick={() => onCategoryClick(cat.id)}
-						className="action-pill"
-					>
-						{cat.label}
-					</button>
-				))}
-			</div>
-
-			{/* Suggestions */}
-			<div className="w-full max-w-lg space-y-2">
-				<p className="text-xs text-[var(--text-secondary)] uppercase tracking-wider mb-3 text-center">
-					Try one of these
-				</p>
-				<div className="grid gap-2">
-					{suggestions.map((prompt) => (
-						<button
-							key={prompt}
-							type="button"
-							onClick={() => onPromptClick(prompt)}
-							className="suggestion-card"
-						>
-							<span className="text-[var(--accent)] mr-2">→</span>
-							{prompt}
-						</button>
+			<div className="mt-8">
+				<p className="text-sm font-medium">Or start from an example</p>
+				<ul className="mt-3 grid gap-2">
+					{STARTER_PROMPTS.map((prompt) => (
+						<li key={prompt}>
+							<button
+								type="button"
+								onClick={() => onPromptPick(prompt)}
+								className="w-full rounded-lg border border-border bg-card px-4 py-3 text-left text-sm text-foreground transition-colors hover:border-foreground/30 focus-visible:ring-3 focus-visible:ring-ring/50"
+							>
+								{prompt}
+							</button>
+						</li>
 					))}
-				</div>
+				</ul>
 			</div>
 
-			{/* Model Guide CTA */}
 			{onOpenModelGuide && (
-				<button
+				<Button
 					type="button"
+					variant="ghost"
+					className="mt-6 self-start px-2"
 					onClick={onOpenModelGuide}
-					className="mt-12 text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors flex items-center gap-2"
 				>
-					<span>New here?</span>
-					<span className="text-[var(--accent)] underline underline-offset-2">Check out our model guide</span>
-					<span>→</span>
-				</button>
+					Compare models and credit costs
+				</Button>
 			)}
 		</div>
 	);
