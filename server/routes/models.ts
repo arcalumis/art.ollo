@@ -2,7 +2,9 @@ import type { FastifyInstance } from "fastify";
 import { getDb } from "../db";
 import { optionalAuthMiddleware } from "../middleware/auth";
 import { getModels } from "../services/replicate";
-import { getAllowedModelsForUser } from "../services/usage";
+import { getAllowedModelsForUser, getModelCreditCost } from "../services/usage";
+
+const DEFAULT_MODEL = "black-forest-labs/flux-2-dev";
 
 interface ModelStats {
 	model: string;
@@ -43,10 +45,19 @@ export async function modelsRoutes(fastify: FastifyInstance): Promise<void> {
 		// Merge stats into models
 		const modelsWithStats = filteredModels.map((m) => ({
 			...m,
+			creditCost: getModelCreditCost(m.id),
 			avgGenerationTime: statsMap.get(m.id)?.avg_time || null,
 			sampleCount: statsMap.get(m.id)?.sample_count || 0,
 		}));
 
 		return { models: modelsWithStats };
+	});
+
+	// Per-image credit cost of every model (admin overrides applied), unfiltered by tier so the
+	// public pricing page can translate credits into image counts.
+	fastify.get("/api/models/credit-costs", async () => {
+		const costs: Record<string, number> = {};
+		for (const m of getModels()) costs[m.id] = getModelCreditCost(m.id);
+		return { defaultModel: DEFAULT_MODEL, costs };
 	});
 }

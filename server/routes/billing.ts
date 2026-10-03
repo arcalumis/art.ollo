@@ -69,10 +69,9 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 						us.current_period_start,
 						us.current_period_end,
 						us.last_credit_topoff_at,
+						us.product_id,
 						sp.name as plan_name,
 						sp.price,
-						sp.monthly_image_limit,
-						sp.monthly_cost_limit,
 						sp.credit_refill_amount,
 						sp.topoff_interval_hours
 					FROM user_subscriptions us
@@ -88,10 +87,9 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 					current_period_start: string | null;
 					current_period_end: string | null;
 					last_credit_topoff_at: string | null;
+					product_id: string;
 					plan_name: string;
 					price: number;
-					monthly_image_limit: number | null;
-					monthly_cost_limit: number | null;
 					credit_refill_amount: number;
 					topoff_interval_hours: number;
 			  }
@@ -102,11 +100,11 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 		const yearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 		const usage = db
 			.prepare(`
-					SELECT image_count, total_cost
+					SELECT image_count
 					FROM usage_monthly
 					WHERE user_id = ? AND year_month = ?
 				`)
-			.get(userId, yearMonth) as { image_count: number; total_cost: number } | undefined;
+			.get(userId, yearMonth) as { image_count: number } | undefined;
 
 		// Get total spent all time
 		const totalSpent = db
@@ -157,11 +155,10 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			subscription: subscription
 				? {
 						id: subscription.id,
+						productId: subscription.product_id,
 						status: subscription.status,
 						planName: subscription.plan_name,
 						price: subscription.price,
-						monthlyImageLimit: subscription.monthly_image_limit,
-						monthlyCostLimit: subscription.monthly_cost_limit,
 						creditRefillAmount: subscription.credit_refill_amount || 0,
 						topoffIntervalHours: subscription.topoff_interval_hours || 24,
 						nextRefillAt,
@@ -171,7 +168,6 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 				: null,
 			usage: {
 				imageCount: usage?.image_count || 0,
-				totalCost: usage?.total_cost || 0,
 			},
 			totalSpentCents: totalSpent?.total_paid_cents || 0,
 			recentPayments: recentPayments.map((p) => ({
@@ -196,8 +192,6 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 					id,
 					name,
 					description,
-					monthly_image_limit,
-					monthly_cost_limit,
 					credit_refill_amount,
 					topoff_interval_hours,
 					bonus_credits,
@@ -206,7 +200,6 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 					available_for_usd,
 					available_for_sol,
 					stripe_price_id,
-					overage_price_cents,
 					allowed_models
 				FROM subscription_products
 				WHERE is_active = 1
@@ -217,8 +210,6 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			id: string;
 			name: string;
 			description: string | null;
-			monthly_image_limit: number | null;
-			monthly_cost_limit: number | null;
 			credit_refill_amount: number;
 			topoff_interval_hours: number;
 			bonus_credits: number;
@@ -227,17 +218,24 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 			available_for_usd: number;
 			available_for_sol: number;
 			stripe_price_id: string | null;
-			overage_price_cents: number;
 			allowed_models: string | null;
 		}>;
+
+		// The Free tier has no Stripe price, so it is reported separately for the pricing page.
+		const free = db
+			.prepare(
+				`SELECT id, name, credit_refill_amount, topoff_interval_hours, allowed_models
+				FROM subscription_products WHERE name = 'Free' AND is_active = 1 ORDER BY created_at ASC LIMIT 1`,
+			)
+			.get() as
+			| { id: string; name: string; credit_refill_amount: number; topoff_interval_hours: number; allowed_models: string | null }
+			| undefined;
 
 		return {
 			products: products.map((p) => ({
 				id: p.id,
 				name: p.name,
 				description: p.description,
-				monthlyImageLimit: p.monthly_image_limit,
-				monthlyCostLimit: p.monthly_cost_limit,
 				creditRefillAmount: p.credit_refill_amount || 0,
 				topoffIntervalHours: p.topoff_interval_hours || 24,
 				bonusCredits: p.bonus_credits,
@@ -246,9 +244,17 @@ export async function billingRoutes(fastify: FastifyInstance): Promise<void> {
 				availableForUsd: p.available_for_usd === 1,
 				availableForSol: p.available_for_sol === 1,
 				stripePriceId: p.stripe_price_id,
-				overagePriceCents: p.overage_price_cents,
 				allowedModels: p.allowed_models ? JSON.parse(p.allowed_models) : null,
 			})),
+			free: free
+				? {
+						id: free.id,
+						name: free.name,
+						creditRefillAmount: free.credit_refill_amount || 0,
+						topoffIntervalHours: free.topoff_interval_hours || 720,
+						allowedModels: free.allowed_models ? JSON.parse(free.allowed_models) : null,
+					}
+				: null,
 		};
 	});
 
