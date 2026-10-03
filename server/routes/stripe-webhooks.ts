@@ -13,7 +13,11 @@ import {
 	syncStripeSubscription,
 	updateUserMetrics,
 } from "../services/stripe";
+import { sendPaymentFailedOnce, sendReceiptOnce } from "../services/email";
 import { addCredits } from "../services/usage";
+
+/** Emails queued by a handler, sent only after its transaction commits. */
+type Outbox = Array<() => Promise<void>>;
 
 /**
  * Thrown when an event can't be applied yet but a retry could succeed (e.g. a paid subscription
@@ -94,16 +98,17 @@ export async function stripeWebhookRoutes(fastify: FastifyInstance): Promise<voi
  */
 export function processStripeEvent(event: Stripe.Event): "processed" | "duplicate" {
 	const db = getDb();
-	return db.transaction(() => {
+	const outbox: Outbox = [];
+	const outcome = db.transaction(() => {
 		const seen = db.prepare("SELECT 1 FROM processed_webhook_events WHERE stripe_event_id = ?").get(event.id);
 		if (seen) return "duplicate" as const;
 
 		switch (event.type) {
 			case "invoice.paid":
-				handleInvoicePaid(event.data.object as Stripe.Invoice);
+				handleInvoicePaid(event.data.object as Stripe.Invoice, outbox);
 				break;
 			case "invoice.payment_failed":
-				handleInvoicePaymentFailed(event.data.object as Stripe.Invoice);
+				handleInvoicePaymentFailed(event.data.object as Stripe.Invoice, outbox);
 				break;
 			case "customer.subscription.created":
 			case "customer.subscription.updated":
@@ -114,7 +119,7 @@ export function processStripeEvent(event: Stripe.Event): "processed" | "duplicat
 				break;
 			case "checkout.session.completed":
 			case "checkout.session.async_payment_succeeded":
-				handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session);
+				handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session, outbox);
 				break;
 			default:
 				console.log(`Unhandled Stripe event type: ${event.type}`);
@@ -126,6 +131,12 @@ export function processStripeEvent(event: Stripe.Event): "processed" | "duplicat
 		);
 		return "processed" as const;
 	})();
+
+	// Committed: now it is safe to email. Fire-and-forget; the send helpers never throw.
+	if (outcome === "processed") {
+		for (const send of outbox) void send();
+	}
+	return outcome;
 }
 
 // Fields present in our pinned API version (2024-12-18.acacia) but missing from the SDK's newer types.
@@ -156,7 +167,7 @@ function customerId(customer: string | { id: string } | null | undefined): strin
 }
 
 // Bookkeeping event: an unmapped customer can't be fixed by retrying, so log loudly and ack.
-function handleInvoicePaid(invoice: Stripe.Invoice): void {
+function handleInvoicePaid(invoice: Stripe.Invoice, outbox: Outbox): void {
 	const customer = customerId(invoice.customer as string | null);
 	if (!customer) return;
 
@@ -196,9 +207,22 @@ function handleInvoicePaid(invoice: Stripe.Invoice): void {
 
 	updateUserMetrics(userId, amountCents);
 	console.log(`Recorded payment of ${amountCents} cents for user ${userId}`);
+
+	if (amountCents > 0 && invoice.id) {
+		const invoiceId = invoice.id;
+		outbox.push(() =>
+			sendReceiptOnce(userId, `receipt:${invoiceId}`, {
+				amountCents,
+				currency: invoice.currency || "usd",
+				description: invoice.description || (paymentType === "subscription" ? "ollo.art subscription" : `Invoice ${invoice.number ?? invoiceId}`),
+				date: invoice.created ? new Date(invoice.created * 1000) : new Date(),
+				invoiceUrl: invoice.hosted_invoice_url ?? null,
+			}),
+		);
+	}
 }
 
-function handleInvoicePaymentFailed(invoice: Stripe.Invoice): void {
+function handleInvoicePaymentFailed(invoice: Stripe.Invoice, outbox: Outbox): void {
 	const customer = customerId(invoice.customer as string | null);
 	if (!customer) return;
 
@@ -230,6 +254,16 @@ function handleInvoicePaymentFailed(invoice: Stripe.Invoice): void {
 	}
 
 	console.log(`Payment failed for user ${userId}, invoice ${invoice.id}`);
+
+	if (invoice.id) {
+		const invoiceId = invoice.id;
+		outbox.push(() =>
+			sendPaymentFailedOnce(userId, `failed:${invoiceId}`, {
+				amountCents: invoice.amount_due,
+				currency: invoice.currency || "usd",
+			}),
+		);
+	}
 }
 
 /**
@@ -306,7 +340,7 @@ function handleSubscriptionDeleted(subscription: Stripe.Subscription): void {
 	console.log(`Subscription canceled for user ${userId}`);
 }
 
-function handleCheckoutCompleted(session: Stripe.Checkout.Session): void {
+function handleCheckoutCompleted(session: Stripe.Checkout.Session, outbox: Outbox): void {
 	// Subscription-mode checkouts are handled by customer.subscription.* events.
 	if (session.mode !== "payment") return;
 
@@ -359,4 +393,15 @@ function handleCheckoutCompleted(session: Stripe.Checkout.Session): void {
 
 	updateUserMetrics(userId, amountCents);
 	console.log(`Granted ${credits} credits to user ${userId} via Stripe (${amountCents} cents)`);
+
+	if (amountCents > 0) {
+		outbox.push(() =>
+			sendReceiptOnce(userId, `receipt:${session.id}`, {
+				amountCents,
+				currency: session.currency || "usd",
+				description: `${credits} credits`,
+				date: new Date(),
+			}),
+		);
+	}
 }

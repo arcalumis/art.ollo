@@ -988,4 +988,19 @@ function runPhase1BMigrations(db: Database): void {
 			SELECT transaction_signature, 'subscription', id, user_id FROM solana_subscription_transactions
 			WHERE status = 'completed' AND transaction_signature NOT LIKE 'pending_%';
 	`);
+
+	// ---- Phase 3D migrations ----
+	// Low-credit email throttle (at most one per user per 7 days).
+	if (!hasColumn(db, "users", "low_credit_email_at")) {
+		db.exec("ALTER TABLE users ADD COLUMN low_credit_email_at DATETIME");
+	}
+	// One row per transactional email that must go out at most once (receipt per invoice, etc.).
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS transactional_email_log (
+			dedupe_key TEXT PRIMARY KEY,
+			user_id TEXT,
+			kind TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`);
 }

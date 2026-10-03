@@ -26,6 +26,8 @@ export type EmailTransport = (email: OutgoingEmail) => Promise<SendResult>;
 let resendClient: Resend | null = null;
 
 const resendTransport: EmailTransport = async ({ to, subject, html, devLink }) => {
+	// Tests that don't install a fake transport must never reach Resend.
+	if (process.env.NODE_ENV === "test") return { success: false, error: "Email disabled in tests" };
 	const apiKey = process.env.RESEND_API_KEY;
 	if (!apiKey) {
 		if (isProduction) {
@@ -248,5 +250,196 @@ export async function sendPasswordResetEmail(email: string, username: string, to
 			showRawLink: true,
 		}),
 	});
+}
+
+// ---- Transactional (billing) emails ----
+//
+// Plain, calm layout: no gradients, images or tracking pixels. Every send goes through the
+// same flood caps as auth email (reserveEmailSend) with its own kind.
+
+function formatMoney(amountCents: number, currency = "usd"): string {
+	try {
+		return new Intl.NumberFormat("en-US", { style: "currency", currency: currency.toUpperCase() }).format(
+			amountCents / 100,
+		);
+	} catch {
+		return `${(amountCents / 100).toFixed(2)} ${currency.toUpperCase()}`;
+	}
+}
+
+function plainLayout(opts: {
+	heading: string;
+	paragraphs: string[];
+	buttonUrl: string;
+	buttonLabel: string;
+	footer: string;
+}): string {
+	const body = opts.paragraphs.map((p) => `<p style="font-size: 16px; margin: 0 0 16px;">${p}</p>`).join("\n    ");
+	return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #152126; background: #eceae4; margin: 0; padding: 24px;">
+  <div style="max-width: 560px; margin: 0 auto; background: #f8f7f3; border: 1px solid #d9d6cc; border-radius: 12px; padding: 32px;">
+    <p style="font-size: 20px; margin: 0 0 24px; color: #152126;">ollo</p>
+    <h1 style="font-size: 22px; font-weight: 600; margin: 0 0 16px;">${opts.heading}</h1>
+    ${body}
+    <a href="${opts.buttonUrl}" style="display: inline-block; background: #152126; color: #f8f7f3; text-decoration: none; padding: 12px 22px; border-radius: 8px; font-weight: 600; font-size: 15px; margin: 8px 0 24px;">${opts.buttonLabel}</a>
+    <p style="font-size: 13px; color: #59696a; margin: 0;">${opts.footer}</p>
+  </div>
+</body>
+</html>
+`;
+}
+
+export interface ReceiptData {
+	amountCents: number;
+	currency?: string;
+	description: string;
+	date?: Date;
+	invoiceUrl?: string | null;
+}
+
+export async function sendPaymentReceiptEmail(to: string, data: ReceiptData): Promise<SendResult> {
+	if (!reserveEmailSend(to, "receipt")) return { success: false, error: "Send cap reached" };
+	const amount = formatMoney(data.amountCents, data.currency);
+	const date = (data.date ?? new Date()).toLocaleDateString("en-US", {
+		year: "numeric",
+		month: "long",
+		day: "numeric",
+	});
+	const paragraphs = [
+		`We received your payment of <strong>${amount}</strong> on ${date}.`,
+		`For: ${escapeHtml(data.description)}`,
+	];
+	if (data.invoiceUrl) {
+		paragraphs.push(`<a href="${escapeHtml(data.invoiceUrl)}" style="color: #2d6f61;">View or download the invoice</a>`);
+	}
+	return sendEmail({
+		to,
+		subject: `Your ollo.art receipt for ${amount}`,
+		html: plainLayout({
+			heading: "Payment received",
+			paragraphs,
+			buttonUrl: `${APP_URL}/billing`,
+			buttonLabel: "View billing",
+			footer: "Keep this email for your records. Questions about a charge? Reply to this email.",
+		}),
+	});
+}
+
+export async function sendPaymentFailedEmail(
+	to: string,
+	data: { amountCents: number; currency?: string },
+): Promise<SendResult> {
+	if (!reserveEmailSend(to, "payment_failed")) return { success: false, error: "Send cap reached" };
+	const amount = formatMoney(data.amountCents, data.currency);
+	return sendEmail({
+		to,
+		subject: "Your ollo.art payment didn't go through",
+		html: plainLayout({
+			heading: "Your payment didn't go through",
+			paragraphs: [
+				`We couldn't charge <strong>${amount}</strong> for your ollo.art plan.`,
+				"Update your card from the billing page to keep your plan and monthly credits. Credits you already have stay in your account.",
+			],
+			buttonUrl: `${APP_URL}/billing`,
+			buttonLabel: "Update payment method",
+			footer: "Your bank may have declined the charge, or the card may have expired.",
+		}),
+	});
+}
+
+export async function sendLowCreditsEmail(to: string, data: { balance: number }): Promise<SendResult> {
+	if (!reserveEmailSend(to, "low_credits")) return { success: false, error: "Send cap reached" };
+	const left = data.balance === 1 ? "1 credit" : `${Math.max(0, data.balance)} credits`;
+	return sendEmail({
+		to,
+		subject: `You have ${left} left on ollo.art`,
+		html: plainLayout({
+			heading: `You have ${left} left`,
+			paragraphs: [
+				"That may not cover your next image. Pick a plan for monthly credits, or top up once from your billing page.",
+				`<a href="${APP_URL}/billing" style="color: #2d6f61;">Top up from billing</a>`,
+			],
+			buttonUrl: `${APP_URL}/pricing`,
+			buttonLabel: "See plans",
+			footer: "We send this at most once a week.",
+		}),
+	});
+}
+
+function userEmail(userId: string): string | null {
+	const row = getDb().prepare("SELECT email FROM users WHERE id = ?").get(userId) as
+		| { email: string | null }
+		| undefined;
+	return row?.email || null;
+}
+
+/** Claim a dedupe key; true only for the first caller. */
+function claimTransactional(dedupeKey: string, userId: string, kind: string): boolean {
+	const result = getDb()
+		.prepare("INSERT OR IGNORE INTO transactional_email_log (dedupe_key, user_id, kind) VALUES (?, ?, ?)")
+		.run(dedupeKey, userId, kind);
+	return result.changes === 1;
+}
+
+async function safely(label: string, send: () => Promise<SendResult>): Promise<void> {
+	try {
+		const result = await send();
+		if (!result.success) console.warn(`[email] ${label} not sent: ${result.error}`);
+	} catch (err) {
+		console.error(`[email] ${label} failed:`, err instanceof Error ? err.message : err);
+	}
+}
+
+/** Send a receipt at most once per dedupe key (e.g. `receipt:<invoice id>`). Never throws. */
+export async function sendReceiptOnce(userId: string, dedupeKey: string, data: ReceiptData): Promise<void> {
+	try {
+		const to = userEmail(userId);
+		if (!to || !claimTransactional(dedupeKey, userId, "receipt")) return;
+		await safely("receipt", () => sendPaymentReceiptEmail(to, data));
+	} catch (err) {
+		console.error("[email] receipt failed:", err instanceof Error ? err.message : err);
+	}
+}
+
+/** Send a payment-failed notice at most once per dedupe key (e.g. `failed:<invoice id>`). Never throws. */
+export async function sendPaymentFailedOnce(
+	userId: string,
+	dedupeKey: string,
+	data: { amountCents: number; currency?: string },
+): Promise<void> {
+	try {
+		const to = userEmail(userId);
+		if (!to || !claimTransactional(dedupeKey, userId, "payment_failed")) return;
+		await safely("payment failed", () => sendPaymentFailedEmail(to, data));
+	} catch (err) {
+		console.error("[email] payment failed notice failed:", err instanceof Error ? err.message : err);
+	}
+}
+
+export const LOW_CREDIT_THRESHOLD = 5;
+
+/** Low-balance nudge: balance below 5, at most once per user per 7 days. Never throws. */
+export async function maybeSendLowCreditEmail(userId: string, balance: number): Promise<void> {
+	try {
+		if (balance >= LOW_CREDIT_THRESHOLD) return;
+		const to = userEmail(userId);
+		if (!to) return;
+		const claimed = getDb()
+			.prepare(
+				`UPDATE users SET low_credit_email_at = datetime('now')
+				WHERE id = ? AND (low_credit_email_at IS NULL OR datetime(low_credit_email_at) < datetime('now', '-7 days'))`,
+			)
+			.run(userId);
+		if (claimed.changes !== 1) return;
+		await safely("low credits", () => sendLowCreditsEmail(to, { balance }));
+	} catch (err) {
+		console.error("[email] low credits failed:", err instanceof Error ? err.message : err);
+	}
 }
 
