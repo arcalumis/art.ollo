@@ -35,3 +35,6 @@ uploads/
 .zshrc
 server-dist/
 shots/
+
+# Claude Code agent worktrees
+.claude/worktrees/
