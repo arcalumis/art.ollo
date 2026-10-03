@@ -19,6 +19,11 @@ beforeAll(() => {
 });
 afterAll(() => fetchSpy.mockRestore());
 
+function stripeClient() {
+	if (!stripeService.stripe) throw new Error("Stripe client not configured in tests");
+	return stripeService.stripe;
+}
+
 function rid(prefix: string): string {
 	return `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
 }
@@ -44,7 +49,7 @@ function linkCustomer(userId: string): string {
 async function sendEvent(type: string, object: Record<string, unknown>, id = rid("evt"), created?: number) {
 	const app = await getApp();
 	const payload = JSON.stringify({ id, object: "event", type, data: { object }, ...(created ? { created } : {}) });
-	const signature = await stripeService.stripe!.webhooks.generateTestHeaderStringAsync({ payload, secret: WEBHOOK_SECRET });
+	const signature = await stripeClient().webhooks.generateTestHeaderStringAsync({ payload, secret: WEBHOOK_SECRET });
 	return app.inject({
 		method: "POST",
 		url: "/api/webhooks/stripe",
@@ -436,7 +441,7 @@ describe("billing checkout guards", () => {
 		const user = createUser();
 		const customer = linkCustomer(user.id);
 		const product = makeProduct();
-		const s = stripeService.stripe!;
+		const s = stripeClient();
 		const list = spyOn(s.subscriptions, "list").mockResolvedValue({ data: [{ id: "sub_x", status: "past_due" }] } as never);
 		const create = spyOn(s.checkout.sessions, "create").mockResolvedValue({ url: "https://checkout.example/x" } as never);
 		try {
@@ -455,7 +460,7 @@ describe("billing checkout guards", () => {
 		const user = createUser();
 		linkCustomer(user.id);
 		const product = makeProduct();
-		const s = stripeService.stripe!;
+		const s = stripeClient();
 		const list = spyOn(s.subscriptions, "list").mockResolvedValue({
 			data: [{ id: "sub_old", status: "canceled" }, { id: "sub_inc", status: "incomplete_expired" }],
 		} as never);

@@ -23,7 +23,7 @@ afterAll(() => {
 });
 afterEach(() => {
 	sent = [];
-	delete process.env.EMAIL_DAILY_CAP;
+	Reflect.deleteProperty(process.env, "EMAIL_DAILY_CAP");
 });
 
 const addr = () => `r.${randomUUID().slice(0, 8)}@example.com`;

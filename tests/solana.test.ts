@@ -72,6 +72,11 @@ afterAll(() => {
 });
 
 let sigSeq = 0;
+function must<T>(value: T | null | undefined): T {
+	if (value == null) throw new Error("expected a value");
+	return value;
+}
+
 function fakeSignature(): string {
 	sigSeq++;
 	// Fixed-width counter: "sig1" + 1s and "sig11" + 1s used to collide after truncation.
@@ -116,12 +121,12 @@ describe("solana credit purchases", () => {
 
 	test("one signature can't pay for two pending payments", async () => {
 		const { user, wallet, payment } = setupCreditPayment();
-		const second = initiatePayment(user.id, getCreditPackages()[0].id, wallet);
+		const second = must(initiatePayment(user.id, getCreditPackages()[0].id, wallet));
 		const sig = fakeSignature();
 		chain.set(sig, { payer: wallet, lamports: payment.amountLamports, blockTime: now(), refs: [payment.reference] });
 		const [a, b] = await Promise.all([
 			verifyAndCreditTransaction(payment.paymentId, sig, user.id),
-			verifyAndCreditTransaction(second!.paymentId, sig, user.id),
+			verifyAndCreditTransaction(second.paymentId, sig, user.id),
 		]);
 		expect([a.success, b.success].filter(Boolean)).toHaveLength(1);
 		expect(creditBalance(user.id)).toBe(payment.credits);
@@ -182,11 +187,11 @@ describe("solana credit purchases", () => {
 	test("a transfer made for payment A can't verify payment B (even from the same wallet)", async () => {
 		const { user, wallet, payment } = setupCreditPayment();
 		const other = createUser();
-		const b = initiatePayment(other.id, getCreditPackages()[0].id, wallet);
-		expect(b!.reference).not.toBe(payment.reference);
+		const b = must(initiatePayment(other.id, getCreditPackages()[0].id, wallet));
+		expect(b.reference).not.toBe(payment.reference);
 		const sig = fakeSignature();
 		chain.set(sig, { payer: wallet, lamports: payment.amountLamports, blockTime: now(), refs: [payment.reference] });
-		const stolen = await verifyAndCreditTransaction(b!.paymentId, sig, other.id);
+		const stolen = await verifyAndCreditTransaction(b.paymentId, sig, other.id);
 		expect(stolen.success).toBe(false);
 		expect(creditBalance(other.id)).toBe(0);
 		// The rightful payer can still claim it
@@ -246,14 +251,14 @@ describe("solana credit purchases", () => {
 describe("solana subscriptions", () => {
 	test("a signature can't be claimed for both credits and a subscription", async () => {
 		const { user, wallet, payment } = setupCreditPayment();
-		const sub = initiateSubscriptionPayment(user.id, "sol-plan", wallet);
+		const sub = must(initiateSubscriptionPayment(user.id, "sol-plan", wallet));
 		const sig = fakeSignature();
 		// Large enough to satisfy either payment
-		chain.set(sig, { payer: wallet, lamports: Math.max(payment.amountLamports, sub!.amountLamports), blockTime: now(), refs: [payment.reference, sub!.reference] });
+		chain.set(sig, { payer: wallet, lamports: Math.max(payment.amountLamports, sub.amountLamports), blockTime: now(), refs: [payment.reference, sub.reference] });
 
 		const credits = await verifyAndCreditTransaction(payment.paymentId, sig, user.id);
 		expect(credits.success).toBe(true);
-		const subscription = await verifyAndCreateSubscription(sub!.paymentId, sig, user.id);
+		const subscription = await verifyAndCreateSubscription(sub.paymentId, sig, user.id);
 		expect(subscription.success).toBe(false);
 		expect(subscription.error).toContain("already used");
 	});
@@ -261,10 +266,10 @@ describe("solana subscriptions", () => {
 	test("a subscription transfer without its reference is rejected", async () => {
 		const user = createUser();
 		const wallet = Keypair.generate().publicKey.toBase58();
-		const sub = initiateSubscriptionPayment(user.id, "sol-plan", wallet);
+		const sub = must(initiateSubscriptionPayment(user.id, "sol-plan", wallet));
 		const sig = fakeSignature();
-		chain.set(sig, { payer: wallet, lamports: sub!.amountLamports, blockTime: now() });
-		const result = await verifyAndCreateSubscription(sub!.paymentId, sig, user.id);
+		chain.set(sig, { payer: wallet, lamports: sub.amountLamports, blockTime: now() });
+		const result = await verifyAndCreateSubscription(sub.paymentId, sig, user.id);
 		expect(result.success).toBe(false);
 		expect(result.error).toContain("not made for this payment");
 	});
@@ -272,12 +277,12 @@ describe("solana subscriptions", () => {
 	test("a valid SOL subscription retires the old row and grants the bonus once", async () => {
 		const user = createUser();
 		const wallet = Keypair.generate().publicKey.toBase58();
-		const sub = initiateSubscriptionPayment(user.id, "sol-plan", wallet);
+		const sub = must(initiateSubscriptionPayment(user.id, "sol-plan", wallet));
 		const sig = fakeSignature();
-		chain.set(sig, { payer: wallet, lamports: sub!.amountLamports, blockTime: now(), refs: [sub!.reference] });
+		chain.set(sig, { payer: wallet, lamports: sub.amountLamports, blockTime: now(), refs: [sub.reference] });
 		const results = await Promise.all([
-			verifyAndCreateSubscription(sub!.paymentId, sig, user.id),
-			verifyAndCreateSubscription(sub!.paymentId, sig, user.id),
+			verifyAndCreateSubscription(sub.paymentId, sig, user.id),
+			verifyAndCreateSubscription(sub.paymentId, sig, user.id),
 		]);
 		expect(results.filter((r) => r.success)).toHaveLength(1);
 		expect(creditBalance(user.id)).toBe(25);
