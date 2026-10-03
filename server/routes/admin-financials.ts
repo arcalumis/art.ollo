@@ -1,7 +1,11 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { getDb } from "../db";
 import { adminMiddleware } from "../middleware/auth";
+import { writeAudit } from "../services/admin-audit";
+import { getReconcileJob, startReconcileJob } from "../services/admin-maintenance";
+import { InvalidDateError, parseDateParam, toSqlTime } from "../services/admin-time";
 import {
+	type PeriodType,
 	calculateMetrics,
 	computePeriodSnapshot,
 	generateProfitLossStatement,
@@ -11,378 +15,230 @@ import {
 	getRevenueTrend,
 	getTopCustomers,
 } from "../services/financial-reports";
-import { getCostSummary, reconcileAllCosts } from "../services/replicate-billing";
+import { getCostSummary } from "../services/replicate-billing";
+import { actorOf } from "./admin-helpers";
 
 interface DateRangeQuery {
 	startDate?: string;
 	endDate?: string;
-	period?: "mtd" | "qtd" | "ytd" | "last30" | "last90" | "custom";
+	period?: string;
 }
 
-interface TrendQuery {
-	type?: "daily" | "weekly" | "monthly";
-	count?: string;
-}
+const PERIODS = new Set(["mtd", "qtd", "ytd", "last30", "last90", "custom"]);
+const PERIOD_TYPES = new Set<PeriodType>(["daily", "monthly", "quarterly", "yearly"]);
 
-function getDateRange(query: DateRangeQuery): { start: Date; end: Date } {
-	const now = new Date();
-	let start: Date;
-	let end = new Date();
-
-	switch (query.period) {
-		case "mtd":
-			start = new Date(now.getFullYear(), now.getMonth(), 1);
-			break;
-		case "qtd": {
-			const quarter = Math.floor(now.getMonth() / 3);
-			start = new Date(now.getFullYear(), quarter * 3, 1);
-			break;
-		}
+/** [start, end) for a report request. Throws InvalidDateError for bad input (answered as 400). */
+export function getDateRange(query: DateRangeQuery, now: Date = new Date()): { start: Date; end: Date } {
+	const end = new Date(now);
+	const utc = (y: number, m: number) => new Date(Date.UTC(y, m, 1));
+	const period = query.period ?? "mtd";
+	if (!PERIODS.has(period)) throw new InvalidDateError("period");
+	switch (period) {
+		case "qtd":
+			return { start: utc(now.getUTCFullYear(), Math.floor(now.getUTCMonth() / 3) * 3), end };
 		case "ytd":
-			start = new Date(now.getFullYear(), 0, 1);
-			break;
+			return { start: utc(now.getUTCFullYear(), 0), end };
 		case "last30":
-			start = new Date(now);
-			start.setDate(start.getDate() - 30);
-			break;
+			return { start: new Date(now.getTime() - 30 * 86_400_000), end };
 		case "last90":
-			start = new Date(now);
-			start.setDate(start.getDate() - 90);
-			break;
-		case "custom":
-			if (query.startDate && query.endDate) {
-				start = new Date(query.startDate);
-				end = new Date(query.endDate);
-			} else {
-				start = new Date(now.getFullYear(), now.getMonth(), 1);
-			}
-			break;
+			return { start: new Date(now.getTime() - 90 * 86_400_000), end };
+		case "custom": {
+			const start = parseDateParam(query.startDate, "startDate");
+			const customEnd = parseDateParam(query.endDate, "endDate");
+			if (customEnd.getTime() <= start.getTime()) throw new InvalidDateError("endDate");
+			return { start, end: customEnd };
+		}
 		default:
-			start = new Date(now.getFullYear(), now.getMonth(), 1);
+			return { start: utc(now.getUTCFullYear(), now.getUTCMonth()), end };
 	}
-
-	return { start, end };
 }
+
+function badRequest(reply: FastifyReply, err: unknown) {
+	if (err instanceof InvalidDateError) {
+		return reply.status(400).send({ error: err.message, code: "INVALID_DATE" });
+	}
+	throw err;
+}
+
+const periodOf = (start: Date, end: Date) => ({ start: start.toISOString(), end: end.toISOString() });
 
 export async function adminFinancialsRoutes(fastify: FastifyInstance): Promise<void> {
-	// Dashboard overview
-	fastify.get<{ Querystring: DateRangeQuery }>(
-		"/api/admin/financials/overview",
-		{ preHandler: adminMiddleware },
-		async (request) => {
+	fastify.addHook("preHandler", adminMiddleware);
+
+	fastify.get<{ Querystring: DateRangeQuery }>("/api/admin/financials/overview", async (request, reply) => {
+		try {
 			const { start, end } = getDateRange(request.query);
-			const metrics = calculateMetrics(start, end);
-
+			const m = calculateMetrics(start, end);
 			return {
-				period: {
-					start: start.toISOString(),
-					end: end.toISOString(),
-				},
-				revenue: metrics.revenue,
-				costs: metrics.costs,
-				profit: metrics.profit,
-				subscribers: metrics.subscribers,
-				mrr: metrics.mrr,
-				arr: metrics.arr,
-				ltv: metrics.ltv,
-				generations: metrics.generations,
-				avgCostPerGeneration: metrics.avgCostPerGeneration,
+				period: periodOf(start, end),
+				revenue: m.revenue,
+				costs: m.costs,
+				profit: m.profit,
+				subscribers: m.subscribers,
+				mrr: m.mrr,
+				arr: m.arr,
+				arpu: m.avgRevenuePerUser,
+				ltv: m.ltv,
+				ltvNote: m.ltv === null ? "Not enough data" : null,
+				generations: m.generations,
+				avgCostPerGeneration: m.avgCostPerGeneration,
 			};
-		},
-	);
+		} catch (err) {
+			return badRequest(reply, err);
+		}
+	});
 
-	// Metrics with period comparison
-	fastify.get(
+	fastify.get<{ Params: { periodType: string } }>(
 		"/api/admin/financials/comparison/:periodType",
-		{ preHandler: adminMiddleware },
-		async (request) => {
-			const { periodType } = request.params as { periodType: string };
-
-			if (!["daily", "monthly", "quarterly", "yearly"].includes(periodType)) {
-				return { error: "Invalid period type" };
+		async (request, reply) => {
+			const { periodType } = request.params;
+			if (!PERIOD_TYPES.has(periodType as PeriodType)) {
+				return reply.status(400).send({ error: "Invalid period type", code: "INVALID_PERIOD" });
 			}
-
-			const comparison = getMetricsWithComparison(
-				periodType as "daily" | "monthly" | "quarterly" | "yearly",
-			);
-
-			return comparison;
+			return getMetricsWithComparison(periodType as PeriodType);
 		},
 	);
 
-	// Revenue breakdown by subscription tier
-	fastify.get<{ Querystring: DateRangeQuery }>(
-		"/api/admin/financials/revenue/by-tier",
-		{ preHandler: adminMiddleware },
-		async (request) => {
+	fastify.get<{ Querystring: DateRangeQuery }>("/api/admin/financials/revenue/by-tier", async (request, reply) => {
+		try {
 			const { start, end } = getDateRange(request.query);
-			const byTier = getRevenueByTier(start, end);
+			return { period: periodOf(start, end), tiers: getRevenueByTier(start, end) };
+		} catch (err) {
+			return badRequest(reply, err);
+		}
+	});
 
-			return {
-				period: {
-					start: start.toISOString(),
-					end: end.toISOString(),
-				},
-				tiers: byTier,
-			};
-		},
-	);
-
-	// Top customers by revenue
 	fastify.get<{ Querystring: DateRangeQuery & { limit?: string } }>(
 		"/api/admin/financials/revenue/top-customers",
-		{ preHandler: adminMiddleware },
-		async (request) => {
-			const { start, end } = getDateRange(request.query);
-			const limit = Math.min(50, Math.max(1, Number.parseInt(request.query.limit || "10", 10)));
-			const topCustomers = getTopCustomers(start, end, limit);
-
-			return {
-				period: {
-					start: start.toISOString(),
-					end: end.toISOString(),
-				},
-				customers: topCustomers,
-			};
-		},
-	);
-
-	// Cost breakdown by model
-	fastify.get<{ Querystring: DateRangeQuery }>(
-		"/api/admin/financials/costs/by-model",
-		{ preHandler: adminMiddleware },
-		async (request) => {
-			const { start, end } = getDateRange(request.query);
-			const byModel = getCostsByModel(start, end);
-
-			return {
-				period: {
-					start: start.toISOString(),
-					end: end.toISOString(),
-				},
-				models: byModel,
-			};
-		},
-	);
-
-	// Cost summary (from replicate-billing)
-	fastify.get<{ Querystring: DateRangeQuery }>(
-		"/api/admin/financials/costs/summary",
-		{ preHandler: adminMiddleware },
-		async (request) => {
-			const { start, end } = getDateRange(request.query);
-			const summary = getCostSummary(start, end);
-
-			return {
-				period: {
-					start: start.toISOString(),
-					end: end.toISOString(),
-				},
-				...summary,
-			};
-		},
-	);
-
-	// Revenue/profit trend
-	fastify.get<{ Querystring: TrendQuery }>(
-		"/api/admin/financials/trend",
-		{ preHandler: adminMiddleware },
-		async (request) => {
-			const type = (request.query.type || "monthly") as "daily" | "weekly" | "monthly";
-			const count = Math.min(365, Math.max(1, Number.parseInt(request.query.count || "12", 10)));
-
-			const trend = getRevenueTrend(type, count);
-
-			return {
-				type,
-				data: trend,
-			};
-		},
-	);
-
-	// P&L statement
-	fastify.get<{ Querystring: DateRangeQuery }>(
-		"/api/admin/financials/pnl",
-		{ preHandler: adminMiddleware },
-		async (request) => {
-			const { start, end } = getDateRange(request.query);
-			const pnl = generateProfitLossStatement(start, end);
-
-			return {
-				period: {
-					start: start.toISOString(),
-					end: end.toISOString(),
-				},
-				...pnl,
-			};
-		},
-	);
-
-	// MRR/ARR history
-	fastify.get(
-		"/api/admin/financials/mrr-history",
-		{ preHandler: adminMiddleware },
-		async () => {
-			const db = getDb();
-
-			const history = db
-				.prepare(`
-					SELECT
-						period_start,
-						mrr_cents / 100.0 as mrr,
-						active_subscribers,
-						new_subscribers,
-						churned_subscribers
-					FROM financial_periods
-					WHERE period_type = 'monthly'
-					ORDER BY period_start DESC
-					LIMIT 12
-				`)
-				.all() as Array<{
-				period_start: string;
-				mrr: number;
-				active_subscribers: number;
-				new_subscribers: number;
-				churned_subscribers: number;
-			}>;
-
-			return {
-				history: history.reverse(),
-			};
-		},
-	);
-
-	// Churn analysis
-	fastify.get<{ Querystring: DateRangeQuery }>(
-		"/api/admin/financials/churn",
-		{ preHandler: adminMiddleware },
-		async (request) => {
-			const { start, end } = getDateRange(request.query);
-			const db = getDb();
-
-			// Get churned users in period
-			const churned = db
-				.prepare(`
-					SELECT
-						u.username,
-						u.email,
-						um.first_payment_at,
-						um.churned_at,
-						um.total_paid_cents / 100.0 as total_paid,
-						um.subscription_months
-					FROM user_metrics um
-					JOIN users u ON um.user_id = u.id
-					WHERE um.churned_at >= ? AND um.churned_at < ?
-					ORDER BY um.churned_at DESC
-				`)
-				.all(start.toISOString(), end.toISOString()) as Array<{
-				username: string;
-				email: string | null;
-				first_payment_at: string | null;
-				churned_at: string;
-				total_paid: number;
-				subscription_months: number;
-			}>;
-
-			// Calculate churn rate
-			const activeStart = db
-				.prepare(`
-					SELECT COUNT(DISTINCT user_id) as count
-					FROM user_subscriptions
-					WHERE status = 'active' AND created_at < ?
-				`)
-				.get(start.toISOString()) as { count: number };
-
-			const churnRate = activeStart.count > 0 ? (churned.length / activeStart.count) * 100 : 0;
-
-			return {
-				period: {
-					start: start.toISOString(),
-					end: end.toISOString(),
-				},
-				churnedCount: churned.length,
-				churnRate,
-				churnedUsers: churned.map((c) => ({
-					username: c.username,
-					email: c.email,
-					firstPayment: c.first_payment_at,
-					churnedAt: c.churned_at,
-					totalPaid: c.total_paid,
-					subscriptionMonths: c.subscription_months,
-				})),
-			};
-		},
-	);
-
-	// Trigger cost reconciliation manually
-	fastify.post(
-		"/api/admin/financials/reconcile-costs",
-		{ preHandler: adminMiddleware },
-		async () => {
-			const result = await reconcileAllCosts(500);
-			return result;
-		},
-	);
-
-	// Compute period snapshots
-	fastify.post<{ Body: { periodType: string } }>(
-		"/api/admin/financials/snapshot",
-		{ preHandler: adminMiddleware },
-		async (request) => {
-			const { periodType } = request.body;
-
-			if (!["daily", "monthly", "quarterly", "yearly"].includes(periodType)) {
-				return { error: "Invalid period type" };
+		async (request, reply) => {
+			try {
+				const { start, end } = getDateRange(request.query);
+				const limit = Math.min(50, Math.max(1, Number.parseInt(request.query.limit || "10", 10) || 10));
+				return { period: periodOf(start, end), customers: getTopCustomers(start, end, limit) };
+			} catch (err) {
+				return badRequest(reply, err);
 			}
-
-			computePeriodSnapshot(periodType as "daily" | "monthly" | "quarterly" | "yearly");
-
-			return { success: true };
 		},
 	);
 
-	// All-time stats summary
-	fastify.get(
-		"/api/admin/financials/all-time",
-		{ preHandler: adminMiddleware },
-		async () => {
-			const db = getDb();
+	fastify.get<{ Querystring: DateRangeQuery }>("/api/admin/financials/costs/by-model", async (request, reply) => {
+		try {
+			const { start, end } = getDateRange(request.query);
+			return { period: periodOf(start, end), models: getCostsByModel(start, end) };
+		} catch (err) {
+			return badRequest(reply, err);
+		}
+	});
 
-			// Total revenue all time
-			const totalRevenue = db
-				.prepare(
-					"SELECT SUM(amount_cents) / 100.0 as total FROM revenue_events WHERE amount_cents > 0",
-				)
-				.get() as { total: number | null };
+	fastify.get<{ Querystring: DateRangeQuery }>("/api/admin/financials/costs/summary", async (request, reply) => {
+		try {
+			const { start, end } = getDateRange(request.query);
+			return { period: periodOf(start, end), ...getCostSummary(start, end) };
+		} catch (err) {
+			return badRequest(reply, err);
+		}
+	});
 
-			// Total costs all time
-			const totalCosts = db
-				.prepare("SELECT SUM(COALESCE(actual_cost, estimated_cost)) as total FROM platform_costs")
-				.get() as { total: number | null };
+	fastify.get<{ Querystring: { type?: string; count?: string } }>("/api/admin/financials/trend", async (request, reply) => {
+		const type = request.query.type || "monthly";
+		if (type !== "daily" && type !== "weekly" && type !== "monthly") {
+			return reply.status(400).send({ error: "Invalid trend type", code: "INVALID_PERIOD" });
+		}
+		const count = Math.min(365, Math.max(1, Number.parseInt(request.query.count || "12", 10) || 12));
+		return { type, data: getRevenueTrend(type, count) };
+	});
 
-			// Total generations
-			const totalGenerations = db
-				.prepare("SELECT COUNT(*) as count FROM generations WHERE purged_at IS NULL")
-				.get() as { count: number };
+	fastify.get<{ Querystring: DateRangeQuery }>("/api/admin/financials/pnl", async (request, reply) => {
+		try {
+			const { start, end } = getDateRange(request.query);
+			return { period: periodOf(start, end), ...generateProfitLossStatement(start, end) };
+		} catch (err) {
+			return badRequest(reply, err);
+		}
+	});
 
-			// Total users
-			const totalUsers = db.prepare("SELECT COUNT(*) as count FROM users").get() as {
-				count: number;
-			};
+	fastify.get("/api/admin/financials/mrr-history", async () => {
+		const history = getDb()
+			.prepare(`
+				SELECT period_start, mrr_cents / 100.0 AS mrr, active_subscribers, new_subscribers, churned_subscribers,
+					total_revenue_cents / 100.0 AS revenue, total_platform_cost_cents / 100.0 AS costs
+				FROM financial_periods
+				WHERE period_type = 'monthly'
+				ORDER BY period_start DESC
+				LIMIT 24
+			`)
+			.all();
+		return { history: history.reverse() };
+	});
 
-			// Paying customers (ever)
-			const payingCustomers = db
-				.prepare("SELECT COUNT(DISTINCT user_id) as count FROM payments WHERE status = 'succeeded'")
-				.get() as { count: number };
-
+	fastify.get<{ Querystring: DateRangeQuery }>("/api/admin/financials/churn", async (request, reply) => {
+		try {
+			const { start, end } = getDateRange(request.query);
+			const churned = getDb()
+				.prepare(`
+					SELECT u.id AS userId, u.username, u.email, um.first_payment_at AS firstPayment, um.churned_at AS churnedAt,
+						um.total_paid_cents / 100.0 AS totalPaid, um.subscription_months AS subscriptionMonths
+					FROM user_metrics um JOIN users u ON um.user_id = u.id
+					WHERE datetime(um.churned_at) >= datetime(?) AND datetime(um.churned_at) < datetime(?)
+					ORDER BY datetime(um.churned_at) DESC
+				`)
+				.all(toSqlTime(start), toSqlTime(end));
+			const m = calculateMetrics(start, end);
 			return {
-				totalRevenue: totalRevenue.total || 0,
-				totalCosts: totalCosts.total || 0,
-				totalProfit: (totalRevenue.total || 0) - (totalCosts.total || 0),
-				totalGenerations: totalGenerations.count,
-				totalUsers: totalUsers.count,
-				payingCustomers: payingCustomers.count,
+				period: periodOf(start, end),
+				churnedCount: m.subscribers.churned,
+				churnRate: m.subscribers.churnRate,
+				churnedUsers: churned,
 			};
-		},
-	);
+		} catch (err) {
+			return badRequest(reply, err);
+		}
+	});
+
+	// Cost reconciliation runs in the background; poll GET for its state.
+	fastify.post("/api/admin/financials/reconcile-costs", async (request, reply) => {
+		const { started, job } = startReconcileJob(request.user?.username ?? null);
+		if (started) {
+			writeAudit(actorOf(request), { action: "costs.reconcile", targetType: "system", ip: request.ip });
+		}
+		return reply.status(202).send({ started, job });
+	});
+
+	fastify.get("/api/admin/financials/reconcile-costs", async () => ({ job: getReconcileJob() }));
+
+	fastify.post<{ Body: { periodType?: string } }>("/api/admin/financials/snapshot", async (request, reply) => {
+		const periodType = request.body?.periodType;
+		if (!periodType || !PERIOD_TYPES.has(periodType as PeriodType)) {
+			return reply.status(400).send({ error: "Invalid period type", code: "INVALID_PERIOD" });
+		}
+		computePeriodSnapshot(periodType as PeriodType);
+		writeAudit(actorOf(request), {
+			action: "financials.snapshot",
+			targetType: "system",
+			after: { periodType },
+			ip: request.ip,
+		});
+		return { success: true };
+	});
+
+	fastify.get("/api/admin/financials/all-time", async () => {
+		const db = getDb();
+		const revenue = db.prepare("SELECT COALESCE(SUM(amount_cents), 0) / 100.0 AS total FROM revenue_events").get() as {
+			total: number;
+		};
+		const costs = db
+			.prepare("SELECT COALESCE(SUM(COALESCE(actual_cost, estimated_cost)), 0) AS total FROM platform_costs")
+			.get() as { total: number };
+		const generations = db.prepare("SELECT COUNT(*) AS n FROM generations").get() as { n: number };
+		const users = db.prepare("SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NULL").get() as { n: number };
+		const paying = db.prepare("SELECT COUNT(DISTINCT user_id) AS n FROM revenue_events").get() as { n: number };
+		return {
+			totalRevenue: revenue.total,
+			totalCosts: costs.total,
+			totalProfit: revenue.total - costs.total,
+			totalGenerations: generations.n,
+			totalUsers: users.n,
+			payingCustomers: paying.n,
+		};
+	});
 }
