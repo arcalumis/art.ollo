@@ -670,7 +670,8 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 					{
 						userId,
 						model: m.id,
-						prompt: prompt.trim(),
+						// Store what the user asked for; the model saw the variation instruction.
+						prompt: isVariation ? (body.prompt?.trim() || "Variation") : prompt.trim(),
 						results,
 						threadId,
 						threadTitle: generateThreadTitle(isVariation ? "" : body.prompt),

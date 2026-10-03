@@ -326,9 +326,7 @@ export function ImageGallery({
 	return (
 		<div className="mx-auto flex w-full max-w-6xl flex-col gap-5">
 			<header className="flex flex-col gap-4">
-				<h1 className="font-display text-[1.75rem] leading-tight text-foreground sm:text-[2rem]">
-					Images
-				</h1>
+				{/* The page title comes from the app shell's library header. */}
 				<Tabs
 					value={view}
 					onValueChange={(v) => {
