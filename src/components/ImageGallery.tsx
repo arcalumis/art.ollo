@@ -466,11 +466,15 @@ export function ImageGallery({
 									className="grid h-full place-items-center"
 									style={{ aspectRatio: cssAspect(item.aspectRatio) }}
 								>
-									<Laurel
-										progress={item.status === "generating" ? 0.5 : 0}
-										className="w-1/2"
-										label="Rendering"
-									/>
+									{item.live?.phase === "waiting_gpu" ? (
+										<Laurel indeterminate className="w-1/2" label="Waiting for a GPU" />
+									) : (
+										<Laurel
+											progress={item.status === "generating" ? 0.5 : 0}
+											className="w-1/2"
+											label={item.live?.phase === "saving" ? "Saving" : "Rendering"}
+										/>
+									)}
 								</div>
 							)}
 						</li>

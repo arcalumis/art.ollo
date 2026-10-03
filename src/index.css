@@ -217,6 +217,25 @@
 	background: var(--ollo-mute);
 }
 
+/* Laurel indeterminate progress: the gilt band climbs from below the stems to past
+   the tips (viewBox units; the band rests mid-wreath, which reduced motion keeps). */
+@keyframes laurel-sweep {
+	from {
+		transform: translateY(523px);
+	}
+	to {
+		transform: translateY(-523px);
+	}
+}
+.laurel-sweep {
+	animation: laurel-sweep 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+	.laurel-sweep {
+		animation: none !important;
+	}
+}
+
 @media (prefers-reduced-motion: reduce) {
 	*,
 	*::before,

@@ -19,13 +19,30 @@ export type Behavior =
 	| { kind: "succeed"; outputs?: number; delayMs?: number }
 	| { kind: "fail"; delayMs?: number }
 	| { kind: "hang" }
-	| { kind: "cancel" };
+	| { kind: "cancel" }
+	/**
+	 * A scripted GPU queue: prediction number i (0-based, in creation order) sits
+	 * in `starting` for startAfterMs[i] ms after it was created (null or missing
+	 * = never gets a GPU), then renders for renderMs and succeeds.
+	 */
+	| { kind: "timeline"; startAfterMs: (number | null)[]; renderMs?: number };
+
+/** One create call, as the fake Replicate saw it. */
+export interface CreatedPrediction {
+	id: string;
+	index: number;
+	model: string;
+	input: Record<string, unknown>;
+	at: number;
+	canceledAt?: number;
+}
 
 export const fake = {
 	behavior: { kind: "succeed" } as Behavior,
 	creates: 0,
 	cancels: 0,
 	inputs: [] as Record<string, unknown>[],
+	created: [] as CreatedPrediction[],
 	apiKeys: [] as (string | undefined)[],
 	enhanceCalls: 0,
 	reset(behavior: Behavior = { kind: "succeed" }) {
@@ -33,6 +50,7 @@ export const fake = {
 		this.creates = 0;
 		this.cancels = 0;
 		this.inputs = [];
+		this.created = [];
 		this.apiKeys = [];
 		this.enhanceCalls = 0;
 	},
@@ -41,25 +59,66 @@ export const fake = {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const predictions = new Map<string, { outputs: number }>();
 
+/** Status of a scripted prediction right now. */
+function timelineStatus(
+	b: Extract<Behavior, { kind: "timeline" }>,
+	p: CreatedPrediction,
+	outputs: number,
+) {
+	const created_at = new Date(p.at).toISOString();
+	const after = b.startAfterMs[p.index];
+	const startAt = after === null || after === undefined ? undefined : p.at + after;
+	const now = Date.now();
+	const started = startAt !== undefined && startAt <= now && (p.canceledAt ?? now + 1) > startAt;
+	const started_at = started ? new Date(startAt as number).toISOString() : undefined;
+	if (p.canceledAt !== undefined) return { id: p.id, status: "canceled", created_at, started_at };
+	if (!started) return { id: p.id, status: "starting", created_at };
+	if (now < (startAt as number) + (b.renderMs ?? 10)) {
+		return { id: p.id, status: "processing", created_at, started_at };
+	}
+	return {
+		id: p.id,
+		status: "succeeded",
+		created_at,
+		started_at,
+		output: Array.from({ length: outputs }, (_, i) => `https://replicate.delivery/fake/${p.id}/out-${i}.png`),
+		metrics: { predict_time: 1.5 },
+	};
+}
+
 function makeClient(apiKey?: string) {
 	fake.apiKeys.push(apiKey);
 	return {
 		predictions: {
-			async create({ input }: { model: string; input: Record<string, unknown> }) {
+			async create({ model, input }: { model: string; input: Record<string, unknown> }) {
 				fake.creates++;
 				fake.inputs.push(input);
 				const b = fake.behavior;
-				await sleep("delayMs" in b && b.delayMs ? b.delayMs : 10);
+				await sleep("delayMs" in b && b.delayMs ? b.delayMs : b.kind === "timeline" ? 1 : 10);
 				const id = randomUUID();
 				const count = input.num_outputs ?? input.number_of_images ?? input.num_images;
 				const requested = typeof count === "number" ? count : 1;
 				predictions.set(id, {
 					outputs: b.kind === "succeed" && b.outputs !== undefined ? b.outputs : requested,
 				});
+				const record: CreatedPrediction = {
+					id,
+					index: fake.created.length,
+					model,
+					input,
+					at: Date.now(),
+				};
+				fake.created.push(record);
+				if (b.kind === "timeline") return timelineStatus(b, record, requested);
 				return { id, status: "starting" };
 			},
 			async get(id: string) {
 				const b = fake.behavior;
+				if (b.kind === "timeline") {
+					const record = fake.created.find((c) => c.id === id);
+					if (!record) throw new Error(`unknown prediction ${id}`);
+					return timelineStatus(b, record, predictions.get(id)?.outputs ?? 1);
+				}
 				if (b.kind === "hang") return { id, status: "processing" };
 				if (b.kind === "cancel") return { id, status: "canceled" };
 				if (b.kind === "fail") return { id, status: "failed", error: "model exploded" };
@@ -76,6 +135,8 @@ function makeClient(apiKey?: string) {
 			},
 			async cancel(id: string) {
 				fake.cancels++;
+				const record = fake.created.find((c) => c.id === id);
+				if (record && record.canceledAt === undefined) record.canceledAt = Date.now();
 				return { id, status: "canceled" };
 			},
 		},

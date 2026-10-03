@@ -1,8 +1,17 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { opensPaywall } from "../components/billing/generationErrors";
 import { usePaywall } from "../contexts/PaywallContext";
-import type { GenerateRequest, GenerateResponse, ModelsResponse, QueuedGeneration } from "../types";
-import { useGenerate } from "./useApi";
+import type {
+	GenerateRequest,
+	GenerateResponse,
+	LiveGenerationStatus,
+	ModelsResponse,
+	QueuedGeneration,
+} from "../types";
+import { type GenerationStatusResponse, fetchGenerationStatus, useGenerate } from "./useApi";
+
+/** How often an in-flight request asks the server what it is doing. */
+const STATUS_POLL_MS = 1000;
 
 /** Image tools that run on one existing image. */
 export type ImageTool = "upscale" | "remove-background";
@@ -35,6 +44,7 @@ export interface QueueFailure {
 export type QueueAction =
 	| { type: "add"; entry: QueueEntry }
 	| { type: "start"; id: string; startedAt: string; estimatedDuration: number }
+	| { type: "live"; id: string; live: LiveGenerationStatus }
 	| { type: "fail"; id: string; failure: QueueFailure }
 	| { type: "retry"; id: string; createdAt: string }
 	| { type: "remove"; id: string };
@@ -52,8 +62,13 @@ export function queueReducer(state: QueueEntry[], action: QueueAction): QueueEnt
 							status: "generating",
 							startedAt: action.startedAt,
 							estimatedDuration: action.estimatedDuration,
+							live: undefined,
 						}
 					: e,
+			);
+		case "live":
+			return state.map((e) =>
+				e.id === action.id && e.status === "generating" ? { ...e, live: action.live } : e,
 			);
 		case "fail":
 			return state.map((e) =>
@@ -70,12 +85,26 @@ export function queueReducer(state: QueueEntry[], action: QueueAction): QueueEnt
 							errorCode: undefined,
 							creditsNeeded: undefined,
 							balanceAtFailure: undefined,
+							live: undefined,
 						}
 					: e,
 			);
 		case "remove":
 			return state.filter((e) => e.id !== action.id);
 	}
+}
+
+/**
+ * Turn the server's durations into local timestamps, so a skewed client clock
+ * can't distort "Waiting for a GPU · 12s" or the render estimate.
+ */
+export function liveFromStatus(status: GenerationStatusResponse, now: number): LiveGenerationStatus {
+	const live: LiveGenerationStatus = { phase: status.phase };
+	if (typeof status.renderingForMs === "number") live.renderingSince = now - status.renderingForMs;
+	if (typeof status.waitingForMs === "number") {
+		live.waitingSince = (live.renderingSince ?? now) - status.waitingForMs;
+	}
+	return live;
 }
 
 /** The image a tool runs on. */
@@ -154,6 +183,8 @@ export function useGenerationQueue({
 	resolveToolSource,
 }: UseGenerationQueueOptions) {
 	const { generate } = useGenerate(token);
+	const tokenRef = useRef(token);
+	tokenRef.current = token;
 	const paywall = usePaywall();
 	const [entries, setEntries] = useState<QueueEntry[]>([]);
 	const entriesRef = useRef(entries);
@@ -201,8 +232,19 @@ export function useGenerationQueue({
 				estimatedDuration,
 			});
 
+			// One id per attempt, so a retry never reads the previous attempt's status.
+			const clientRequestId = crypto.randomUUID();
+			let polling = true;
+			const poll = setInterval(async () => {
+				const status = await fetchGenerationStatus(tokenRef.current, clientRequestId);
+				if (!polling || !status || status.phase === "done" || status.phase === "failed") return;
+				dispatch({ type: "live", id: entry.id, live: liveFromStatus(status, Date.now()) });
+			}, STATUS_POLL_MS);
+
 			// useGenerate never throws: failures come back with a code.
-			const result = await ctx.generate(entry.request);
+			const result = await ctx.generate({ ...entry.request, clientRequestId });
+			polling = false;
+			clearInterval(poll);
 			inFlight.current.delete(entry.id);
 			const after = latest.current;
 			// Success charges credits; failures may have refunded them. Either way the pill updates.

@@ -4,6 +4,7 @@ import type {
 	GenerateErrorCode,
 	GenerateRequest,
 	GenerateResponse,
+	GenerationPhase,
 	HistoryResponse,
 	ModelsResponse,
 	Thread,
@@ -26,8 +27,32 @@ function fallbackErrorCode(status: number): GenerateErrorCode {
 	if (status === 401) return "UNAUTHORIZED";
 	if (status === 402) return "INSUFFICIENT_CREDITS";
 	if (status === 429) return "RATE_LIMITED";
+	if (status === 503) return "GPU_BUSY";
 	if (status === 504) return "GENERATION_TIMEOUT";
 	return "GENERATION_FAILED";
+}
+
+/** The server's live status of one in-flight request (see server/services/generation-status.ts). */
+export interface GenerationStatusResponse {
+	phase: GenerationPhase;
+	waitingForMs?: number;
+	renderingForMs?: number;
+}
+
+/** GET /api/generate/status/:id. Null when unknown yet, expired, or the call failed. */
+export async function fetchGenerationStatus(
+	token: string | null,
+	clientRequestId: string,
+): Promise<GenerationStatusResponse | null> {
+	try {
+		const res = await fetch(`${API_BASE}/api/generate/status/${clientRequestId}`, {
+			headers: getAuthHeaders(token, false),
+		});
+		if (!res.ok) return null;
+		return (await res.json()) as GenerationStatusResponse;
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -40,7 +65,14 @@ function fallbackErrorCode(status: number): GenerateErrorCode {
  */
 export function useGenerate(token: string | null) {
 	const generate = useCallback(
-		async (request: GenerateRequest & { tool?: string; image?: string; threadId?: string }): Promise<GenerateResponse> => {
+		async (
+			request: GenerateRequest & {
+				tool?: string;
+				image?: string;
+				threadId?: string;
+				clientRequestId?: string;
+			},
+		): Promise<GenerateResponse> => {
 			const failed = (
 				code: GenerateErrorCode,
 				extra: Partial<GenerateResponse> = {},
@@ -57,7 +89,11 @@ export function useGenerate(token: string | null) {
 					? await fetch(`${API_BASE}/api/tools/${request.tool}`, {
 							method: "POST",
 							headers: getAuthHeaders(token),
-							body: JSON.stringify({ image: request.image, threadId: request.threadId }),
+							body: JSON.stringify({
+								image: request.image,
+								threadId: request.threadId,
+								clientRequestId: request.clientRequestId,
+							}),
 						})
 					: await fetch(`${API_BASE}/api/generate`, {
 							method: "POST",

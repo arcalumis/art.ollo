@@ -563,7 +563,8 @@ export function getModelEconomics(days: number) {
 	const gens = db
 		.prepare(`
 			SELECT g.model, g.predict_time, COALESCE(pc.actual_cost, pc.estimated_cost, g.cost, 0) AS cost,
-				pc.source AS cost_source
+				pc.source AS cost_source,
+				CASE WHEN json_valid(g.parameters) THEN json_extract(g.parameters, '$.queueWaitMs') END AS queue_wait_ms
 			FROM generations g LEFT JOIN platform_costs pc ON pc.generation_id = g.id
 			WHERE 1 = 1 ${sinceSql}
 		`)
@@ -572,6 +573,7 @@ export function getModelEconomics(days: number) {
 		predict_time: number | null;
 		cost: number;
 		cost_source: string | null;
+		queue_wait_ms: number | null;
 	}>;
 
 	const used = db
@@ -603,12 +605,21 @@ export function getModelEconomics(days: number) {
 			cost: number;
 			estimatedCost: number;
 			latencies: number[];
+			queueWaits: number[];
 		}
 	>();
 	const get = (model: string) => {
 		let s = stats.get(model);
 		if (!s) {
-			s = { runs: 0, failures: 0, credits: 0, cost: 0, estimatedCost: 0, latencies: [] };
+			s = {
+				runs: 0,
+				failures: 0,
+				credits: 0,
+				cost: 0,
+				estimatedCost: 0,
+				latencies: [],
+				queueWaits: [],
+			};
 			stats.set(model, s);
 		}
 		return s;
@@ -619,6 +630,9 @@ export function getModelEconomics(days: number) {
 		s.cost += g.cost;
 		if (g.cost_source) s.estimatedCost += g.cost;
 		if (g.predict_time && g.predict_time > 0) s.latencies.push(g.predict_time);
+		if (typeof g.queue_wait_ms === "number" && g.queue_wait_ms >= 0) {
+			s.queueWaits.push(g.queue_wait_ms / 1000);
+		}
 	}
 	for (const u of used) {
 		const model = modelOfReason(u.reason);
@@ -662,8 +676,10 @@ export function getModelEconomics(days: number) {
 				cost: 0,
 				estimatedCost: 0,
 				latencies: [],
+				queueWaits: [],
 			};
 			const lat = [...s.latencies].sort((a, b) => a - b);
+			const waits = [...s.queueWaits].sort((a, b) => a - b);
 			const attempts = s.runs + s.failures;
 			const revenueCents = s.credits * vpc.cents;
 			return {
@@ -676,6 +692,9 @@ export function getModelEconomics(days: number) {
 				failureRate: attempts > 0 ? (s.failures / attempts) * 100 : null,
 				p50Seconds: percentile(lat, 50),
 				p95Seconds: percentile(lat, 95),
+				/** GPU queue wait of the winning prediction (recorded since GPU-wait tracking shipped). */
+				queueWaitP50Seconds: percentile(waits, 50),
+				queueWaitP95Seconds: percentile(waits, 95),
 				costUsd: s.cost,
 				estimatedCostUsd: s.estimatedCost,
 				creditsCharged: s.credits,

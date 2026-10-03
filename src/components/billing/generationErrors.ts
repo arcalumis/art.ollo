@@ -60,6 +60,12 @@ export function describeGenerationError(code: GenerateErrorCode | undefined, ctx
 				detail: `${REFUNDED} Try again, or switch to a faster model.`,
 				actions: ["retry"],
 			};
+		case "GPU_BUSY":
+			return {
+				title: "Image generation is busy right now",
+				detail: "No GPU came free in time. Your credits were returned. Try again in a minute.",
+				actions: ["retry"],
+			};
 		case "GENERATION_CANCELED":
 			return { title: "The generation was stopped", detail: `${REFUNDED} Try again.`, actions: ["retry"] };
 		case "GENERATION_NO_OUTPUT":

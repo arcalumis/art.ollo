@@ -41,6 +41,17 @@ export class GenerationTimeoutError extends Error {
 	}
 }
 
+/**
+ * Thrown when no attempt of a prediction got a GPU before the no-GPU cap. Every
+ * attempt was canceled before it started, so Replicate bills none of them.
+ */
+export class GpuBusyError extends Error {
+	constructor(message = "No GPU became available") {
+		super(message);
+		this.name = "GpuBusyError";
+	}
+}
+
 /** Thrown when Replicate reports the prediction as canceled/aborted. */
 export class GenerationCanceledError extends Error {
 	constructor(message = "Generation was canceled") {
@@ -65,7 +76,16 @@ const settings = {
 	clientFactory: null as ClientFactory | null,
 	fetchImpl: null as typeof fetch | null,
 	pollIntervalMs: 1000,
-	timeoutMs: Number(process.env.GENERATION_TIMEOUT_MS) || 180_000,
+	/** Render deadline, counted from the moment a GPU picks the prediction up. */
+	timeoutMs: Number(process.env.GENERATION_TIMEOUT_MS) || 120_000,
+	/**
+	 * While nothing has started, submit an identical copy of the prediction at
+	 * each of these times (so at most 1 + length attempts are in flight).
+	 */
+	hedgeAtMs: [5_000, 10_000, 15_000],
+	/** Give up (cancel everything, refund) when no attempt has started by then. */
+	gpuCapMs: 45_000,
+	now: () => Date.now(),
 };
 
 export const __testing = {
@@ -75,9 +95,16 @@ export const __testing = {
 	setFetch(fetchImpl: typeof fetch | null): void {
 		settings.fetchImpl = fetchImpl;
 	},
-	setTiming(opts: { pollIntervalMs?: number; timeoutMs?: number }): void {
+	setTiming(opts: {
+		pollIntervalMs?: number;
+		timeoutMs?: number;
+		hedgeAtMs?: number[];
+		gpuCapMs?: number;
+	}): void {
 		if (opts.pollIntervalMs !== undefined) settings.pollIntervalMs = opts.pollIntervalMs;
 		if (opts.timeoutMs !== undefined) settings.timeoutMs = opts.timeoutMs;
+		if (opts.hedgeAtMs !== undefined) settings.hedgeAtMs = opts.hedgeAtMs;
+		if (opts.gpuCapMs !== undefined) settings.gpuCapMs = opts.gpuCapMs;
 	},
 };
 
@@ -286,35 +313,195 @@ export async function imageInputDimensions(
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Run a single prediction and return results.
-// Exits on every terminal status and enforces an overall deadline; on timeout
-// the prediction is canceled (best effort) so we stop paying for it.
+/**
+ * Phase callbacks for the live status channel. Called from every parallel
+ * prediction of a generation, so implementations must be idempotent.
+ */
+export interface RunTracker {
+	/** Submitted; no GPU has picked it up yet. */
+	waitingGpu?(): void;
+	/** A GPU picked up an attempt: the render is running. */
+	rendering?(): void;
+	/** The render finished; outputs are being downloaded and saved. */
+	saving?(): void;
+}
+
+type Prediction = Awaited<ReturnType<Replicate["predictions"]["get"]>>;
+
+interface Attempt {
+	/** 1 = the original submission, 2.. = identical hedges. */
+	n: number;
+	id: string;
+	/** Our clock when the create call returned. */
+	submittedAt: number;
+	latest: Prediction;
+	/** Our clock when we first saw it started. */
+	seenStartedAt?: number;
+}
+
+/** What one hedged prediction produced, plus how long it waited for a GPU. */
+interface PredictionRun {
+	output: unknown;
+	predictTime: number;
+	replicateId: string;
+	/** started_at - created_at of the winning attempt (Replicate's timestamps when present). */
+	queueWaitMs: number;
+	/** Attempts submitted (1 = no hedges). */
+	attempts: number;
+	/** Which attempt won (1 = the original). */
+	winningAttempt: number;
+}
+
+const isTerminal = (status: string) =>
+	status === "succeeded" || status === "failed" || status === "canceled" || status === "aborted";
+
+/** A GPU has picked the prediction up (or it already finished between polls). */
+const hasStarted = (p: Prediction) =>
+	p.status === "processing" || p.status === "succeeded" || !!p.started_at;
+
+const timeOf = (iso: string | undefined | null) => {
+	const t = iso ? Date.parse(iso) : Number.NaN;
+	return Number.isFinite(t) ? t : undefined;
+};
+
+/**
+ * Run one prediction with same-model hedging and return its output.
+ *
+ * While the prediction is still waiting for a GPU, identical copies (same
+ * model, same input object, so the same seed) are submitted at
+ * `settings.hedgeAtMs`. The first attempt to start wins and every other one is
+ * canceled at once; canceled-before-start predictions aren't billed. If nothing
+ * starts by `settings.gpuCapMs`, everything is canceled and GpuBusyError is
+ * thrown. Once an attempt is rendering it gets `settings.timeoutMs` to finish.
+ */
 async function runSinglePrediction(
 	replicate: Replicate,
 	model: string,
 	input: Record<string, unknown>,
-): Promise<{ output: unknown; predictTime: number; replicateId: string }> {
-	const deadline = Date.now() + settings.timeoutMs;
-	const prediction = await replicate.predictions.create({
-		model: model as `${string}/${string}`,
-		input,
-	});
+	tracker?: RunTracker,
+): Promise<PredictionRun> {
+	const now = settings.now;
+	const t0 = now();
+	const attempts: Attempt[] = [];
+	const cancel = async (a: Attempt, why: string) => {
+		try {
+			await replicate.predictions.cancel(a.id);
+		} catch (err) {
+			console.error(`Failed to cancel ${why} prediction ${a.id}:`, err);
+		}
+	};
+	const submit = async () => {
+		const n = attempts.length + 1;
+		const p = await replicate.predictions.create({
+			model: model as `${string}/${string}`,
+			input,
+		});
+		const a: Attempt = { n, id: p.id, submittedAt: now(), latest: p };
+		if (hasStarted(p)) a.seenStartedAt = now();
+		attempts.push(a);
+	};
 
-	const isTerminal = (status: string) =>
-		status === "succeeded" || status === "failed" || status === "canceled" || status === "aborted";
+	// The original submission: if this throws, nothing was created.
+	await submit();
+	tracker?.waitingGpu?.();
 
-	let finalPrediction = prediction;
-	while (!isTerminal(finalPrediction.status)) {
-		if (Date.now() >= deadline) {
+	// ---- Wait for a GPU, hedging with identical copies ------------------------
+	let hedgesPlanned = 0;
+	let winner = attempts.find((a) => a.seenStartedAt !== undefined);
+	while (!winner) {
+		const elapsed = now() - t0;
+		if (elapsed >= settings.gpuCapMs) {
+			await Promise.all(
+				attempts.filter((a) => !isTerminal(a.latest.status)).map((a) => cancel(a, "GPU-starved")),
+			);
+			throw new GpuBusyError();
+		}
+		const due = settings.hedgeAtMs.filter((t) => elapsed >= t).length;
+		while (hedgesPlanned < due) {
+			hedgesPlanned++;
 			try {
-				await replicate.predictions.cancel(prediction.id);
+				await submit();
 			} catch (err) {
-				console.error(`Failed to cancel timed-out prediction ${prediction.id}:`, err);
+				// A failed hedge is not fatal: the original is still queued.
+				console.error(`Failed to submit hedge for ${model}:`, err);
 			}
+		}
+
+		const nextHedge = settings.hedgeAtMs.find((t) => t > elapsed) ?? Number.POSITIVE_INFINITY;
+		const wait = Math.min(settings.pollIntervalMs, settings.gpuCapMs - elapsed, nextHedge - elapsed);
+		await sleep(Math.max(0, wait));
+
+		const live = attempts.filter((a) => !isTerminal(a.latest.status));
+		await Promise.all(
+			live.map(async (a) => {
+				try {
+					a.latest = await replicate.predictions.get(a.id);
+				} catch (err) {
+					console.error(`Failed to poll prediction ${a.id}:`, err);
+					return;
+				}
+				if (a.seenStartedAt === undefined && hasStarted(a.latest)) a.seenStartedAt = now();
+			}),
+		);
+
+		// First to start wins: by Replicate's started_at when it gives one, else attempt order.
+		const started = attempts.filter((a) => a.seenStartedAt !== undefined);
+		if (started.length > 0) {
+			winner = started.reduce((best, a) => {
+				const ta = timeOf(a.latest.started_at) ?? a.seenStartedAt ?? 0;
+				const tb = timeOf(best.latest.started_at) ?? best.seenStartedAt ?? 0;
+				return ta < tb || (ta === tb && a.n < best.n) ? a : best;
+			});
+			break;
+		}
+
+		// Every attempt ended without starting (failed or canceled upstream).
+		if (attempts.every((a) => isTerminal(a.latest.status))) {
+			const failed = attempts.find((a) => a.latest.status === "failed");
+			if (failed) {
+				throw new Error(
+					failed.latest.error ? String(failed.latest.error) : "Generation failed",
+				);
+			}
+			throw new GenerationCanceledError();
+		}
+	}
+
+	// ---- Cancel the losers right away -------------------------------------------
+	const losers = attempts.filter((a) => a !== winner);
+	await Promise.all(
+		losers
+			.filter((a) => !isTerminal(a.latest.status))
+			.map((a) => cancel(a, "hedge-loser")),
+	);
+	for (const a of losers) {
+		if (a.seenStartedAt !== undefined) {
+			// Replicate may bill a prediction that started before we canceled it. Logged so we can
+			// see whether hedging ever costs money; only the winner's cost is recorded.
+			console.warn(
+				`[hedge] loser ${a.id} (attempt ${a.n}) of ${model} had already started when ${winner.id} (attempt ${winner.n}) won`,
+			);
+		}
+	}
+
+	const created = timeOf(winner.latest.created_at);
+	const startedAt = timeOf(winner.latest.started_at);
+	const queueWaitMs =
+		created !== undefined && startedAt !== undefined
+			? Math.max(0, startedAt - created)
+			: Math.max(0, (winner.seenStartedAt ?? winner.submittedAt) - winner.submittedAt);
+
+	// ---- Render ---------------------------------------------------------------------
+	tracker?.rendering?.();
+	const deadline = now() + settings.timeoutMs;
+	let finalPrediction = winner.latest;
+	while (!isTerminal(finalPrediction.status)) {
+		if (now() >= deadline) {
+			await cancel(winner, "timed-out");
 			throw new GenerationTimeoutError();
 		}
-		await sleep(Math.min(settings.pollIntervalMs, Math.max(0, deadline - Date.now())));
-		finalPrediction = await replicate.predictions.get(prediction.id);
+		await sleep(Math.min(settings.pollIntervalMs, Math.max(0, deadline - now())));
+		finalPrediction = await replicate.predictions.get(winner.id);
 	}
 
 	if (finalPrediction.status === "failed") {
@@ -327,7 +514,10 @@ async function runSinglePrediction(
 	return {
 		output: finalPrediction.output,
 		predictTime: finalPrediction.metrics?.predict_time || 0,
-		replicateId: prediction.id,
+		replicateId: winner.id,
+		queueWaitMs,
+		attempts: attempts.length,
+		winningAttempt: winner.n,
 	};
 }
 
@@ -465,6 +655,12 @@ export interface GenerationResult {
 	predictTime: number;
 	width: number;
 	height: number;
+	/** How long the winning attempt waited for a GPU (started_at - created_at). */
+	queueWaitMs: number;
+	/** Attempts submitted for this output's prediction (1 = no hedges). */
+	attempts: number;
+	/** Which attempt produced it (1 = the original). */
+	winningAttempt: number;
 }
 
 interface SavedImage {
@@ -540,6 +736,8 @@ export interface GenerateOptions {
 	outputFormat?: string;
 	apiKey?: string; // Optional BYO API key
 	seed?: number; // Random seed for reproducibility/variation
+	/** Phase callbacks for the live status channel. */
+	tracker?: RunTracker;
 }
 
 /** What the server will actually run for a request: used for both pricing and the call. */
@@ -618,11 +816,9 @@ export async function generateImage(
 			seed,
 			outputFormat: options.outputFormat,
 		});
-		const { output, predictTime, replicateId } = await runSinglePrediction(
-			replicate,
-			resolved.slug,
-			input,
-		);
+		const run = await runSinglePrediction(replicate, resolved.slug, input, options.tracker);
+		const { output, predictTime, replicateId, queueWaitMs, attempts, winningAttempt } = run;
+		options.tracker?.saving?.();
 		const out: GenerationResult[] = [];
 		for (const url of outputToUrls(output)) {
 			const saved = await downloadAndSaveImage(url, options.outputFormat ?? model.outputFormat);
@@ -633,6 +829,9 @@ export async function generateImage(
 				...saved,
 				replicateId,
 				predictTime,
+				queueWaitMs,
+				attempts,
+				winningAttempt,
 				cost: priceOfOutput(model, resolved.tier, { outputMp, inputMps }),
 			});
 		}
@@ -687,12 +886,13 @@ export function toolModelFor(
 export async function runTool(
 	tool: ToolName,
 	imageInput: string,
-	opts: { apiKey?: string; model?: CatalogModel } = {},
+	opts: { apiKey?: string; model?: CatalogModel; tracker?: RunTracker } = {},
 ): Promise<GenerationResult> {
 	const model = opts.model ?? toolModelFor(tool, await imageInputDimensions(imageInput));
 	const [result] = await generateImage("", model.id, {
 		imageInputs: [imageInput],
 		apiKey: opts.apiKey,
+		tracker: opts.tracker,
 	});
 	if (!result) throw new Error("The tool returned no image");
 	return result;

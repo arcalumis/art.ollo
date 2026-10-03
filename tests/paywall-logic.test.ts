@@ -79,6 +79,7 @@ describe("generation error copy", () => {
 		"GENERATION_CANCELED",
 		"GENERATION_NO_OUTPUT",
 		"GENERATION_FAILED",
+		"GPU_BUSY",
 		"API_KEY_UNREADABLE",
 		"NETWORK_ERROR",
 	];
