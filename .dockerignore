@@ -41,3 +41,6 @@ scripts/*.sh
 .DS_Store
 Thumbs.db
 *.log
+
+# Agent worktrees and skills
+.claude
