@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import rawBody from "fastify-raw-body";
 import type Stripe from "stripe";
 import { getDb } from "../db";
+import { recordWebhookFailure } from "../services/admin-health";
 import {
 	STRIPE_WEBHOOK_SECRET,
 	getProductByStripePriceId,
@@ -82,6 +83,7 @@ export async function stripeWebhookRoutes(fastify: FastifyInstance): Promise<voi
 				return { received: true };
 			} catch (error) {
 				// Not marked processed (the transaction rolled back): answer 500 so Stripe retries.
+				recordWebhookFailure(event.id, event.type, error);
 				request.log.error(
 					{ eventId: event.id, type: event.type, err: error instanceof Error ? error.message : String(error) },
 					error instanceof RetryableWebhookError

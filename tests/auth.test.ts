@@ -307,7 +307,7 @@ describe("sessions", () => {
 		const admin = createUser({ isAdmin: true });
 		const user = createUser();
 		const patch = (isActive: boolean) =>
-			app.inject({ method: "PATCH", url: `/api/admin/users/${user.id}`, headers: authHeader(admin), payload: { isActive } });
+			app.inject({ method: "PATCH", url: `/api/admin/users/${user.id}`, headers: authHeader(admin), payload: { isActive, reason: "test toggle" } });
 		expect((await patch(false)).statusCode).toBe(200);
 		expect((await patch(true)).statusCode).toBe(200);
 		expect((await app.inject({ method: "GET", url: "/api/me", headers: authHeader(user) })).statusCode).toBe(401);

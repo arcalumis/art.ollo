@@ -1,4 +1,5 @@
 import { getDb } from "../db";
+import { runAdminMaintenance } from "./admin-maintenance";
 import { startReconciliationJob, stopReconciliationJob } from "./replicate-billing";
 import { captureAndGetSolPrice } from "./solana";
 import { deleteGenerationFiles, getUploadsDir, unlinkInside } from "./storage";
@@ -90,6 +91,9 @@ export function cleanupTrashedItems(): void {
 
 	// Process expired subscription boosts
 	runStep("expire boosts", () => processExpiredBoosts());
+
+	// Expire ended SOL subscriptions; keep monthly financial snapshots current
+	runStep("admin maintenance", () => runAdminMaintenance());
 
 	// Process subscription credit refills
 	runStep("credit refills", () => {

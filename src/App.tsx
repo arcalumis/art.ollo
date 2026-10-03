@@ -46,7 +46,6 @@ import {
 	useUserUsage,
 } from "./hooks/useUserSettings";
 import { type PendingPrompt, takePendingPrompt } from "./lib/pendingPrompt";
-import { AdminLayout } from "./pages/AdminLayout";
 import { Landing } from "./pages/Landing";
 import { NotFound } from "./pages/NotFound";
 import { Pricing } from "./pages/Pricing";
@@ -55,17 +54,8 @@ import { Terms } from "./pages/Terms";
 import type { Generation, Thread } from "./types";
 import "./App.css";
 
-// Lazy load admin pages - these are only loaded when admin navigates to them
-const AdminCosts = lazy(() => import("./pages/AdminCosts"));
-const AdminCreditPackages = lazy(() => import("./pages/AdminCreditPackages"));
-const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
-const AdminFinancials = lazy(() => import("./pages/AdminFinancials"));
-const AdminMetrics = lazy(() => import("./pages/AdminMetrics"));
-const AdminModels = lazy(() => import("./pages/AdminModels"));
-const AdminPnL = lazy(() => import("./pages/AdminPnL"));
-const AdminProducts = lazy(() => import("./pages/AdminProducts"));
-const AdminRevenue = lazy(() => import("./pages/AdminRevenue"));
-const AdminUsers = lazy(() => import("./pages/AdminUsers"));
+// The admin console (its own layout and routes) loads only when an admin opens it.
+const AdminApp = lazy(() => import("./pages/admin/AdminApp"));
 
 // These carry the Solana wallet features (SOL purchase, wallet sign-in), so
 // they load on demand inside a <SolanaBoundary> instead of with every page.
@@ -856,102 +846,15 @@ function AppRoutes() {
 			<Route path="/pricing" element={<Pricing />} />
 			<Route path="/s/:slug" element={<SharedImage />} />
 			<Route
-				path="/admin"
+				path="/admin/*"
 				element={
 					<AdminRoute>
-						<AdminLayout />
+						<Suspense fallback={<AdminLoading />}>
+							<AdminApp />
+						</Suspense>
 					</AdminRoute>
 				}
-			>
-				<Route
-					index
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminDashboard />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="users"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminUsers />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="users/:id"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminUsers />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="products"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminProducts />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="models"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminModels />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="credit-packages"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminCreditPackages />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="financials"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminFinancials />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="financials/revenue"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminRevenue />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="financials/costs"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminCosts />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="financials/metrics"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminMetrics />
-						</Suspense>
-					}
-				/>
-				<Route
-					path="financials/pnl"
-					element={
-						<Suspense fallback={<AdminLoading />}>
-							<AdminPnL />
-						</Suspense>
-					}
-				/>
-			</Route>
+			/>
 			<Route path="*" element={<NotFound />} />
 		</Routes>
 	);

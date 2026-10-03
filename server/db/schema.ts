@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import crypto from "node:crypto";
+import { backfillPlatformCosts } from "../services/admin-cost-backfill";
 
 export function initializeSchema(db: Database): void {
 	// Users table
@@ -815,6 +816,55 @@ export function initializeSchema(db: Database): void {
 	// ---- Phase 3.5 migrations ----
 	// New model lineup: move every restricted product's allowed_models onto it (once).
 	runOnce("3.5_allowed_models_lineup", () => migrateAllowedModelsToLineup(db));
+
+	// ---- Phase 6 migrations ----
+	// Admin console: audit log, webhook failure log, moderation columns, cost provenance.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS admin_audit_log (
+			id TEXT PRIMARY KEY,
+			admin_user_id TEXT,
+			admin_username TEXT,
+			action TEXT NOT NULL,
+			target_type TEXT NOT NULL,
+			target_id TEXT,
+			before_json TEXT,
+			after_json TEXT,
+			reason TEXT,
+			ip TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_log(created_at);
+		CREATE INDEX IF NOT EXISTS idx_admin_audit_target ON admin_audit_log(target_type, target_id);
+		CREATE INDEX IF NOT EXISTS idx_admin_audit_action ON admin_audit_log(action);
+
+		CREATE TABLE IF NOT EXISTS webhook_failures (
+			id TEXT PRIMARY KEY,
+			stripe_event_id TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			error TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_webhook_failures_event ON webhook_failures(stripe_event_id);
+		CREATE INDEX IF NOT EXISTS idx_webhook_failures_created ON webhook_failures(created_at);
+	`);
+	// NULL = booked live by the generation path; 'backfill_estimate' = estimated after the fact.
+	if (!hasColumn(db, "platform_costs", "source")) {
+		db.exec("ALTER TABLE platform_costs ADD COLUMN source TEXT DEFAULT NULL");
+	}
+	// Admin moderation: removal is a soft delete plus who/why.
+	if (!hasColumn(db, "generations", "moderated_at")) {
+		db.exec("ALTER TABLE generations ADD COLUMN moderated_at DATETIME DEFAULT NULL");
+	}
+	if (!hasColumn(db, "generations", "moderation_reason")) {
+		db.exec("ALTER TABLE generations ADD COLUMN moderation_reason TEXT DEFAULT NULL");
+	}
+	if (!hasColumn(db, "generations", "moderated_by")) {
+		db.exec("ALTER TABLE generations ADD COLUMN moderated_by TEXT DEFAULT NULL");
+	}
+	// Generations from before cost tracking get an estimated cost row from the catalog formula.
+	runOnce("6_backfill_platform_costs", () => {
+		backfillPlatformCosts(db);
+	});
 }
 
 // ---- Phase 3.5 migrations (definitions) ----

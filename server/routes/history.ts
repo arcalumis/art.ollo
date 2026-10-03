@@ -68,11 +68,11 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 			// Always exclude purged records (no image file, kept only for cost tracking)
 			let condition: string;
 			if (showTrash) {
-				condition = "deleted_at IS NOT NULL AND purged_at IS NULL";
+				condition = "deleted_at IS NOT NULL AND purged_at IS NULL AND moderated_at IS NULL";
 			} else if (showArchived) {
-				condition = "archived_at IS NOT NULL AND deleted_at IS NULL AND purged_at IS NULL";
+				condition = "archived_at IS NOT NULL AND deleted_at IS NULL AND purged_at IS NULL AND moderated_at IS NULL";
 			} else {
-				condition = "deleted_at IS NULL AND archived_at IS NULL AND purged_at IS NULL";
+				condition = "deleted_at IS NULL AND archived_at IS NULL AND purged_at IS NULL AND moderated_at IS NULL";
 			}
 
 			const userId = requireUserId(request);
@@ -169,11 +169,18 @@ export async function historyRoutes(fastify: FastifyInstance): Promise<void> {
 			const db = getDb();
 			// Verify ownership
 			const row = db
-				.prepare("SELECT id FROM generations WHERE id = ? AND user_id = ?")
-				.get(id, requireUserId(request)) as { id: string } | undefined;
+				.prepare("SELECT id, moderated_at FROM generations WHERE id = ? AND user_id = ?")
+				.get(id, requireUserId(request)) as { id: string; moderated_at: string | null } | undefined;
 
 			if (!row) {
 				return reply.status(404).send({ error: "Generation not found" });
+			}
+
+			// Images removed by moderation stay removed; only an admin can reverse that.
+			if (!deleted && row.moderated_at) {
+				return reply
+					.status(403)
+					.send({ code: "MODERATED", error: "This image was removed for breaking the content rules." });
 			}
 
 			if (deleted) {
