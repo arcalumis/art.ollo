@@ -53,7 +53,8 @@ interface AuthContextType {
 	updateUser: (updates: Partial<User>) => void;
 	/** Switch to a token the server just issued (e.g. after the email changed and sessions reset). */
 	adoptToken: (token: string) => void;
-	logout: () => void;
+	/** Signs out this device; `{ everywhere: true }` also ends every other session. */
+	logout: (opts?: { everywhere?: boolean }) => void;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -274,11 +275,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		setToken(next);
 	}, []);
 
-	// Signing out ends every session on the server (best effort: local state clears regardless,
+	// "Everywhere" ends every session on the server (best effort: local state clears regardless,
 	// e.g. offline, or after account deletion when the token is already revoked).
-	const logout = useCallback(() => {
+	const logout = useCallback((opts?: { everywhere?: boolean }) => {
 		const current = localStorage.getItem("token");
-		if (current) {
+		if (current && opts?.everywhere) {
 			void fetch(`${API_BASE}/api/auth/logout`, {
 				method: "POST",
 				headers: { Authorization: `Bearer ${current}` },

@@ -81,7 +81,7 @@ export function AdminLayout() {
 						</div>
 						<button
 							type="button"
-							onClick={logout}
+							onClick={() => logout()}
 							className="p-1.5 text-gray-400 hover:text-pink-400 hover:bg-pink-500/10 rounded transition-all"
 							title="Sign Out"
 						>

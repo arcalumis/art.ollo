@@ -674,7 +674,7 @@ export function AccountSettings({ onNavigateAway }: { onNavigateAway?: () => voi
 						onClick={() => {
 							onNavigateAway?.();
 							navigate("/", { replace: true });
-							logout();
+							logout({ everywhere: true });
 							toast("Signed out everywhere", {
 								description: "Every device needs to sign in again.",
 							});
