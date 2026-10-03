@@ -34,6 +34,8 @@ interface ModelRow {
 	failureRate: number | null;
 	p50Seconds: number | null;
 	p95Seconds: number | null;
+	queueWaitP50Seconds: number | null;
+	queueWaitP95Seconds: number | null;
 	costUsd: number;
 	estimatedCostUsd: number;
 	creditsCharged: number;
@@ -197,7 +199,7 @@ export default function AdminModels() {
 						Each model's runs, failures, latency and margin appear here once people generate.
 					</EmptyState>
 				) : (
-					<DataTable className="min-w-[60rem]">
+					<DataTable className="min-w-[66rem]">
 						<thead>
 							<tr>
 								<Th>Model</Th>
@@ -205,6 +207,7 @@ export default function AdminModels() {
 								<Th right>Failure rate</Th>
 								<Th right>p50</Th>
 								<Th right>p95</Th>
+								<Th right>Queue wait p50/p95</Th>
 								<Th right>Replicate cost</Th>
 								<Th right>Credits</Th>
 								<Th right>Credit value</Th>
@@ -239,6 +242,11 @@ export default function AdminModels() {
 									<Td num>{secs(m.p50Seconds)}</Td>
 									<Td num>{secs(m.p95Seconds)}</Td>
 									<Td num>
+										{m.queueWaitP50Seconds == null
+											? "—"
+											: `${secs(m.queueWaitP50Seconds)} / ${secs(m.queueWaitP95Seconds)}`}
+									</Td>
+									<Td num>
 										{fmtCost(m.costUsd)}
 										{m.estimatedCostUsd > 0 && (
 											<div className="text-xs text-muted-foreground">
@@ -258,6 +266,7 @@ export default function AdminModels() {
 							<tr>
 								<Td className="font-medium">Total</Td>
 								<Td num>{fmtInt(totals.runs)}</Td>
+								<Td />
 								<Td />
 								<Td />
 								<Td />
