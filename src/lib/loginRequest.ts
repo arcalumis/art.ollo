@@ -55,6 +55,29 @@ export function isThisDevicesRequest(requestId: string): boolean {
 	return readStored()?.requestId === requestId;
 }
 
+/** The unfinished request this browser saved, if any (survives tab reloads). */
+export function readStoredLoginRequest(): LoginRequest | null {
+	const stored = readStored();
+	if (!stored || typeof stored.pollSecret !== "string") return null;
+	return { requestId: stored.requestId, pollSecret: stored.pollSecret, code: String(stored.code ?? "") };
+}
+
+// While the sign-in screen's own "Check your inbox" step is open it does the polling; the
+// app-wide resume banner stays quiet so the request isn't polled twice (it is rate limited).
+let inboxScreens = 0;
+const inboxListeners = new Set<() => void>();
+export function markInboxScreen(open: boolean): void {
+	inboxScreens = Math.max(0, inboxScreens + (open ? 1 : -1));
+	for (const l of inboxListeners) l();
+}
+export function subscribeInboxScreen(listener: () => void): () => void {
+	inboxListeners.add(listener);
+	return () => inboxListeners.delete(listener);
+}
+export function isInboxScreenOpen(): boolean {
+	return inboxScreens > 0;
+}
+
 export function clearLoginRequest(): void {
 	try {
 		localStorage.removeItem(KEY);

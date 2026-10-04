@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { type LoginRequestPoll, useAuth } from "../../contexts/AuthContext";
 import { useLoginRequestPoll } from "../../hooks/useLoginRequestPoll";
-import { type LoginRequest, clearLoginRequest, saveLoginRequest } from "../../lib/loginRequest";
+import { type LoginRequest, clearLoginRequest, markInboxScreen, saveLoginRequest } from "../../lib/loginRequest";
 import { CheckInboxStep } from "./CheckInboxStep";
 import { EmailStep } from "./EmailStep";
 import { PasswordStep } from "./PasswordStep";
@@ -84,6 +84,12 @@ export function SignIn({
 		onApproved,
 		onSignedInOtherTab,
 	);
+	const inboxPolling = step === "inbox" && !!loginRequest;
+	useEffect(() => {
+		if (!inboxPolling) return;
+		markInboxScreen(true);
+		return () => markInboxScreen(false);
+	}, [inboxPolling]);
 
 	// Only auto-sign after the user connected a wallet from this screen, not on
 	// the adapter's silent reconnect from an earlier session.

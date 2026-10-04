@@ -111,12 +111,18 @@ export function useLoginRequestPoll(
 			if (!document.hidden && !done) schedule(0);
 		};
 		document.addEventListener("visibilitychange", onVisibility);
+		// iPadOS/iOS Safari may restore the page from the back-forward cache or just refocus it
+		// without a visibilitychange after a trip to the Mail app.
+		window.addEventListener("pageshow", onVisibility);
+		window.addEventListener("focus", onVisibility);
 		schedule(FAST_MS);
 
 		return () => {
 			done = true;
 			if (timer) clearTimeout(timer);
 			document.removeEventListener("visibilitychange", onVisibility);
+			window.removeEventListener("pageshow", onVisibility);
+			window.removeEventListener("focus", onVisibility);
 		};
 	}, [request, pollLoginRequest]);
 

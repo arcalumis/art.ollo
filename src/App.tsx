@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { ChatFeed } from "./components/ChatFeed";
 import { type CreationOptions, CreationPanel } from "./components/CreationPanel";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { PendingSignIn } from "./components/auth/PendingSignIn";
 import { GenerationStatus } from "./components/GenerationStatus";
 import { ImageGallery } from "./components/ImageGallery";
 import { MagicLinkVerify } from "./components/MagicLinkVerify";
@@ -866,6 +867,7 @@ function App() {
 			<BrowserRouter>
 				<AuthProvider>
 					<AppRoutes />
+					<PendingSignIn />
 				</AuthProvider>
 			</BrowserRouter>
 		</ErrorBoundary>
