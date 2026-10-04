@@ -68,6 +68,12 @@ export function describeGenerationError(code: GenerateErrorCode | undefined, ctx
 			};
 		case "GENERATION_CANCELED":
 			return { title: "The generation was stopped", detail: `${REFUNDED} Try again.`, actions: ["retry"] };
+		case "CONTENT_FILTERED":
+			return {
+				title: "The model's safety filter blocked this image",
+				detail: "Your credits were returned. Try rewording the prompt.",
+				actions: ["retry"],
+			};
 		case "GENERATION_NO_OUTPUT":
 			return {
 				title: "The model returned no image",
@@ -99,6 +105,29 @@ export function describeGenerationError(code: GenerateErrorCode | undefined, ctx
 				actions: ["retry"],
 			};
 	}
+}
+
+/**
+ * The quiet note on a step where the safety filter blocked some outputs:
+ * "3 of 4 images were blocked by the model's safety filter. 6 credits were returned."
+ * Null when nothing was blocked or the record is malformed.
+ */
+export function describeBlockedOutputs(blocked: unknown, requested: unknown): string | null {
+	if (!blocked || typeof blocked !== "object") return null;
+	const { count, creditsReturned } = blocked as { count?: unknown; creditsReturned?: unknown };
+	if (typeof count !== "number" || count < 1) return null;
+	const total = typeof requested === "number" && requested >= count ? requested : null;
+	const what =
+		total && total > 1
+			? `${count} of ${total} images ${count === 1 ? "was" : "were"}`
+			: count === 1
+				? "1 image was"
+				: `${count} images were`;
+	const credits =
+		typeof creditsReturned === "number" && creditsReturned > 0
+			? ` ${creditsReturned} ${creditsReturned === 1 ? "credit was" : "credits were"} returned.`
+			: "";
+	return `${what} blocked by the model's safety filter.${credits}`.replace(/^./, (c) => c.toUpperCase());
 }
 
 /** Codes that open the upgrade sheet on their own instead of only showing a message. */

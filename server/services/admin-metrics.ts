@@ -564,7 +564,8 @@ export function getModelEconomics(days: number) {
 		.prepare(`
 			SELECT g.model, g.predict_time, COALESCE(pc.actual_cost, pc.estimated_cost, g.cost, 0) AS cost,
 				pc.source AS cost_source,
-				CASE WHEN json_valid(g.parameters) THEN json_extract(g.parameters, '$.queueWaitMs') END AS queue_wait_ms
+				CASE WHEN json_valid(g.parameters) THEN json_extract(g.parameters, '$.queueWaitMs') END AS queue_wait_ms,
+				CASE WHEN json_valid(g.parameters) THEN json_extract(g.parameters, '$.blocked.count') END AS blocked_count
 			FROM generations g LEFT JOIN platform_costs pc ON pc.generation_id = g.id
 			WHERE 1 = 1 ${sinceSql}
 		`)
@@ -574,6 +575,7 @@ export function getModelEconomics(days: number) {
 		cost: number;
 		cost_source: string | null;
 		queue_wait_ms: number | null;
+		blocked_count: number | null;
 	}>;
 
 	const used = db
@@ -601,6 +603,8 @@ export function getModelEconomics(days: number) {
 		{
 			runs: number;
 			failures: number;
+			/** Outputs the model's safety filter blocked. */
+			filtered: number;
 			credits: number;
 			cost: number;
 			estimatedCost: number;
@@ -614,6 +618,7 @@ export function getModelEconomics(days: number) {
 			s = {
 				runs: 0,
 				failures: 0,
+				filtered: 0,
 				credits: 0,
 				cost: 0,
 				estimatedCost: 0,
@@ -633,6 +638,8 @@ export function getModelEconomics(days: number) {
 		if (typeof g.queue_wait_ms === "number" && g.queue_wait_ms >= 0) {
 			s.queueWaits.push(g.queue_wait_ms / 1000);
 		}
+		// Partly blocked runs (some outputs saved): recorded on the generation.
+		if (typeof g.blocked_count === "number" && g.blocked_count > 0) s.filtered += g.blocked_count;
 	}
 	for (const u of used) {
 		const model = modelOfReason(u.reason);
@@ -649,6 +656,9 @@ export function getModelEconomics(days: number) {
 		if (/^(Generation failed|Generation returned no images|Tool .* failed)/.test(r.reason)) {
 			s.failures++;
 		}
+		// Fully blocked runs leave no generation row, only this refund.
+		const filtered = r.reason.match(/failed: blocked by safety filter \((\d+)\)/);
+		if (filtered) s.filtered += Number(filtered[1]);
 	}
 
 	const overrides = new Map(
@@ -672,6 +682,7 @@ export function getModelEconomics(days: number) {
 			const s = stats.get(id) ?? {
 				runs: 0,
 				failures: 0,
+				filtered: 0,
 				credits: 0,
 				cost: 0,
 				estimatedCost: 0,
@@ -690,6 +701,8 @@ export function getModelEconomics(days: number) {
 				runs: s.runs,
 				failures: s.failures,
 				failureRate: attempts > 0 ? (s.failures / attempts) * 100 : null,
+				/** Outputs blocked by the model's safety filter (refunded; own-key runs that were fully blocked aren't counted). */
+				filtered: s.filtered,
 				p50Seconds: percentile(lat, 50),
 				p95Seconds: percentile(lat, 95),
 				/** GPU queue wait of the winning prediction (recorded since GPU-wait tracking shipped). */

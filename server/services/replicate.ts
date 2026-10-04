@@ -60,6 +60,39 @@ export class GenerationCanceledError extends Error {
 	}
 }
 
+/**
+ * Thrown when the model's safety filter blocked the input or output (Replicate's
+ * E005 "flagged as sensitive", NSFW checkers). Credits are returned like any
+ * failure, but the user is told why so they can reword the prompt.
+ */
+export class ContentFilteredError extends Error {
+	constructor(message = "The output was blocked by the model's safety filter") {
+		super(message);
+		this.name = "ContentFilteredError";
+	}
+}
+
+/** Failure messages that mean a safety filter blocked the run, across models. */
+const CONTENT_FILTER_MESSAGE =
+	/\bE005\b|flagged as sensitive|\bnsfw\b|safety (filter|checker|system)|content (policy|moderation|filter)|moderation[_ ]blocked|potentially (sensitive|unsafe)/i;
+
+export function isContentFilterMessage(message: string): boolean {
+	return CONTENT_FILTER_MESSAGE.test(message);
+}
+
+/** Why one output failed: "content_filter" for safety-filter blocks, else "error". */
+export type FailureReason = "content_filter" | "error";
+
+export function failureReason(error: unknown): FailureReason {
+	return error instanceof ContentFilteredError ? "content_filter" : "error";
+}
+
+/** The error for a prediction Replicate reports as failed. */
+function predictionFailure(error: unknown): Error {
+	const message = error ? String(error) : "Generation failed";
+	return isContentFilterMessage(message) ? new ContentFilteredError(message) : new Error(message);
+}
+
 /** Thrown when an image input is not a safe, existing file in uploads/ or generated-images/. */
 export class InvalidImageInputError extends Error {
 	constructor(message = "Invalid image input") {
@@ -459,9 +492,7 @@ async function runSinglePrediction(
 		if (attempts.every((a) => isTerminal(a.latest.status))) {
 			const failed = attempts.find((a) => a.latest.status === "failed");
 			if (failed) {
-				throw new Error(
-					failed.latest.error ? String(failed.latest.error) : "Generation failed",
-				);
+				throw predictionFailure(failed.latest.error);
 			}
 			throw new GenerationCanceledError();
 		}
@@ -505,7 +536,7 @@ async function runSinglePrediction(
 	}
 
 	if (finalPrediction.status === "failed") {
-		throw new Error(finalPrediction.error ? String(finalPrediction.error) : "Generation failed");
+		throw predictionFailure(finalPrediction.error);
 	}
 	if (finalPrediction.status !== "succeeded") {
 		throw new GenerationCanceledError();
@@ -780,6 +811,13 @@ export function resolveRequest(
 /** Megapixels billed for the given pixel size. */
 const billedMp = (w: number, h: number) => (w * h) / 1_000_000;
 
+/** What a generation produced, and why any parallel outputs are missing. */
+export interface GenerationOutcome {
+	results: GenerationResult[];
+	/** One entry per parallel prediction that failed while others succeeded. */
+	failures: FailureReason[];
+}
+
 /**
  * Run a generation and download its outputs.
  *
@@ -792,6 +830,20 @@ export async function generateImage(
 	modelId: string,
 	options: GenerateOptions = {},
 ): Promise<GenerationResult[]> {
+	return (await generateImageDetailed(prompt, modelId, options)).results;
+}
+
+/**
+ * `generateImage`, plus the reason each failed parallel output failed (FLUX and
+ * most models run one prediction per output, and a safety filter can block
+ * some of them). When every output failed it throws: ContentFilteredError if
+ * the safety filter blocked all of them, else the first other error.
+ */
+export async function generateImageDetailed(
+	prompt: string,
+	modelId: string,
+	options: GenerateOptions = {},
+): Promise<GenerationOutcome> {
 	const model = getCatalogModel(modelId);
 	if (!model?.build || model.hidden) throw new Error(`Unknown model: ${modelId}`);
 	const { numOutputs = 1, apiKey, imageInputs = [] } = options;
@@ -840,7 +892,7 @@ export async function generateImage(
 
 	// One prediction when the model returns several outputs itself (or only one is wanted).
 	if (model.nativeOutputs || numOutputs === 1) {
-		return runAndDownload(numOutputs, options.seed);
+		return { results: await runAndDownload(numOutputs, options.seed), failures: [] };
 	}
 
 	// Otherwise parallel predictions. Partial success is kept; the caller refunds missing outputs.
@@ -854,11 +906,12 @@ export async function generateImage(
 	);
 
 	const results = settled.flatMap((s) => (s.status === "fulfilled" ? s.value : []));
-	if (results.length === 0) {
-		const firstError = settled.find((s): s is PromiseRejectedResult => s.status === "rejected");
-		if (firstError) throw firstError.reason;
+	const rejected = settled.filter((s): s is PromiseRejectedResult => s.status === "rejected");
+	if (results.length === 0 && rejected.length > 0) {
+		// A filter block is only reported as such when nothing else went wrong.
+		throw (rejected.find((r) => failureReason(r.reason) !== "content_filter") ?? rejected[0]).reason;
 	}
-	return results;
+	return { results, failures: rejected.map((r) => failureReason(r.reason)) };
 }
 
 // ---- Tools ------------------------------------------------------------------------

@@ -100,6 +100,7 @@ export type GenerateErrorCode =
 	| "GENERATION_NO_OUTPUT"
 	| "GENERATION_FAILED"
 	| "GPU_BUSY"
+	| "CONTENT_FILTERED"
 	| "API_KEY_UNREADABLE"
 	| "THREAD_NOT_FOUND"
 	| "RATE_LIMITED"
@@ -124,8 +125,17 @@ export interface GenerateResponse {
 	availableCredits?: number;
 	model?: string;
 	creditsCharged?: number;
+	/** Outputs the model's safety filter blocked while others succeeded (refunded). */
+	blocked?: BlockedOutputs;
 	usedOwnKey?: boolean;
 	threadId?: string;
+}
+
+/** Outputs of a generation the model's safety filter blocked (also in generations.parameters.blocked). */
+export interface BlockedOutputs {
+	count: number;
+	reason: "content_filter";
+	creditsReturned: number;
 }
 
 export interface HistoryResponse {

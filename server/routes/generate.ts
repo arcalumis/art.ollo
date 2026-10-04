@@ -17,6 +17,7 @@ import {
 	tierFromResolution,
 } from "../services/model-catalog";
 import {
+	ContentFilteredError,
 	GenerationCanceledError,
 	type GenerationResult,
 	GenerationTimeoutError,
@@ -26,7 +27,7 @@ import {
 	TOOL_NAMES,
 	type ToolName,
 	enhancePrompt,
-	generateImage,
+	generateImageDetailed,
 	imageInputDimensions,
 	isPerOutputPriced,
 	resolveRequest,
@@ -85,7 +86,16 @@ export type GenerateErrorCode =
 	| "GENERATION_CANCELED"
 	| "GENERATION_NO_OUTPUT"
 	| "GENERATION_FAILED"
-	| "GPU_BUSY";
+	| "GPU_BUSY"
+	| "CONTENT_FILTERED";
+
+/** Outputs of a partly successful generation that the model's safety filter blocked. */
+interface BlockedOutputs {
+	count: number;
+	reason: "content_filter";
+	/** Credits refunded for them (0 on the user's own Replicate key). */
+	creditsReturned: number;
+}
 
 const MAX_OUTPUTS = 4;
 const MAX_PROMPT_LENGTH = 10_000;
@@ -288,8 +298,23 @@ function makeReservation(userId: string, totalCredits: number) {
 	};
 }
 
+/**
+ * Refund reason for runs a safety filter blocked entirely. The admin Models
+ * page counts filtered outputs from `failed: blocked by safety filter (N)`.
+ */
+const filteredRefundReason = (prefix: string, outputs: number) =>
+	`${prefix}: blocked by safety filter (${outputs})`;
+
 /** Map a failed Replicate run to the error response (after refunding). */
 function sendRunError(reply: FastifyReply, error: unknown) {
+	if (error instanceof ContentFilteredError) {
+		return sendError(
+			reply,
+			422,
+			"CONTENT_FILTERED",
+			"The model's safety filter blocked this image. Your credits were returned. Try rewording the prompt.",
+		);
+	}
 	if (error instanceof InvalidImageInputError) {
 		return sendError(reply, 400, "INVALID_IMAGE_INPUT", error.message);
 	}
@@ -733,8 +758,9 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 			}
 
 			let results: GenerationResult[];
+			let filteredOutputs = 0;
 			try {
-				results = await generateImage(prompt, m.id, {
+				const outcome = await generateImageDetailed(prompt, m.id, {
 					numOutputs,
 					imageInputs,
 					aspectRatio: resolved.ratio,
@@ -744,8 +770,15 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 					seed,
 					tracker: trackerFor(request),
 				});
+				results = outcome.results;
+				filteredOutputs = outcome.failures.filter((f) => f === "content_filter").length;
 			} catch (error) {
-				reservation.refund(totalCredits, "Generation failed");
+				reservation.refund(
+					totalCredits,
+					error instanceof ContentFilteredError
+						? filteredRefundReason("Generation failed", numOutputs)
+						: "Generation failed",
+				);
 				fastify.log.error(error);
 				return sendRunError(reply, error);
 			}
@@ -761,9 +794,25 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 			}
 			// Native multi-output models may return extras: keep only what was paid for.
 			results = results.slice(0, numOutputs);
-			if (results.length < numOutputs) {
+			const missing = numOutputs - results.length;
+			// Outputs the model's safety filter blocked: refunded, and the user is told.
+			const blockedCount = Math.min(filteredOutputs, missing);
+			let blocked: BlockedOutputs | undefined;
+			if (blockedCount > 0) {
+				const before = reservation.charged;
 				reservation.refund(
-					(numOutputs - results.length) * perImageCredits,
+					blockedCount * perImageCredits,
+					`Blocked by safety filter (${blockedCount} of ${numOutputs})`,
+				);
+				blocked = {
+					count: blockedCount,
+					reason: "content_filter",
+					creditsReturned: before - reservation.charged,
+				};
+			}
+			if (missing > blockedCount) {
+				reservation.refund(
+					(missing - blockedCount) * perImageCredits,
 					"Generation returned fewer images",
 				);
 			}
@@ -791,6 +840,7 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 							outputFormat,
 							variation: isVariation || undefined,
 							creditsCharged,
+							blocked,
 							...queueStats(results),
 						},
 					},
@@ -813,6 +863,7 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 					tier,
 					aspectRatio: resolved.ratio,
 					creditsCharged,
+					...(blocked ? { blocked } : {}),
 					usedOwnKey,
 					threadId: finalThreadId,
 				};
@@ -945,7 +996,12 @@ export async function generateRoutes(fastify: FastifyInstance): Promise<void> {
 					tracker: trackerFor(request),
 				});
 			} catch (error) {
-				reservation.refund(credits, `Tool ${tool} failed`);
+				reservation.refund(
+					credits,
+					error instanceof ContentFilteredError
+						? filteredRefundReason(`Tool ${tool} failed`, 1)
+						: `Tool ${tool} failed`,
+				);
 				fastify.log.error(error);
 				return sendRunError(reply, error);
 			}

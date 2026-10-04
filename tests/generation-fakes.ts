@@ -17,7 +17,12 @@ export const PNG_BYTES = Buffer.from(
 
 export type Behavior =
 	| { kind: "succeed"; outputs?: number; delayMs?: number }
-	| { kind: "fail"; delayMs?: number }
+	| { kind: "fail"; delayMs?: number; error?: string }
+	/**
+	 * Per prediction (0-based, in creation order): null succeeds with one
+	 * output, a string fails with that error (missing entries succeed).
+	 */
+	| { kind: "mixed"; errors: (string | null)[] }
 	| { kind: "hang" }
 	| { kind: "cancel" }
 	/**
@@ -121,7 +126,12 @@ function makeClient(apiKey?: string) {
 				}
 				if (b.kind === "hang") return { id, status: "processing" };
 				if (b.kind === "cancel") return { id, status: "canceled" };
-				if (b.kind === "fail") return { id, status: "failed", error: "model exploded" };
+				if (b.kind === "fail") return { id, status: "failed", error: b.error ?? "model exploded" };
+				if (b.kind === "mixed") {
+					const index = fake.created.find((c) => c.id === id)?.index ?? 0;
+					const error = b.errors[index];
+					if (error) return { id, status: "failed", error };
+				}
 				const n = predictions.get(id)?.outputs ?? 1;
 				return {
 					id,
