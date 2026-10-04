@@ -1,4 +1,5 @@
 import { GenerationErrorNotice } from "@/components/billing/GenerationErrorNotice";
+import { describeBlockedOutputs } from "@/components/billing/generationErrors";
 import { modelName } from "@/components/billing/plans";
 import { Laurel } from "@/components/brand/Laurel";
 import { Button } from "@/components/ui/button";
@@ -11,7 +12,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import type { Generation, QueuedGeneration } from "@/types";
-import { ImagePlusIcon, MoreHorizontalIcon } from "lucide-react";
+import { ImagePlusIcon, MoreHorizontalIcon, ShieldAlertIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { type ImageActionCosts, type ViewerImage, absoluteUrl, cssAspect } from "../viewer/media";
 import { pendingView } from "./pendingView";
@@ -75,6 +76,10 @@ export function CompletedStep({
 			: undefined,
 	);
 	const referenced = images.some((img) => referenceUrls.includes(img.url));
+	const blockedNote = describeBlockedOutputs(
+		generation.parameters?.blocked,
+		generation.parameters?.numOutputs,
+	);
 
 	return (
 		<figure className="m-0 flex min-w-0 flex-col gap-2.5">
@@ -156,6 +161,12 @@ export function CompletedStep({
 					</p>
 					<StepMenu generation={generation} image={first} isSet={isSet} {...menu} />
 				</div>
+				{blockedNote && (
+					<p className="flex items-start gap-1.5 text-xs leading-snug text-muted-foreground">
+						<ShieldAlertIcon className="mt-px size-3.5 shrink-0" aria-hidden />
+						<span>{blockedNote}</span>
+					</p>
+				)}
 				{selected && menu.onUseAsReference && first && (
 					<Button
 						variant="outline"

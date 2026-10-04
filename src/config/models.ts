@@ -12,8 +12,13 @@ import {
 	type Tier,
 	catalogCredits,
 	currentModelId,
+	MATCH_INPUT,
+	type OutputSize,
 	getCatalogModel,
+	outputSize,
 	resolveTier,
+	sizeLabel,
+	snapRatio,
 } from "../../server/services/model-catalog";
 import type { Model } from "../types";
 
@@ -30,7 +35,9 @@ export {
 	modelDisplayName,
 	orientationOf,
 	ratioChoices,
+	outputSize,
 	resolveTier,
+	sizeLabel,
 	snapRatio,
 	supportedRatios,
 	TIER_LABELS,
@@ -167,4 +174,33 @@ export function groupModels<T extends { group?: string }>(
 		group,
 		models: models.filter((m) => m.group === group),
 	})).filter((g) => g.models.length > 0);
+}
+
+/** Parse an /api/models size ("1424x1424", "~1424x1424" when approximate). */
+function parseApiSize(value: string | undefined): OutputSize | null {
+	const m = value ? /^(~?)(\d+)x(\d+)$/.exec(value) : null;
+	if (!m) return null;
+	return { width: Number(m[2]), height: Number(m[3]), approx: m[1] === "~" || undefined };
+}
+
+/**
+ * The expected output size of a model at a tier and ratio, as a label
+ * ("1424 × 1424", or "≈ 2 MP" when the model picks its own size). The
+ * server's table wins; the catalog computes the same while it loads.
+ */
+export function outputSizeLabel(
+	catalog: CatalogModel,
+	tier: Tier,
+	ratio: string,
+	serverModel?: Model,
+): string | null {
+	const resolved = resolveTier(catalog, tier);
+	if (ratio !== MATCH_INPUT) {
+		const rendered = snapRatio(catalog, ratio).ratio;
+		const row = serverModel?.tiers?.find((t) => t.tier === resolved);
+		const fromServer = parseApiSize(row?.sizes?.[rendered]);
+		if (fromServer) return sizeLabel(fromServer);
+	}
+	const size = outputSize(catalog, ratio, resolved);
+	return size ? sizeLabel(size) : null;
 }

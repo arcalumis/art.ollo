@@ -58,6 +58,8 @@ export interface ModelTierInfo {
 	/** Credits per output, indexed by number of reference images. */
 	credits: number[];
 	allowed: boolean;
+	/** Expected output size per rendered ratio: "1424x1424", or "~1424x1424" when approximate. */
+	sizes?: Record<string, string>;
 }
 
 export interface GenerateRequest {
@@ -100,6 +102,7 @@ export type GenerateErrorCode =
 	| "GENERATION_NO_OUTPUT"
 	| "GENERATION_FAILED"
 	| "GPU_BUSY"
+	| "CONTENT_FILTERED"
 	| "API_KEY_UNREADABLE"
 	| "THREAD_NOT_FOUND"
 	| "RATE_LIMITED"
@@ -124,8 +127,17 @@ export interface GenerateResponse {
 	availableCredits?: number;
 	model?: string;
 	creditsCharged?: number;
+	/** Outputs the model's safety filter blocked while others succeeded (refunded). */
+	blocked?: BlockedOutputs;
 	usedOwnKey?: boolean;
 	threadId?: string;
+}
+
+/** Outputs of a generation the model's safety filter blocked (also in generations.parameters.blocked). */
+export interface BlockedOutputs {
+	count: number;
+	reason: "content_filter";
+	creditsReturned: number;
 }
 
 export interface HistoryResponse {

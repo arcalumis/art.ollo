@@ -116,6 +116,20 @@ export interface CatalogModel {
 	/** File type the model returns ("svg" for vector models). */
 	outputFormat: "png" | "jpg" | "webp" | "svg";
 	build?: (ctx: BuildContext) => Record<string, unknown>;
+	/**
+	 * Expected output size for a ratio the model renders (already snapped) at a
+	 * tier, from the model's own sizing rules. Without it, `outputSize` falls
+	 * back to an approximate size from the tier's nominal megapixels.
+	 */
+	size?: (ratio: string, tier: Tier) => OutputSize;
+}
+
+/** Expected pixel size of one output. */
+export interface OutputSize {
+	width: number;
+	height: number;
+	/** The model picks its own size; width/height are a best guess, show megapixels instead. */
+	approx?: boolean;
 }
 
 // ---- Ratios -------------------------------------------------------------------
@@ -208,6 +222,32 @@ export function customDimensions(
 	const snap = (v: number) =>
 		Math.min(limits.max, Math.max(limits.min, Math.floor(v / limits.multiple) * limits.multiple));
 	return { width: snap(w), height: snap(h) };
+}
+
+/**
+ * Width x height for a ratio at `mp` megapixels (1 MP = 1,000,000 pixels here,
+ * as BFL's `output_megapixels` / `resolution` presets count them), each side
+ * rounded to `multiple` with `mode`.
+ */
+export function megapixelDimensions(
+	ratio: string,
+	mp: number,
+	multiple: number,
+	mode: "round" | "ceil" = "round",
+): { width: number; height: number } {
+	const r = ratioValue(ratio) || 1;
+	const w = Math.sqrt(mp * 1_000_000 * r);
+	const h = w / r;
+	// The epsilon keeps float noise (1000.0000001) from rounding a whole multiple up.
+	const snap = (v: number) =>
+		Math.max(multiple, (mode === "ceil" ? Math.ceil(v / multiple - 1e-9) : Math.round(v / multiple)) * multiple);
+	return { width: snap(w), height: snap(h) };
+}
+
+/** Parse a "WxH" size. */
+function parseSize(size: string): { width: number; height: number } {
+	const [width, height] = size.split("x").map(Number);
+	return { width, height };
 }
 
 /** Pick the "WxH" size from a fixed list whose shape is closest to the ratio. */
@@ -348,6 +388,16 @@ const fmt = (wanted: string | undefined, allowed: string[], fallback: string, jp
 	return fallback;
 };
 
+/**
+ * Owner-approved policy setting (2026-10-03): FLUX 2 Pro's `safety_tolerance`
+ * (integer 1-5, default 2; 1 is most strict, 5 most permissive). Of the
+ * catalog's schemas (checked 2026-10-03) it is the only numeric moderation
+ * scale; GPT Image's `moderation` ("auto" | "low") is not a matching scale and
+ * stays at its default. `disable_safety_checker` (FLUX 2 Dev, Klein, Quick
+ * Edit, large-image upscale) is never sent.
+ */
+export const SAFETY_TOLERANCE = 4;
+
 const FLUX2_PRESETS = ["1:1", "16:9", "3:2", "2:3", "4:5", "5:4", "9:16", "3:4", "4:3"];
 const BANANA_RATIOS = [
 	"1:1",
@@ -419,6 +469,125 @@ const RECRAFT_PRO_SIZES = [
 const RECRAFT_RATIOS = sizesToRatios(RECRAFT_SIZES);
 const IDEOGRAM_RATIOS = sizesToRatios(IDEOGRAM_SIZES);
 
+// ---- Output sizes -------------------------------------------------------------------
+
+/** Nominal megapixels of a tier (1 = 1024x1024). */
+const tierMp = (tier: Tier) => (tier === "draft" ? 1 : tier === "standard" ? 2 : 4);
+
+/** A best-guess size for models that choose their own: `mp` nominal megapixels at the ratio. */
+function approxSize(ratio: string, mp: number): OutputSize {
+	const r = ratioValue(ratio) || 1;
+	const w = Math.sqrt(mp * MP_PIXELS * r);
+	return { width: Math.round(w), height: Math.round(w / r), approx: true };
+}
+
+/** Google's published 1K sizes for Gemini image models; 2K and 4K are exact multiples. */
+const BANANA_1K: Record<string, string> = {
+	"1:1": "1024x1024",
+	"2:3": "848x1264",
+	"3:2": "1264x848",
+	"3:4": "896x1200",
+	"4:3": "1200x896",
+	"4:5": "928x1152",
+	"5:4": "1152x928",
+	"9:16": "768x1376",
+	"16:9": "1376x768",
+	"21:9": "1584x672",
+};
+const BANANA_SCALE: Record<string, number> = { "1K": 1, "2K": 2, "4K": 4 };
+function bananaSize(ratio: string, resolution: "1K" | "2K" | "4K"): OutputSize {
+	const base = BANANA_1K[ratio];
+	const k = BANANA_SCALE[resolution];
+	// The very wide and tall shapes (1:4, 8:1, …) aren't in the published table.
+	if (!base) return approxSize(ratio, k * k);
+	const { width, height } = parseSize(base);
+	return { width: width * k, height: height * k };
+}
+
+/**
+ * ByteDance's recommended Seedream sizes. The model may adjust them, so these
+ * are marked approximate.
+ */
+const SEEDREAM_2K: Record<string, string> = {
+	"1:1": "2048x2048",
+	"4:3": "2304x1728",
+	"3:4": "1728x2304",
+	"16:9": "2560x1440",
+	"9:16": "1440x2560",
+	"3:2": "2496x1664",
+	"2:3": "1664x2496",
+	"21:9": "3024x1296",
+};
+function seedreamSize(ratio: string, tier: Tier): OutputSize {
+	const base = SEEDREAM_2K[ratio];
+	if (!base) return approxSize(ratio, tier === "draft" ? 1 : 4);
+	const { width, height } = parseSize(base);
+	const k = tier === "draft" ? 2 : 1;
+	return { width: width / k, height: height / k, approx: true };
+}
+
+const FLUX2_DEV_LIMITS = { min: 256, max: 1440, multiple: 32 };
+const FLUX2_PRO_LIMITS = { min: 256, max: 2048, multiple: 32 };
+
+/**
+ * Output size of `model` at `tier` for `ratio` (snapped to a ratio it renders
+ * first). Null for tools. For "Match input" the shape follows the image, so
+ * the size is the model's 1:1 size marked approximate (shown as megapixels).
+ */
+export function outputSize(model: CatalogModel, ratio: string, tier: Tier): OutputSize | null {
+	if (model.kind !== "image") return null;
+	const t = resolveTier(model, tier);
+	const spec = model.tiers[t];
+	if (!spec) return null;
+	if (ratio === MATCH_INPUT) {
+		const square = outputSize(model, "1:1", t);
+		return square && { ...square, approx: true };
+	}
+	const snapped = snapRatio(model, ratio).ratio;
+	return model.size ? model.size(snapped, t) : approxSize(snapped, spec.mp);
+}
+
+/** Megapixels to show for a size: one decimal under 10 ("1.5 MP"), whole above. */
+export function megapixelsLabel(size: { width: number; height: number }): string {
+	const mp = (size.width * size.height) / MP_PIXELS;
+	const rounded = mp < 10 ? Math.round(mp * 10) / 10 : Math.round(mp);
+	return `${rounded} MP`;
+}
+
+/** "1424 × 1424", or "≈ 2 MP" when the model picks its own size. */
+export function sizeLabel(size: OutputSize): string {
+	return size.approx ? `≈ ${megapixelsLabel(size)}` : `${size.width} × ${size.height}`;
+}
+
+/** Expected output of a tool on an input of this size. */
+export function toolOutputSize(
+	model: CatalogModel,
+	input: { width: number; height: number },
+): OutputSize | null {
+	const { width, height } = input;
+	if (!width || !height) return null;
+	switch (model.id) {
+		case "recraft-ai/recraft-crisp-upscale": {
+			// Four times larger, with the long side capped at 4096.
+			const long = Math.max(width, height);
+			const scale = Math.min(4, 4096 / long);
+			return {
+				width: Math.round(width * scale),
+				height: Math.round(height * scale),
+				approx: long * 4 < 4096 || undefined,
+			};
+		}
+		case "prunaai/p-image-upscale": {
+			const scale = Math.sqrt((16 * 1_000_000) / (width * height));
+			return { width: Math.round(width * scale), height: Math.round(height * scale), approx: true };
+		}
+		case "recraft-ai/recraft-remove-background":
+			return { width, height };
+		default:
+			return null;
+	}
+}
+
 const GPT_QUALITY: Record<Tier, string> = { draft: "medium", standard: "high", max: "xhigh" };
 const gptTiers = (): Partial<Record<Tier, TierSpec>> => ({
 	draft: { mp: 1, price: { perImage: 0.047 }, hint: "Medium detail" },
@@ -437,9 +606,19 @@ const gptBuild = (ctx: BuildContext) => {
 	return input;
 };
 
+/** Max sends an exact size; the lower tiers send a ratio and the model picks the size. */
+const gptSize = (ratio: string, tier: Tier): OutputSize =>
+	tier === "max" && GPT_MAX_SIZES[ratio]
+		? parseSize(GPT_MAX_SIZES[ratio])
+		: approxSize(ratio, tier === "draft" ? 1 : 1.5);
+
+const recraftSizes = (tier: Tier) => (tier === "max" ? RECRAFT_PRO_SIZES : RECRAFT_SIZES);
+const recraftSize = (ratio: string, tier: Tier): OutputSize =>
+	parseSize(nearestSize(recraftSizes(tier), ratio));
+
 const recraftBuild = (ctx: BuildContext) => ({
 	prompt: ctx.prompt,
-	size: nearestSize(ctx.tier === "max" ? RECRAFT_PRO_SIZES : RECRAFT_SIZES, ctx.ratio),
+	size: nearestSize(recraftSizes(ctx.tier), ctx.ratio),
 });
 
 // ---- The catalog ------------------------------------------------------------------
@@ -475,6 +654,8 @@ export const CATALOG: CatalogModel[] = [
 			if (ctx.refs.length > 0) input.images = ctx.refs;
 			return withSeed(input, ctx.seed);
 		},
+		// Sides round to multiples of 64 (4:5 draft rendered 896x1088).
+		size: (ratio, tier) => megapixelDimensions(ratio, tierMp(tier), 64),
 	},
 	{
 		id: "black-forest-labs/flux-2-dev",
@@ -495,11 +676,7 @@ export const CATALOG: CatalogModel[] = [
 		seed: true,
 		outputFormat: "png",
 		build: (ctx) => {
-			const { width, height } = customDimensions(ctx.ratio, ctx.tier === "draft" ? 1 : 2, {
-				min: 256,
-				max: 1440,
-				multiple: 32,
-			});
+			const { width, height } = customDimensions(ctx.ratio, tierMp(ctx.tier), FLUX2_DEV_LIMITS);
 			const input: Record<string, unknown> = {
 				prompt: ctx.prompt,
 				aspect_ratio: "custom",
@@ -511,6 +688,7 @@ export const CATALOG: CatalogModel[] = [
 			if (ctx.refs.length > 0) input.input_images = ctx.refs;
 			return withSeed(input, ctx.seed);
 		},
+		size: (ratio, tier) => customDimensions(ratio, tierMp(tier), FLUX2_DEV_LIMITS),
 	},
 	{
 		id: "google/nano-banana-2-lite",
@@ -532,6 +710,7 @@ export const CATALOG: CatalogModel[] = [
 			image_input: ctx.refs,
 			output_format: fmt(ctx.outputFormat, ["jpg", "png"], "png"),
 		}),
+		size: (ratio) => bananaSize(ratio, "1K"),
 	},
 
 	// === Best quality ===
@@ -576,6 +755,8 @@ export const CATALOG: CatalogModel[] = [
 			if (ctx.refs.length > 0) input.image = ctx.refs[0];
 			return input;
 		},
+		// xAI picks the exact size for each shape.
+		size: (ratio, tier) => approxSize(ratio, tier === "draft" ? 1 : 4),
 	},
 	{
 		id: "openai/gpt-image-2.5-flare",
@@ -592,6 +773,7 @@ export const CATALOG: CatalogModel[] = [
 		nativeOutputs: true,
 		outputFormat: "png",
 		build: gptBuild,
+		size: gptSize,
 	},
 	{
 		id: "bytedance/seedream-5-pro",
@@ -617,6 +799,7 @@ export const CATALOG: CatalogModel[] = [
 			image_input: ctx.refs,
 			output_format: fmt(ctx.outputFormat, ["png", "jpeg"], "png", "jpeg"),
 		}),
+		size: seedreamSize,
 	},
 	{
 		id: "google/nano-banana-2",
@@ -643,6 +826,7 @@ export const CATALOG: CatalogModel[] = [
 			image_input: ctx.refs,
 			output_format: fmt(ctx.outputFormat, ["jpg", "png"], "png"),
 		}),
+		size: (ratio, tier) => bananaSize(ratio, tier === "draft" ? "1K" : tier === "standard" ? "2K" : "4K"),
 	},
 	{
 		id: "black-forest-labs/flux-2-pro",
@@ -668,20 +852,17 @@ export const CATALOG: CatalogModel[] = [
 		seed: true,
 		outputFormat: "png",
 		build: (ctx) => {
-			const mp = ctx.tier === "draft" ? 1 : ctx.tier === "standard" ? 2 : 4;
+			const mp = tierMp(ctx.tier);
 			const input: Record<string, unknown> = {
 				prompt: ctx.prompt,
+				safety_tolerance: SAFETY_TOLERANCE,
 				output_format: fmt(ctx.outputFormat, ["webp", "jpg", "png"], "png"),
 			};
 			if (FLUX2_PRESETS.includes(ctx.ratio)) {
 				input.aspect_ratio = ctx.ratio;
 				input.resolution = `${mp} MP`;
 			} else {
-				const { width, height } = customDimensions(ctx.ratio, mp, {
-					min: 256,
-					max: 2048,
-					multiple: 32,
-				});
+				const { width, height } = customDimensions(ctx.ratio, mp, FLUX2_PRO_LIMITS);
 				input.aspect_ratio = "custom";
 				input.width = width;
 				input.height = height;
@@ -689,6 +870,12 @@ export const CATALOG: CatalogModel[] = [
 			if (ctx.refs.length > 0) input.input_images = ctx.refs;
 			return withSeed(input, ctx.seed);
 		},
+		// Presets: sides round up to multiples of 16 at 1 MP = 1,000,000 px (1:1 standard
+		// rendered 1424x1424). Other shapes send an exact custom size.
+		size: (ratio, tier) =>
+			FLUX2_PRESETS.includes(ratio)
+				? megapixelDimensions(ratio, tierMp(tier), 16, "ceil")
+				: customDimensions(ratio, tierMp(tier), FLUX2_PRO_LIMITS),
 	},
 
 	// === Text and logos ===
@@ -722,6 +909,7 @@ export const CATALOG: CatalogModel[] = [
 			if (ctx.refs.length > 0) input.images = ctx.refs;
 			return withSeed(input, ctx.seed);
 		},
+		size: (ratio) => parseSize(nearestSize(IDEOGRAM_SIZES, ratio)),
 	},
 	{
 		id: "recraft-ai/recraft-v4.1",
@@ -746,6 +934,7 @@ export const CATALOG: CatalogModel[] = [
 		maxOutputs: 4,
 		outputFormat: "png",
 		build: recraftBuild,
+		size: recraftSize,
 	},
 	{
 		id: "recraft-ai/recraft-v4.1-svg",
@@ -761,6 +950,7 @@ export const CATALOG: CatalogModel[] = [
 		maxOutputs: 4,
 		outputFormat: "svg",
 		build: recraftBuild,
+		size: recraftSize,
 	},
 
 	// === Edit an image ===
@@ -779,6 +969,7 @@ export const CATALOG: CatalogModel[] = [
 		nativeOutputs: true,
 		outputFormat: "png",
 		build: gptBuild,
+		size: gptSize,
 	},
 	{
 		id: "prunaai/p-image-edit",

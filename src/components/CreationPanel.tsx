@@ -34,6 +34,7 @@ import {
 	groupModels,
 	isTierAllowed,
 	orientationOf,
+	outputSizeLabel,
 	ratioChoices,
 	resolveTier,
 	snapRatio,
@@ -405,6 +406,7 @@ function ShapeAndSize({
 						const credits = available
 							? creditsPerOutput(catalog.id, t, refsCount, serverModel)
 							: null;
+						const size = available ? outputSizeLabel(catalog, t, ratio, serverModel) : null;
 						return (
 							<button
 								key={t}
@@ -427,6 +429,11 @@ function ShapeAndSize({
 									)}
 									{TIER_LABELS[t]}
 								</span>
+								{size && (
+									<span className="text-[0.75rem] whitespace-nowrap text-foreground/80 tabular-nums">
+										{size}
+									</span>
+								)}
 								<span className="text-[0.72rem] text-muted-foreground tabular-nums">
 									{credits === null ? "Not offered" : allowed ? creditsLabel(credits) : "Upgrade"}
 								</span>
@@ -593,6 +600,10 @@ export function CreationPanel({
 	const ratioLabel = options.aspectRatio === MATCH_INPUT ? "Match input" : options.aspectRatio;
 	const snapped =
 		catalog && options.aspectRatio !== MATCH_INPUT ? snapRatio(catalog, options.aspectRatio) : null;
+	const sizeText = catalog
+		? outputSizeLabel(catalog, tier, options.aspectRatio, serverModel)
+		: null;
+	const shapeText = snapped?.snapped ? snapped.ratio : ratioLabel;
 	const shapeIcon =
 		options.aspectRatio === MATCH_INPUT ? (
 			<ScanIcon className="size-4" />
@@ -857,11 +868,14 @@ export function CreationPanel({
 								<button
 									type="button"
 									className={iconPill}
-									aria-label={`Shape ${ratioLabel}, size ${TIER_LABELS[tier]}`}
+									aria-label={`Shape ${shapeText}, size ${TIER_LABELS[tier]}${sizeText ? `, ${sizeText}` : ""}`}
 								>
 									{shapeIcon}
-									<span className="tabular-nums">
-										{snapped?.snapped ? snapped.ratio : ratioLabel} · {TIER_LABELS[tier]}
+									<span className="whitespace-nowrap tabular-nums">
+										{/* Exact pixels say the shape; "≈ 2 MP" doesn't, so the ratio stays with it. */}
+										{TIER_LABELS[tier]}
+										{sizeText && !sizeText.startsWith("≈") ? "" : ` · ${shapeText}`}
+										{sizeText ? ` · ${sizeText}` : ""}
 										{outputCountEnabled && outputs > 1 ? ` · ×${outputs}` : ""}
 									</span>
 									<ChevronDownIcon className="size-3.5 text-muted-foreground" aria-hidden />

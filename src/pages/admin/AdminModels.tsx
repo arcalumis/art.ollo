@@ -32,6 +32,7 @@ interface ModelRow {
 	runs: number;
 	failures: number;
 	failureRate: number | null;
+	filtered: number;
 	p50Seconds: number | null;
 	p95Seconds: number | null;
 	queueWaitP50Seconds: number | null;
@@ -154,15 +155,16 @@ export default function AdminModels() {
 		`/api/admin/models/economics?days=${days}`,
 	);
 	const models = data?.models ?? [];
-	const used = models.filter((m) => m.runs > 0 || m.failures > 0);
+	const used = models.filter((m) => m.runs > 0 || m.failures > 0 || m.filtered > 0);
 	const editable = models.filter((m) => !m.hidden && m.tiers.length > 0);
 	const totals = used.reduce(
 		(t, m) => ({
 			cost: t.cost + m.costUsd,
 			value: t.value + m.creditValueUsd,
 			runs: t.runs + m.runs,
+			filtered: t.filtered + m.filtered,
 		}),
-		{ cost: 0, value: 0, runs: 0 },
+		{ cost: 0, value: 0, runs: 0, filtered: 0 },
 	);
 
 	return (
@@ -196,15 +198,16 @@ export default function AdminModels() {
 					</div>
 				) : used.length === 0 ? (
 					<EmptyState title="No runs in this range">
-						Each model's runs, failures, latency and margin appear here once people generate.
+						Each model's runs, failures, filtered images, latency and margin appear here once people generate.
 					</EmptyState>
 				) : (
-					<DataTable className="min-w-[66rem]">
+					<DataTable className="min-w-[70rem]">
 						<thead>
 							<tr>
 								<Th>Model</Th>
 								<Th right>Runs</Th>
 								<Th right>Failure rate</Th>
+								<Th right>Filtered</Th>
 								<Th right>p50</Th>
 								<Th right>p95</Th>
 								<Th right>Queue wait p50/p95</Th>
@@ -239,6 +242,9 @@ export default function AdminModels() {
 											</div>
 										)}
 									</Td>
+									<Td num>
+										{m.filtered > 0 ? fmtInt(m.filtered) : "—"}
+									</Td>
 									<Td num>{secs(m.p50Seconds)}</Td>
 									<Td num>{secs(m.p95Seconds)}</Td>
 									<Td num>
@@ -267,6 +273,7 @@ export default function AdminModels() {
 								<Td className="font-medium">Total</Td>
 								<Td num>{fmtInt(totals.runs)}</Td>
 								<Td />
+								<Td num>{totals.filtered > 0 ? fmtInt(totals.filtered) : "—"}</Td>
 								<Td />
 								<Td />
 								<Td />
