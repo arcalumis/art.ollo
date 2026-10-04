@@ -18,11 +18,16 @@ import {
 	currentModelId,
 	customDimensions,
 	getCatalogModel,
+	TIERS,
 	isTierAllowed,
+	outputSize,
 	priceOfOutput,
 	resolveTier,
+	sizeLabel,
 	snapRatio,
+	supportedRatios,
 	tierFromResolution,
+	toolOutputSize,
 	visibleModels,
 } from "../server/services/model-catalog";
 import {
@@ -437,5 +442,113 @@ describe("/api/models", () => {
 
 		const legacy = (await app.inject({ method: "GET", url: "/api/models?all=1" })).json();
 		expect(legacy.models).toHaveLength(13); // ?all=1 is admin-only
+	});
+});
+
+describe("output sizes", () => {
+	// Real outputs from production (dimensions read from the saved files).
+	const golden: [string, string, Tier, number, number][] = [
+		["black-forest-labs/flux-2-pro", "1:1", "standard", 1424, 1424],
+		["black-forest-labs/flux-2-klein-4b", "4:5", "draft", 896, 1088],
+		["black-forest-labs/flux-2-dev", "16:9", "standard", 1440, 800],
+		// Vary runs FLUX 2 Dev at Standard.
+		["black-forest-labs/flux-2-dev", "4:5", "standard", 1152, 1440],
+	];
+	for (const [id, ratio, tier, width, height] of golden) {
+		test(`${id.split("/")[1]} ${ratio} ${tier} = ${width}x${height}`, () => {
+			expect(outputSize(model(id), ratio, tier)).toEqual({ width, height });
+		});
+	}
+
+	test("recraft-crisp-upscale took 896x1088 to 3373x4096", () => {
+		const size = toolOutputSize(model("recraft-ai/recraft-crisp-upscale"), {
+			width: 896,
+			height: 1088,
+		});
+		expect(size?.width).toBe(3373);
+		expect(size?.height).toBe(4096);
+		expect(size?.approx).toBeFalsy();
+	});
+
+	test("custom sizes match what the builder sends", () => {
+		for (const ratio of ["21:9", "1:2", "9:16"]) {
+			const input = build("black-forest-labs/flux-2-pro", { ratio, tier: "max" });
+			const size = outputSize(model("black-forest-labs/flux-2-pro"), ratio, "max");
+			if (input.aspect_ratio === "custom") {
+				expect(size).toEqual({ width: input.width as number, height: input.height as number });
+			}
+		}
+		const dev = build("black-forest-labs/flux-2-dev", { ratio: "3:2", tier: "draft" });
+		expect(outputSize(model("black-forest-labs/flux-2-dev"), "3:2", "draft")).toEqual({
+			width: dev.width as number,
+			height: dev.height as number,
+		});
+	});
+
+	test("resolution tables, fixed size lists and exact sizes", () => {
+		const nb2 = model("google/nano-banana-2");
+		expect(outputSize(nb2, "16:9", "draft")).toEqual({ width: 1376, height: 768 });
+		expect(outputSize(nb2, "16:9", "standard")).toEqual({ width: 2752, height: 1536 });
+		expect(outputSize(nb2, "1:1", "max")).toEqual({ width: 4096, height: 4096 });
+		expect(outputSize(nb2, "8:1", "draft")?.approx).toBe(true);
+		expect(outputSize(model("ideogram-ai/ideogram-4-5"), "4:5", "max")).toEqual({
+			width: 896,
+			height: 1280,
+		});
+		expect(outputSize(model("recraft-ai/recraft-v4.1"), "1:1", "max")).toEqual({
+			width: 2048,
+			height: 2048,
+		});
+		expect(outputSize(model("openai/gpt-image-2.5-flare"), "16:9", "max")).toEqual({
+			width: 3840,
+			height: 2160,
+		});
+	});
+
+	test("models that pick their own size are approximate and read as megapixels", () => {
+		const grok = outputSize(model("xai/grok-imagine-image-2"), "16:9", "standard");
+		expect(grok?.approx).toBe(true);
+		expect(grok && sizeLabel(grok)).toBe("≈ 4 MP");
+		const gpt = outputSize(model("openai/gpt-image-2.5-flare"), "1:1", "standard");
+		expect(gpt && sizeLabel(gpt)).toBe("≈ 1.5 MP");
+		expect(sizeLabel({ width: 1424, height: 1424 })).toBe("1424 × 1424");
+	});
+
+	test("unsupported ratios snap first; Match input is approximate; tools have no tier size", () => {
+		const recraft = model("recraft-ai/recraft-v4.1");
+		expect(outputSize(recraft, "21:9", "standard")).toEqual(
+			outputSize(recraft, snapRatio(recraft, "21:9").ratio, "standard"),
+		);
+		expect(
+			outputSize(model("black-forest-labs/flux-2-dev"), "match_input_image", "standard"),
+		).toEqual({ width: 1440, height: 1440, approx: true });
+		expect(outputSize(model("recraft-ai/recraft-crisp-upscale"), "1:1", "standard")).toBeNull();
+	});
+
+	test("every visible model has a size for every ratio and tier it offers", () => {
+		for (const m of visibleModels()) {
+			for (const tier of TIERS.filter((t) => m.tiers[t])) {
+				for (const ratio of supportedRatios(m)) {
+					const size = outputSize(m, ratio, tier);
+					expect(size?.width).toBeGreaterThan(0);
+					expect(size?.height).toBeGreaterThan(0);
+				}
+			}
+		}
+	});
+
+	test("/api/models carries a compact size table per tier", async () => {
+		const app = await getApp();
+		const body = (await app.inject({ method: "GET", url: "/api/models" })).json();
+		const pro = body.models.find((m: { id: string }) => m.id === "black-forest-labs/flux-2-pro");
+		const standard = pro.tiers.find((t: { tier: string }) => t.tier === "standard");
+		expect(standard.sizes["1:1"]).toBe("1424x1424");
+		const grok = body.models.find((m: { id: string }) => m.id === "xai/grok-imagine-image-2");
+		expect(grok.tiers[0].sizes["16:9"]).toMatch(/^~\d+x\d+$/);
+		// Small: every size table together stays well under 10 KB.
+		const tables = body.models.flatMap((m: { tiers: { sizes: unknown }[] }) =>
+			m.tiers.map((t) => t.sizes),
+		);
+		expect(JSON.stringify(tables).length).toBeLessThan(10_000);
 	});
 });

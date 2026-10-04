@@ -58,6 +58,8 @@ export interface ModelTierInfo {
 	/** Credits per output, indexed by number of reference images. */
 	credits: number[];
 	allowed: boolean;
+	/** Expected output size per rendered ratio: "1424x1424", or "~1424x1424" when approximate. */
+	sizes?: Record<string, string>;
 }
 
 export interface GenerateRequest {

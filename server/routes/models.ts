@@ -8,6 +8,7 @@ import {
 	TIER_LABELS,
 	availableTiers,
 	isTierAllowed,
+	outputSize,
 	ratioChoices,
 	supportedRatios,
 	toolModels,
@@ -28,6 +29,7 @@ function toApiModel(
 	stats: ModelStats | undefined,
 	getModelCreditCost: ReturnType<typeof creditCostResolver>,
 ) {
+	const ratios = supportedRatios(m);
 	const tiers = availableTiers(m).map((tier) => ({
 		tier,
 		label: TIER_LABELS[tier],
@@ -37,6 +39,16 @@ function toApiModel(
 			getModelCreditCost(m.id, tier, refs),
 		),
 		allowed: isTierAllowed(allowed, m.id, tier),
+		/**
+		 * Expected output size per ratio the model renders: "1424x1424", or
+		 * "~1424x1424" when the model picks its own size (show megapixels).
+		 */
+		sizes: Object.fromEntries(
+			ratios.flatMap((r) => {
+				const s = outputSize(m, r, tier);
+				return s ? [[r, `${s.approx ? "~" : ""}${s.width}x${s.height}`]] : [];
+			}),
+		),
 	}));
 	return {
 		id: m.id,
@@ -51,7 +63,7 @@ function toApiModel(
 		maxImages: m.refs.max,
 		minImages: m.refs.min,
 		requiresImage: m.refs.min > 0,
-		ratios: supportedRatios(m),
+		ratios,
 		ratioChoices: ratioChoices(m),
 		matchInput: m.refs.max > 0,
 		tiers,
