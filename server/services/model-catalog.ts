@@ -388,6 +388,16 @@ const fmt = (wanted: string | undefined, allowed: string[], fallback: string, jp
 	return fallback;
 };
 
+/**
+ * Owner-approved policy setting (2026-10-03): FLUX 2 Pro's `safety_tolerance`
+ * (integer 1-5, default 2; 1 is most strict, 5 most permissive). Of the
+ * catalog's schemas (checked 2026-10-03) it is the only numeric moderation
+ * scale; GPT Image's `moderation` ("auto" | "low") is not a matching scale and
+ * stays at its default. `disable_safety_checker` (FLUX 2 Dev, Klein, Quick
+ * Edit, large-image upscale) is never sent.
+ */
+export const SAFETY_TOLERANCE = 4;
+
 const FLUX2_PRESETS = ["1:1", "16:9", "3:2", "2:3", "4:5", "5:4", "9:16", "3:4", "4:3"];
 const BANANA_RATIOS = [
 	"1:1",
@@ -845,6 +855,7 @@ export const CATALOG: CatalogModel[] = [
 			const mp = tierMp(ctx.tier);
 			const input: Record<string, unknown> = {
 				prompt: ctx.prompt,
+				safety_tolerance: SAFETY_TOLERANCE,
 				output_format: fmt(ctx.outputFormat, ["webp", "jpg", "png"], "png"),
 			};
 			if (FLUX2_PRESETS.includes(ctx.ratio)) {

@@ -18,6 +18,7 @@ import {
 	currentModelId,
 	customDimensions,
 	getCatalogModel,
+	SAFETY_TOLERANCE,
 	TIERS,
 	isTierAllowed,
 	outputSize,
@@ -260,6 +261,17 @@ describe("tier -> model input", () => {
 		const wide = build("black-forest-labs/flux-2-pro", { tier: "standard", ratio: "21:9" });
 		expect(wide.aspect_ratio).toBe("custom");
 		expect(wide.width).toBe(2048);
+	});
+	test("FLUX 2 Pro sends the owner-approved safety_tolerance; no model disables its safety checker", () => {
+		expect(SAFETY_TOLERANCE).toBe(4);
+		for (const ratio of ["1:1", "21:9"]) {
+			expect(build("black-forest-labs/flux-2-pro", { ratio }).safety_tolerance).toBe(4);
+		}
+		for (const m of CATALOG.filter((c) => c.build && !c.hidden)) {
+			const input = build(m.id, { refs: m.refs.min > 0 ? ["data:image/png;base64,x"] : [] });
+			expect(input.disable_safety_checker).toBeUndefined();
+			if (m.id !== "black-forest-labs/flux-2-pro") expect(input.safety_tolerance).toBeUndefined();
+		}
 	});
 	test("Nano Banana 2: resolution 1K/2K/4K", () => {
 		expect(build("google/nano-banana-2", { tier: "max", ratio: "8:1" })).toMatchObject({
