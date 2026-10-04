@@ -89,8 +89,7 @@ export function PendingSignIn() {
 	}
 
 	return (
-		<div
-			role="status"
+		<output
 			className="fixed inset-x-3 bottom-3 z-50 mx-auto flex max-w-md items-center gap-3 rounded-2xl border border-border bg-card px-4 py-3 text-sm shadow-lg [padding-bottom:max(0.75rem,env(safe-area-inset-bottom))]"
 		>
 			<div className="min-w-0 flex-1">
@@ -108,6 +107,6 @@ export function PendingSignIn() {
 			<Button variant="ghost" size="sm" onClick={finish}>
 				Cancel
 			</Button>
-		</div>
+		</output>
 	);
 }
